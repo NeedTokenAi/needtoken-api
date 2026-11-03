@@ -320,6 +320,8 @@ func TestUserAuthAppliesAccessTokenRouteRules(t *testing.T) {
 	require.NoError(t, model.DB.Model(admin).Update("role", common.RoleAdminUser).Error)
 	profile, _ := createMiddlewareScopedToken(t, admin.Id, 0, "profile:read")
 	channel, _ := createMiddlewareScopedToken(t, admin.Id, time.Now().Unix()+3600, "channel:read")
+	billing, _ := createMiddlewareScopedToken(t, admin.Id, 0, "billing:read")
+	redemption, _ := createMiddlewareScopedToken(t, admin.Id, 0, "redemption:read")
 	expired, _ := createMiddlewareScopedToken(t, admin.Id, time.Now().Unix()-1, "profile:read")
 
 	ok := func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"id": c.GetInt("id")}) }
@@ -329,6 +331,9 @@ func TestUserAuthAppliesAccessTokenRouteRules(t *testing.T) {
 	router.GET("/api/undeclared", UserAuth(), ok)
 	router.GET("/api/channel/", AdminAuth(), RequirePermission(authz.ChannelRead), ok)
 	router.GET("/api/pricing", TryUserAuth(), ok)
+	router.GET("/api/subscription/admin/fulfillment/:operation_id", AdminAuth(), ok)
+	router.GET("/api/subscription/admin/users/:id/summary", AdminAuth(), ok)
+	router.GET("/api/redemption/fulfillment/:operation_id", AdminAuth(), ok)
 
 	for _, test := range []struct {
 		name, path, token, code, reason string
@@ -343,6 +348,11 @@ func TestUserAuthAppliesAccessTokenRouteRules(t *testing.T) {
 		{name: "expired token", path: "/api/user/self", token: expired, status: http.StatusUnauthorized, code: "ACCESS_TOKEN_EXPIRED", reason: "expired"},
 		{name: "legacy token before the deadline", path: "/api/user/self", token: legacy, status: http.StatusOK},
 		{name: "legacy token on a session route", path: "/api/user/access_tokens", token: legacy, status: http.StatusForbidden, code: "AUTH_SESSION_REQUIRED", reason: "session_required"},
+		{name: "subscription fulfillment billing read", path: "/api/subscription/admin/fulfillment/order-1", token: billing, status: http.StatusOK},
+		{name: "customer summary billing read", path: "/api/subscription/admin/users/1/summary", token: billing, status: http.StatusOK},
+		{name: "redemption fulfillment redemption read", path: "/api/redemption/fulfillment/order-2", token: redemption, status: http.StatusOK},
+		{name: "billing cannot read redemption fulfillment", path: "/api/redemption/fulfillment/order-2", token: billing, status: http.StatusForbidden, code: "ACCESS_TOKEN_SCOPE_DENIED", reason: "scope_denied"},
+		{name: "redemption cannot read customer wallet", path: "/api/subscription/admin/users/1/summary", token: redemption, status: http.StatusForbidden, code: "ACCESS_TOKEN_SCOPE_DENIED", reason: "scope_denied"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			response := middlewareBearerRequest(router, test.path, test.token)
