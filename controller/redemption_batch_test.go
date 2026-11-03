@@ -20,6 +20,21 @@ import (
 	"gorm.io/gorm"
 )
 
+func TestExternalFulfillmentRejectsNonPATBeforeAnyDatabaseAccess(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, handler := range []gin.HandlerFunc{AdminCreateSubscriptionFulfillment, AdminGetSubscriptionFulfillment, AdminCreateRedemptionFulfillment, AdminGetRedemptionFulfillment, AdminGetCustomerQuotaSummary} {
+		recorder := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(recorder)
+		c.Request = httptest.NewRequest(http.MethodPost, "/api/external-fulfillment", nil)
+		c.Set("id", 1)
+		c.Set("role", common.RoleAdminUser)
+		// A dashboard session or legacy token has no scoped PAT ID.
+		handler(c)
+		assert.Equal(t, http.StatusForbidden, recorder.Code)
+		assert.Contains(t, recorder.Body.String(), "Unauthorized, insufficient privileges")
+	}
+}
+
 func TestDeleteRedemptionBatch(t *testing.T) {
 	for _, dialect := range []string{"sqlite", "mysql", "postgres"} {
 		t.Run(dialect, func(t *testing.T) {

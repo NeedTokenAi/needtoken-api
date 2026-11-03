@@ -194,6 +194,9 @@ func SetApiRouter(router *gin.Engine) {
 			subscriptionAdminRoute.PUT("/plans/:id", controller.AdminUpdateSubscriptionPlan)
 			subscriptionAdminRoute.PATCH("/plans/:id", controller.AdminUpdateSubscriptionPlanStatus)
 			subscriptionAdminRoute.POST("/bind", controller.AdminBindSubscription)
+			subscriptionAdminRoute.POST("/fulfillment", middleware.CriticalRateLimit(), middleware.DisableCache(), controller.AdminCreateSubscriptionFulfillment)
+			subscriptionAdminRoute.GET("/fulfillment/:operation_id", middleware.DisableCache(), controller.AdminGetSubscriptionFulfillment)
+			subscriptionAdminRoute.GET("/users/:id/summary", middleware.DisableCache(), controller.AdminGetCustomerQuotaSummary)
 			subscriptionAdminRoute.POST("/plans/:id/subscriptions/reset", controller.AdminResetPlanSubscriptions)
 
 			// User subscription management (admin)
@@ -311,6 +314,8 @@ func SetApiRouter(router *gin.Engine) {
 		{
 			redemptionRoute.GET("/", controller.GetAllRedemptions)
 			redemptionRoute.GET("/search", controller.SearchRedemptions)
+			redemptionRoute.POST("/fulfillment", middleware.CriticalRateLimit(), middleware.DisableCache(), controller.AdminCreateRedemptionFulfillment)
+			redemptionRoute.GET("/fulfillment/:operation_id", middleware.DisableCache(), controller.AdminGetRedemptionFulfillment)
 			redemptionRoute.GET("/:id", controller.GetRedemption)
 			redemptionRoute.POST("/", controller.AddRedemption)
 			redemptionRoute.POST("/batch", controller.DeleteRedemptionBatch)
