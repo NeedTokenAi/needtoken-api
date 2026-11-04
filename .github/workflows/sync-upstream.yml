@@ -1,0 +1,205 @@
+name: Sync upstream
+
+# Daily RC sync from QuantumNous/new-api. This job has no cloud credentials
+# and must not request an OIDC token.
+#
+# SYNC_GITHUB_TOKEN is required. The default GITHUB_TOKEN does not start
+# pull_request or push workflows, so CI would not run on the sync pull
+# request and deploy would not see a green main SHA after it merged.
+
+on:
+  schedule:
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Open upstream sync pull request
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ secrets.SYNC_GITHUB_TOKEN }}
+      SYNC_GITHUB_TOKEN: ${{ secrets.SYNC_GITHUB_TOKEN }}
+      UPSTREAM_CHANNEL_VAR: ${{ vars.UPSTREAM_CHANNEL }}
+      UPSTREAM_CHANNEL: ${{ vars.UPSTREAM_CHANNEL || 'v1.0.0-rc' }}
+      UPSTREAM_URL: https://github.com/QuantumNous/new-api.git
+      UPSTREAM_API_REPO: QuantumNous/new-api
+      GIT_TERMINAL_PROMPT: "0"
+    steps:
+      - name: Require sync token
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REPOSITORY}" != "NeedTokenAi/needtoken-api" ]]; then
+            echo "::error::refusing to sync ${GITHUB_REPOSITORY}"
+            exit 1
+          fi
+          if [[ -z "${SYNC_GITHUB_TOKEN}" ]]; then
+            echo "::error::Set Actions secret SYNC_GITHUB_TOKEN to a fine-grained PAT or GitHub App user token. The default GITHUB_TOKEN does not retrigger CI."
+            exit 1
+          fi
+
+      - name: Checkout main
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_GITHUB_TOKEN }}
+          persist-credentials: true
+
+      - name: Resolve upstream RC tag to a commit
+        id: resolve
+        run: |
+          set -euo pipefail
+          if [[ -z "${UPSTREAM_CHANNEL_VAR}" ]]; then
+            echo "UPSTREAM_CHANNEL is unset; using the documented default ${UPSTREAM_CHANNEL}"
+          fi
+          gh api --paginate "repos/${UPSTREAM_API_REPO}/tags?per_page=100" --jq '.[].name' >"$RUNNER_TEMP/upstream-tags.txt"
+          tag=$(bash .github/scripts/resolve-upstream-channel.sh select-tag <"$RUNNER_TEMP/upstream-tags.txt")
+          git ls-remote "$UPSTREAM_URL" "refs/tags/${tag}" >"$RUNNER_TEMP/upstream-ref.txt"
+          sha=$(bash .github/scripts/resolve-upstream-channel.sh peel-sha <"$RUNNER_TEMP/upstream-ref.txt")
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-rc\.[0-9]+$ || ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::resolved upstream ref is not a fixed RC commit"
+            exit 1
+          fi
+          echo "UPSTREAM_TAG=${tag}" >>"$GITHUB_ENV"
+          echo "UPSTREAM_SHA=${sha}" >>"$GITHUB_ENV"
+          {
+            echo "## Upstream candidate"
+            echo "- channel: \`${UPSTREAM_CHANNEL}\`"
+            echo "- tag: \`${tag}\`"
+            echo "- sha: \`${sha}\`"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Skip when a sync pull request is already open
+        id: open
+        run: |
+          set -euo pipefail
+          open=$(gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/pulls?state=open&base=main&per_page=100" \
+            --jq '.[] | select(.head.ref | startswith("sync/upstream/")) | "\(.number)\t\(.head.ref)\t\(.html_url)"')
+          if [[ -n "$open" ]]; then
+            {
+              echo "## Sync skipped"
+              echo "An upstream sync pull request is already open. Merge or close it before opening another."
+              echo
+              echo '```'
+              printf '%s\n' "$open"
+              echo '```'
+            } >>"$GITHUB_STEP_SUMMARY"
+            echo "skip=true" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "skip=false" >>"$GITHUB_OUTPUT"
+
+      - name: Merge upstream commit
+        id: merge
+        if: success() && steps.open.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main
+          git fetch --no-tags --no-recurse-submodules "$UPSTREAM_URL" "$UPSTREAM_SHA"
+          output="$RUNNER_TEMP/sync-merge.txt"
+          set +e
+          OUTPUT_FILE="$output" \
+            BASE_REF=origin/main \
+            UPSTREAM_CHANNEL="$UPSTREAM_CHANNEL" \
+            UPSTREAM_TAG="$UPSTREAM_TAG" \
+            UPSTREAM_SHA="$UPSTREAM_SHA" \
+            bash .github/scripts/sync-upstream-merge.sh
+          code=$?
+          set -e
+          if [[ -f "$output" ]]; then
+            cat "$output"
+          fi
+          if [[ "$code" -eq 2 ]]; then
+            base_sha=$(awk -F= '$1=="base_sha"{print $2; exit}' "$output")
+            upstream_sha=$(awk -F= '$1=="upstream_sha"{print $2; exit}' "$output")
+            files=$(sed -n 's/^conflict_file=//p' "$output")
+            {
+              echo "## Upstream sync conflict"
+              echo "Conflict markers were not pushed."
+              echo "- base SHA: \`${base_sha}\`"
+              echo "- upstream SHA: \`${upstream_sha}\`"
+              echo "- tag: \`${UPSTREAM_TAG}\`"
+              echo "- channel: \`${UPSTREAM_CHANNEL}\`"
+              echo
+              echo '```'
+              printf '%s\n' "$files"
+              echo '```'
+            } >>"$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          if [[ "$code" -ne 0 ]]; then
+            exit "$code"
+          fi
+          status=$(awk -F= '$1=="status"{print $2; exit}' "$output")
+          if [[ "$status" != "clean" && "$status" != "skipped" ]]; then
+            echo "::error::unexpected merge status"
+            exit 1
+          fi
+          echo "status=${status}" >>"$GITHUB_OUTPUT"
+
+      - name: Push branch and open pull request
+        if: success() && steps.open.outputs.skip != 'true' && steps.merge.outputs.status == 'clean'
+        run: |
+          set -euo pipefail
+          branch="sync/upstream/${UPSTREAM_SHA}"
+          if [[ ! "$branch" =~ ^sync/upstream/[0-9a-f]{40}$ ]]; then
+            echo "::error::refusing to push ${branch}"
+            exit 1
+          fi
+          if [[ "$(git branch --show-current)" != "$branch" ]]; then
+            echo "::error::merge did not leave the sync branch checked out"
+            exit 1
+          fi
+          if [[ "$(git rev-parse 'HEAD^2')" != "$UPSTREAM_SHA" || -n "$(git ls-files -u)" ]]; then
+            echo "::error::refusing to push a merge that is not a clean upstream parent"
+            exit 1
+          fi
+          git fetch --no-tags origin "refs/heads/${branch}:refs/remotes/origin/${branch}" || true
+          if ! git push origin "refs/heads/${branch}:refs/heads/${branch}"; then
+            git push --force-with-lease="refs/heads/${branch}:refs/remotes/origin/${branch}" \
+              origin "refs/heads/${branch}:refs/heads/${branch}"
+          fi
+          base_sha=$(git rev-parse 'HEAD^1')
+          body="$RUNNER_TEMP/pr-body.md"
+          {
+            echo "## Upstream sync"
+            echo
+            echo "- Channel: \`${UPSTREAM_CHANNEL}\`"
+            echo "- Tag: \`${UPSTREAM_TAG}\`"
+            echo "- Upstream SHA: \`${UPSTREAM_SHA}\`"
+            echo "- Base SHA: \`${base_sha}\`"
+            echo "- Source: https://github.com/QuantumNous/new-api"
+            echo
+            echo "This branch is an ordinary merge commit. Merge it with a merge commit."
+            echo "Do not squash and do not rebase the upstream parent away. A squash drops the upstream commit from history, so the next sync cannot see that it is already contained in main."
+            echo
+            echo "CI on this pull request must be green before merging. Deploy runs only after that merge is pushed to main and CI succeeds for the new SHA."
+          } >"$body"
+          url=$(gh pr create \
+            --repo "$GITHUB_REPOSITORY" \
+            --base main \
+            --head "$branch" \
+            --title "Sync upstream ${UPSTREAM_TAG}" \
+            --body-file "$body")
+          {
+            echo "## Sync pull request"
+            echo "${url}"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Record an already-contained upstream commit
+        if: success() && steps.open.outputs.skip != 'true' && steps.merge.outputs.status == 'skipped'
+        run: |
+          set -euo pipefail
+          {
+            echo "## Sync skipped"
+            echo "\`${UPSTREAM_TAG}\` (\`${UPSTREAM_SHA}\`) is already contained in main."
+          } >>"$GITHUB_STEP_SUMMARY"
