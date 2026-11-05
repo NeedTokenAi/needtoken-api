@@ -195,6 +195,7 @@ func SetApiRouter(router *gin.Engine) {
 			subscriptionAdminRoute.PATCH("/plans/:id", controller.AdminUpdateSubscriptionPlanStatus)
 			subscriptionAdminRoute.POST("/bind", controller.AdminBindSubscription)
 			subscriptionAdminRoute.POST("/fulfillment", middleware.CriticalRateLimit(), middleware.DisableCache(), controller.AdminCreateSubscriptionFulfillment)
+			subscriptionAdminRoute.GET("/fulfillment-capabilities", middleware.DisableCache(), controller.AdminGetFulfillmentCapabilities)
 			subscriptionAdminRoute.GET("/fulfillment/:operation_id", middleware.DisableCache(), controller.AdminGetSubscriptionFulfillment)
 			subscriptionAdminRoute.GET("/users/:id/summary", middleware.DisableCache(), controller.AdminGetCustomerQuotaSummary)
 			subscriptionAdminRoute.POST("/plans/:id/subscriptions/reset", controller.AdminResetPlanSubscriptions)

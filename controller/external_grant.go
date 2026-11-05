@@ -7,6 +7,8 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 )
@@ -31,6 +33,8 @@ func externalGrantError(c *gin.Context, err error) {
 		status, code = http.StatusConflict, "plan_revision_mismatch"
 	case errors.Is(err, model.ErrExternalGrantQuotaUnit):
 		status, code = http.StatusConflict, "quota_unit_mismatch"
+	case errors.Is(err, model.ErrExternalGrantTokenLimit):
+		status, code = http.StatusConflict, "token_limit_reached"
 	case errors.Is(err, model.ErrExternalGrantInvalid):
 		status, code, message = http.StatusBadRequest, "invalid_fulfillment", "Invalid parameters"
 	case errors.Is(err, gorm.ErrRecordNotFound):
@@ -48,6 +52,7 @@ func AdminCreateSubscriptionFulfillment(c *gin.Context) {
 		UserId       int    `json:"user_id"`
 		PlanId       int    `json:"plan_id"`
 		PlanRevision string `json:"plan_revision"`
+		IssueAPIKey  bool   `json:"issue_api_key"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		externalGrantError(c, model.ErrExternalGrantInvalid)
@@ -55,13 +60,28 @@ func AdminCreateSubscriptionFulfillment(c *gin.Context) {
 	}
 	grant, err := model.CreateExternalGrant(c.Request.Context(), c.GetInt("id"), model.ExternalGrantRequest{
 		Kind: model.ExternalGrantSubscription, OperationId: req.OperationId, UserId: req.UserId,
-		PlanId: req.PlanId, PlanRevision: req.PlanRevision,
+		PlanId: req.PlanId, PlanRevision: req.PlanRevision, IssueAPIKey: req.IssueAPIKey,
 	})
 	if err != nil {
 		externalGrantError(c, err)
 		return
 	}
 	common.ApiSuccess(c, grant)
+}
+
+// Capabilities are available only to the same scoped administrative PATs that
+// can read subscription fulfillment receipts. No credentials are returned.
+func AdminGetFulfillmentCapabilities(c *gin.Context) {
+	if !requireExternalGrantPAT(c) {
+		return
+	}
+	common.ApiSuccess(c, gin.H{
+		"source": "new-api", "contract_version": 1,
+		"managed_api_key_issuance": true, "delivery_mode": "native_console",
+		"payment_compliance_confirmed":  operation_setting.IsPaymentComplianceConfirmed(),
+		"subscription_write_authorized": service.AccessTokenScopeGranted(c.GetStringSlice("access_token_scopes"), "billing:write"),
+		"collected_at":                  common.GetTimestamp(),
+	})
 }
 
 func AdminGetSubscriptionFulfillment(c *gin.Context) {
