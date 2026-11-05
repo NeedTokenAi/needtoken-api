@@ -332,6 +332,7 @@ func TestUserAuthAppliesAccessTokenRouteRules(t *testing.T) {
 	router.GET("/api/channel/", AdminAuth(), RequirePermission(authz.ChannelRead), ok)
 	router.GET("/api/pricing", TryUserAuth(), ok)
 	router.GET("/api/subscription/admin/fulfillment/:operation_id", AdminAuth(), ok)
+	router.GET("/api/subscription/admin/fulfillment-capabilities", AdminAuth(), ok)
 	router.GET("/api/subscription/admin/users/:id/summary", AdminAuth(), ok)
 	router.GET("/api/redemption/fulfillment/:operation_id", AdminAuth(), ok)
 
@@ -349,6 +350,9 @@ func TestUserAuthAppliesAccessTokenRouteRules(t *testing.T) {
 		{name: "legacy token before the deadline", path: "/api/user/self", token: legacy, status: http.StatusOK},
 		{name: "legacy token on a session route", path: "/api/user/access_tokens", token: legacy, status: http.StatusForbidden, code: "AUTH_SESSION_REQUIRED", reason: "session_required"},
 		{name: "subscription fulfillment billing read", path: "/api/subscription/admin/fulfillment/order-1", token: billing, status: http.StatusOK},
+		{name: "fulfillment capabilities billing read", path: "/api/subscription/admin/fulfillment-capabilities", token: billing, status: http.StatusOK},
+		{name: "fulfillment capabilities needs billing read", path: "/api/subscription/admin/fulfillment-capabilities", token: profile, status: http.StatusForbidden, code: "ACCESS_TOKEN_SCOPE_DENIED", reason: "scope_denied"},
+		{name: "expired PAT cannot read fulfillment capabilities", path: "/api/subscription/admin/fulfillment-capabilities", token: expired, status: http.StatusUnauthorized, code: "ACCESS_TOKEN_EXPIRED", reason: "expired"},
 		{name: "customer summary billing read", path: "/api/subscription/admin/users/1/summary", token: billing, status: http.StatusOK},
 		{name: "redemption fulfillment redemption read", path: "/api/redemption/fulfillment/order-2", token: redemption, status: http.StatusOK},
 		{name: "billing cannot read redemption fulfillment", path: "/api/redemption/fulfillment/order-2", token: billing, status: http.StatusForbidden, code: "ACCESS_TOKEN_SCOPE_DENIED", reason: "scope_denied"},

@@ -9,7 +9,9 @@ import (
 	"unicode/utf8"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"gorm.io/gorm"
+	gormlogger "gorm.io/gorm/logger"
 )
 
 const (
@@ -22,6 +24,7 @@ var (
 	ErrExternalGrantConflict     = errors.New("external grant payload conflict")
 	ErrExternalGrantPlanRevision = errors.New("external grant plan revision mismatch")
 	ErrExternalGrantQuotaUnit    = errors.New("external grant quota unit mismatch")
+	ErrExternalGrantTokenLimit   = errors.New("external grant token limit reached")
 )
 
 // ExternalGrant is committed with the native resource. Pending rows are never
@@ -43,8 +46,10 @@ type ExternalGrant struct {
 	Quota                int    `json:"quota" gorm:"type:bigint"`
 	SubscriptionId       int    `json:"subscription_id"`
 	RedemptionId         int    `json:"redemption_id"`
+	ManagedTokenId       int    `json:"managed_token_id,omitempty"`
 	CreatedAt            int64  `json:"created_at" gorm:"type:bigint"`
 	ExpectedQuotaPerUnit int64  `json:"expected_quota_per_unit" gorm:"-"`
+	IssueAPIKey          bool   `json:"issue_api_key,omitempty" gorm:"-"`
 }
 
 // ExternalGrantRequest deliberately excludes native resource IDs and keys.
@@ -59,6 +64,7 @@ type ExternalGrantRequest struct {
 	Quota                int    `json:"quota"`
 	ExpiredTime          int64  `json:"expired_time"`
 	ExpectedQuotaPerUnit int64  `json:"expected_quota_per_unit,omitempty"`
+	IssueAPIKey          bool   `json:"issue_api_key,omitempty"`
 }
 
 // SubscriptionPlanRevision freezes the full native contract, including duration,
@@ -105,6 +111,7 @@ func GetExternalGrant(ctx context.Context, operationId, kind string) (*ExternalG
 		return nil, err
 	}
 	grant.ExpectedQuotaPerUnit = payload.ExpectedQuotaPerUnit
+	grant.IssueAPIKey = payload.IssueAPIKey
 	return &grant, nil
 }
 
@@ -124,7 +131,7 @@ func CreateExternalGrant(ctx context.Context, creatorUserId int, request Externa
 		}
 		request.PlanRevision = strings.ToLower(request.PlanRevision)
 	case ExternalGrantRedemption:
-		if request.UserId != 0 || request.PlanId != 0 || request.PlanRevision != "" || utf8.RuneCountInString(request.Name) < 1 || utf8.RuneCountInString(request.Name) > 20 || request.Quota <= 0 || common.ValidateWalletQuota(request.Quota) != nil || request.ExpiredTime < 0 || request.ExpectedQuotaPerUnit <= 0 || request.ExpectedQuotaPerUnit > common.MaxWalletQuota {
+		if request.UserId != 0 || request.PlanId != 0 || request.PlanRevision != "" || request.IssueAPIKey || utf8.RuneCountInString(request.Name) < 1 || utf8.RuneCountInString(request.Name) > 20 || request.Quota <= 0 || common.ValidateWalletQuota(request.Quota) != nil || request.ExpiredTime < 0 || request.ExpectedQuotaPerUnit <= 0 || request.ExpectedQuotaPerUnit > common.MaxWalletQuota {
 			return nil, ErrExternalGrantInvalid
 		}
 	default:
@@ -140,6 +147,7 @@ func CreateExternalGrant(ctx context.Context, creatorUserId int, request Externa
 		CreatorUserId: creatorUserId, UserId: request.UserId, PlanId: request.PlanId, PlanRevision: request.PlanRevision,
 		Quota: request.Quota, CreatedAt: common.GetTimestamp(),
 		ExpectedQuotaPerUnit: request.ExpectedQuotaPerUnit,
+		IssueAPIKey:          request.IssueAPIKey,
 	}
 	var existing ExternalGrant
 	err = DB.WithContext(ctx).Where("operation_key = ?", operation.OperationKey).First(&existing).Error
@@ -148,12 +156,16 @@ func CreateExternalGrant(ctx context.Context, creatorUserId int, request Externa
 			return nil, ErrExternalGrantConflict
 		}
 		existing.ExpectedQuotaPerUnit = request.ExpectedQuotaPerUnit
+		existing.IssueAPIKey = request.IssueAPIKey
 		return &existing, nil
 	}
 	if !errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, err
 	}
 	groupChanged := false
+	// Read configuration before acquiring database locks. The token count below
+	// uses this transaction and the locked recipient, never the global DB handle.
+	maxTokens := operation_setting.GetMaxUserTokens()
 	err = DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := tx.Create(&operation).Error; err != nil {
 			return err
@@ -189,6 +201,33 @@ func CreateExternalGrant(ctx context.Context, creatorUserId int, request Externa
 			}
 			groupChanged = subscription.PrevUserGroup != ""
 			operation.SubscriptionId = subscription.Id
+			if request.IssueAPIKey {
+				var count int64
+				if err := tx.Model(&Token{}).Where("user_id = ?", request.UserId).Count(&count).Error; err != nil {
+					return err
+				}
+				if count >= int64(maxTokens) {
+					return ErrExternalGrantTokenLimit
+				}
+				key, err := common.GenerateKey()
+				if err != nil {
+					return err
+				}
+				// This removes only the additional per-token cap. Native wallet and
+				// subscription limits, resets and billing preferences still govern
+				// every request. An empty group follows the recipient's native group.
+				token := Token{
+					UserId: request.UserId, Key: key, Name: "API subscription",
+					Status: common.TokenStatusEnabled, CreatedTime: common.GetTimestamp(), AccessedTime: common.GetTimestamp(),
+					ExpiredTime: subscription.EndTime, UnlimitedQuota: true, AllowUserQuotaQuery: true,
+				}
+				// SQL tracing must never print the inserted credential, including
+				// when a driver rejects the insert. The caller returns fixed errors.
+				if err := tx.Session(&gorm.Session{Logger: gormlogger.Discard}).Create(&token).Error; err != nil {
+					return err
+				}
+				operation.ManagedTokenId = token.Id
+			}
 			planJSON, err := common.Marshal(plan)
 			if err != nil {
 				return err
@@ -222,6 +261,7 @@ func CreateExternalGrant(ctx context.Context, creatorUserId int, request Externa
 				return nil, ErrExternalGrantConflict
 			}
 			recovered.ExpectedQuotaPerUnit = request.ExpectedQuotaPerUnit
+			recovered.IssueAPIKey = request.IssueAPIKey
 			return &recovered, nil
 		}
 		return nil, err
@@ -260,6 +300,12 @@ type CustomerTokenCapSummary struct {
 	ExpiredTime    int64  `json:"expired_time"`
 }
 
+type CustomerManagedAPIKeyCapacity struct {
+	Limit     int   `json:"limit"`
+	Used      int64 `json:"used"`
+	Available bool  `json:"available"`
+}
+
 // CustomerQuotaSummary uses dedicated DTOs and SELECT lists. Wallet balances,
 // subscription allowances and token caps remain three independent layers.
 type CustomerQuotaSummary struct {
@@ -272,6 +318,7 @@ type CustomerQuotaSummary struct {
 	TokenCaps              []CustomerTokenCapSummary     `json:"token_caps"`
 	SubscriptionsTruncated bool                          `json:"subscriptions_truncated"`
 	TokenCapsTruncated     bool                          `json:"token_caps_truncated"`
+	ManagedAPIKeyCapacity  CustomerManagedAPIKeyCapacity `json:"managed_api_key_capacity"`
 }
 
 func GetCustomerQuotaSummary(ctx context.Context, userId int) (*CustomerQuotaSummary, error) {
@@ -279,6 +326,7 @@ func GetCustomerQuotaSummary(ctx context.Context, userId int) (*CustomerQuotaSum
 		return nil, ErrExternalGrantInvalid
 	}
 	result := CustomerQuotaSummary{Source: "new-api", UserId: userId, Subscriptions: []CustomerSubscriptionSummary{}, TokenCaps: []CustomerTokenCapSummary{}}
+	result.ManagedAPIKeyCapacity.Limit = operation_setting.GetMaxUserTokens()
 	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var user User
 		if err := tx.Select("id", "status", "quota", "used_quota").First(&user, userId).Error; err != nil {
@@ -286,6 +334,12 @@ func GetCustomerQuotaSummary(ctx context.Context, userId int) (*CustomerQuotaSum
 		}
 		result.Status = user.Status
 		result.Wallet = CustomerWalletSummary{Quota: user.Quota, UsedQuota: user.UsedQuota}
+		// Count all native keys, independently of the capped display list or
+		// monetary caps. Expired/disabled keys still occupy native token slots.
+		if err := tx.Model(&Token{}).Where("user_id = ?", userId).Count(&result.ManagedAPIKeyCapacity.Used).Error; err != nil {
+			return err
+		}
+		result.ManagedAPIKeyCapacity.Available = result.ManagedAPIKeyCapacity.Used < int64(result.ManagedAPIKeyCapacity.Limit)
 		if err := tx.Model(&UserSubscription{}).
 			Select("id", "plan_id", "amount_total", "amount_used", "start_time", "end_time", "status", "last_reset_time", "next_reset_time", "allow_wallet_overflow").
 			Where("user_id = ?", userId).Order("id desc").Limit(1001).Scan(&result.Subscriptions).Error; err != nil {

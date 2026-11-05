@@ -11,6 +11,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
@@ -22,7 +23,7 @@ import (
 
 func TestExternalFulfillmentRejectsNonPATBeforeAnyDatabaseAccess(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	for _, handler := range []gin.HandlerFunc{AdminCreateSubscriptionFulfillment, AdminGetSubscriptionFulfillment, AdminCreateRedemptionFulfillment, AdminGetRedemptionFulfillment, AdminGetCustomerQuotaSummary} {
+	for _, handler := range []gin.HandlerFunc{AdminCreateSubscriptionFulfillment, AdminGetSubscriptionFulfillment, AdminCreateRedemptionFulfillment, AdminGetRedemptionFulfillment, AdminGetCustomerQuotaSummary, AdminGetFulfillmentCapabilities} {
 		recorder := httptest.NewRecorder()
 		c, _ := gin.CreateTestContext(recorder)
 		c.Request = httptest.NewRequest(http.MethodPost, "/api/external-fulfillment", nil)
@@ -32,6 +33,62 @@ func TestExternalFulfillmentRejectsNonPATBeforeAnyDatabaseAccess(t *testing.T) {
 		handler(c)
 		assert.Equal(t, http.StatusForbidden, recorder.Code)
 		assert.Contains(t, recorder.Body.String(), "Unauthorized, insufficient privileges")
+	}
+}
+
+func TestFulfillmentCapabilitiesContract(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	previousPayment := *operation_setting.GetPaymentSetting()
+	t.Cleanup(func() { *operation_setting.GetPaymentSetting() = previousPayment })
+	for _, test := range []struct {
+		name                                string
+		confirmed, currentTerms, writeScope bool
+	}{
+		{name: "unconfirmed compliance", writeScope: true},
+		{name: "stale compliance terms", confirmed: true, writeScope: true},
+		{name: "read only PAT", confirmed: true, currentTerms: true},
+		{name: "ready", confirmed: true, currentTerms: true, writeScope: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			payment := operation_setting.GetPaymentSetting()
+			payment.ComplianceConfirmed = test.confirmed
+			payment.ComplianceTermsVersion = "old"
+			if test.currentTerms {
+				payment.ComplianceTermsVersion = operation_setting.CurrentComplianceTermsVersion
+			}
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodGet, "/api/subscription/admin/fulfillment-capabilities", nil)
+			c.Set("access_token_id", 1)
+			scopes := []string{"billing:read"}
+			if test.writeScope {
+				scopes = append(scopes, "billing:write")
+			}
+			c.Set("access_token_scopes", scopes)
+			AdminGetFulfillmentCapabilities(c)
+			assert.Equal(t, http.StatusOK, recorder.Code)
+			var response struct {
+				Success bool `json:"success"`
+				Data    struct {
+					Source                      string `json:"source"`
+					ContractVersion             int    `json:"contract_version"`
+					ManagedAPIKeyIssuance       bool   `json:"managed_api_key_issuance"`
+					DeliveryMode                string `json:"delivery_mode"`
+					CollectedAt                 int64  `json:"collected_at"`
+					PaymentComplianceConfirmed  bool   `json:"payment_compliance_confirmed"`
+					SubscriptionWriteAuthorized bool   `json:"subscription_write_authorized"`
+				} `json:"data"`
+			}
+			require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+			assert.True(t, response.Success)
+			assert.Equal(t, "new-api", response.Data.Source)
+			assert.Equal(t, 1, response.Data.ContractVersion)
+			assert.True(t, response.Data.ManagedAPIKeyIssuance)
+			assert.Equal(t, "native_console", response.Data.DeliveryMode)
+			assert.Positive(t, response.Data.CollectedAt)
+			assert.Equal(t, test.confirmed && test.currentTerms, response.Data.PaymentComplianceConfirmed)
+			assert.Equal(t, test.writeScope, response.Data.SubscriptionWriteAuthorized)
+		})
 	}
 }
 
