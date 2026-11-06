@@ -5,7 +5,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"reflect"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/QuantumNous/new-api/common"
@@ -319,13 +321,38 @@ type CustomerQuotaSummary struct {
 	SubscriptionsTruncated bool                          `json:"subscriptions_truncated"`
 	TokenCapsTruncated     bool                          `json:"token_caps_truncated"`
 	ManagedAPIKeyCapacity  CustomerManagedAPIKeyCapacity `json:"managed_api_key_capacity"`
+	// SubscriptionTimeZone describes this process's calendar calculation rules,
+	// not a persisted historical transaction zone. Empty means unknown. A named
+	// IANA location (including a reloadable alias) is reported only when its full
+	// structure matches a same-name reload; Local and fixed-zone imitations are
+	// not inferred from offsets, environment settings or sampled dates.
+	SubscriptionTimeZone string `json:"subscription_time_zone"`
+}
+
+// CalculationTimeZone identifies the time.Local rules used by native month/year
+// AddDate calculations. Structural matching is deliberately conservative: even
+// an otherwise equivalent location with different cached state remains unknown.
+func CalculationTimeZone() string {
+	location := time.Local
+	if location == nil {
+		return ""
+	}
+	name := location.String()
+	if name == "" || name == "Local" {
+		return ""
+	}
+	reloaded, err := time.LoadLocation(name)
+	if err != nil || reloaded.String() != name || !reflect.DeepEqual(location, reloaded) {
+		return ""
+	}
+	return name
 }
 
 func GetCustomerQuotaSummary(ctx context.Context, userId int) (*CustomerQuotaSummary, error) {
 	if userId <= 0 {
 		return nil, ErrExternalGrantInvalid
 	}
-	result := CustomerQuotaSummary{Source: "new-api", UserId: userId, Subscriptions: []CustomerSubscriptionSummary{}, TokenCaps: []CustomerTokenCapSummary{}}
+	result := CustomerQuotaSummary{Source: "new-api", UserId: userId, Subscriptions: []CustomerSubscriptionSummary{}, TokenCaps: []CustomerTokenCapSummary{}, SubscriptionTimeZone: CalculationTimeZone()}
 	result.ManagedAPIKeyCapacity.Limit = operation_setting.GetMaxUserTokens()
 	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var user User
