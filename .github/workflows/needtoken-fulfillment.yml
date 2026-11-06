@@ -1,5 +1,10 @@
 name: NeedToken fulfillment
 
+# Extra path-filtered signal. It does not run on every main SHA.
+# The deploy gate is the CI workflow, which runs the same database tests
+# on every pull request and every push to main. Do not require this
+# workflow as the only status check.
+
 on:
   pull_request:
     paths:

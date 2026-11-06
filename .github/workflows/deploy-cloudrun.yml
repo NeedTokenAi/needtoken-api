@@ -1,0 +1,506 @@
+name: Deploy Cloud Run
+
+# Deploy NeedToken-built digests to Cloud Run. This file is the production
+# gate: pull_request jobs never receive id-token, and workflow_run from a
+# fork or a non-main branch is rejected before Workload Identity is used.
+#
+# workflow_run's github.sha is the default-branch commit of this file, not
+# the commit CI tested. The image is built only from the resolved head SHA.
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      git_sha:
+        description: Full 40-character commit SHA on main to deploy
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: needtoken-api-cloudrun
+  cancel-in-progress: false
+
+env:
+  GIT_TERMINAL_PROMPT: "0"
+  CLOUDSDK_CORE_DISABLE_PROMPTS: "1"
+  CLOUDSDK_CORE_PROJECT: suichong
+  GCP_PROJECT: suichong
+  GCP_REGION: asia-southeast1
+  SERVICE: needtoken-api
+  PUBLIC_BASE_URL: https://api.needtoken.ai
+  IMAGE: ${{ vars.GCP_CLOUD_RUN_IMAGE || 'asia-southeast1-docker.pkg.dev/suichong/needtoken/needtoken-api' }}
+
+jobs:
+  resolve:
+    name: Resolve verified SHA
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (
+        github.event_name == 'workflow_dispatch' ||
+        (
+          github.event.workflow_run.conclusion == 'success' &&
+          github.event.workflow_run.event == 'push' &&
+          github.event.workflow_run.head_branch == 'main' &&
+          github.event.workflow_run.head_repository.full_name == github.repository
+        )
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      proceed: ${{ steps.gate.outputs.proceed }}
+      sha: ${{ steps.gate.outputs.sha }}
+      require_tip: ${{ steps.gate.outputs.require_tip }}
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Verify CI SHA
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          THIS_REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_SHA: ${{ github.event.inputs.git_sha }}
+          RUN_EVENT: ${{ github.event.workflow_run.event }}
+          RUN_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          RUN_SHA: ${{ github.event.workflow_run.head_sha }}
+          RUN_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          RUN_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
+          RUN_NAME: ${{ github.event.workflow_run.name }}
+          RUN_PATH: ${{ github.event.workflow_run.path }}
+        run: |
+          set -euo pipefail
+          echo "event=${EVENT_NAME} run_event=${RUN_EVENT} branch=${RUN_BRANCH} conclusion=${RUN_CONCLUSION} path=${RUN_PATH} name=${RUN_NAME} repo=${RUN_REPO}"
+          if [[ "$THIS_REPO" != "NeedTokenAi/needtoken-api" ]]; then
+            echo "::error::refusing deploy gate for ${THIS_REPO}"
+            exit 1
+          fi
+          if [[ "${GITHUB_REF}" != "refs/heads/main" ]]; then
+            echo "::error::deploy workflow must run from refs/heads/main"
+            exit 1
+          fi
+
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            sha=$(printf '%s' "$INPUT_SHA" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+            require_tip=false
+          else
+            if [[ "$RUN_EVENT" != "push" || "$RUN_BRANCH" != "main" || "$RUN_CONCLUSION" != "success" ]]; then
+              echo "::error::CI workflow_run is not a successful main push"
+              exit 1
+            fi
+            if [[ "$RUN_REPO" != "$THIS_REPO" || "$RUN_NAME" != "CI" ]]; then
+              echo "::error::unexpected triggering workflow name=${RUN_NAME} repo=${RUN_REPO}"
+              exit 1
+            fi
+            if [[ "$RUN_PATH" != ".github/workflows/ci.yml" ]]; then
+              echo "::error::unexpected triggering workflow path=${RUN_PATH}"
+              exit 1
+            fi
+            sha=$(printf '%s' "$RUN_SHA" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+            require_tip=true
+          fi
+
+          if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::git SHA must be 40 lowercase hex characters"
+            exit 1
+          fi
+
+          git fetch --no-tags origin main
+          tip=$(git rev-parse origin/main)
+          if ! git cat-file -e "${sha}^{commit}" 2>/dev/null; then
+            echo "::error::${sha} is not in the fetched main history"
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$sha" origin/main; then
+            echo "::error::${sha} is not contained in origin/main"
+            exit 1
+          fi
+
+          if [[ "$require_tip" == "true" && "$sha" != "$tip" ]]; then
+            {
+              echo "## Deploy skipped"
+              echo "CI SHA \`${sha}\` is not the current main tip \`${tip}\`."
+            } >>"$GITHUB_STEP_SUMMARY"
+            echo "proceed=false" >>"$GITHUB_OUTPUT"
+            echo "sha=${sha}" >>"$GITHUB_OUTPUT"
+            echo "require_tip=true" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          found=0
+          for _ in 1 2 3 4 5 6; do
+            runs=$(gh run list --repo "$THIS_REPO" --workflow ci.yml --commit "$sha" --limit 30 \
+              --json conclusion,event,headBranch,headSha,status,databaseId,name)
+            if printf '%s' "$runs" | jq -e --arg commit "$sha" '
+                map(select(
+                  .conclusion == "success" and
+                  .event == "push" and
+                  .headBranch == "main" and
+                  .headSha == $commit
+                )) | length > 0
+              ' >/dev/null; then
+              found=1
+              break
+            fi
+            sleep 5
+          done
+          if [[ "$found" != "1" ]]; then
+            echo "::error::no successful CI push run for ${sha} on main"
+            exit 1
+          fi
+
+          {
+            echo "## Deploy gate"
+            echo "- SHA: \`${sha}\`"
+            echo "- main tip: \`${tip}\`"
+            echo "- require tip: \`${require_tip}\`"
+          } >>"$GITHUB_STEP_SUMMARY"
+          echo "proceed=true" >>"$GITHUB_OUTPUT"
+          echo "sha=${sha}" >>"$GITHUB_OUTPUT"
+          echo "require_tip=${require_tip}" >>"$GITHUB_OUTPUT"
+
+  deploy:
+    name: Build and roll Cloud Run
+    needs: resolve
+    if: success() && needs.resolve.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      GIT_SHA: ${{ needs.resolve.outputs.sha }}
+      REQUIRE_TIP: ${{ needs.resolve.outputs.require_tip }}
+    steps:
+      - name: Checkout target SHA
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          path: src
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Reject a stale or unknown SHA
+        id: precheck
+        working-directory: src
+        run: |
+          set -euo pipefail
+          head=$(git rev-parse HEAD)
+          if [[ "$head" != "$GIT_SHA" ]]; then
+            echo "::error::checked out ${head}, expected ${GIT_SHA}"
+            exit 1
+          fi
+          git fetch --no-tags origin main
+          tip=$(git rev-parse origin/main)
+          if ! git merge-base --is-ancestor "$GIT_SHA" origin/main; then
+            echo "::error::${GIT_SHA} is not contained in origin/main"
+            exit 1
+          fi
+          if [[ "$REQUIRE_TIP" == "true" && "$tip" != "$GIT_SHA" ]]; then
+            echo "DEPLOY_RESULT=skipped-stale" >>"$GITHUB_ENV"
+            echo "skip=true" >>"$GITHUB_OUTPUT"
+            {
+              echo "## Deploy skipped"
+              echo "SHA \`${GIT_SHA}\` is behind main \`${tip}\`. Nothing was deployed."
+            } >>"$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo "skip=false" >>"$GITHUB_OUTPUT"
+          echo "MAIN_TIP=${tip}" >>"$GITHUB_ENV"
+
+      - name: Checkout pipeline scripts from main
+        if: success() && steps.precheck.outputs.skip != 'true'
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: main
+          path: pipeline
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Require image path and Workload Identity
+        if: success() && steps.precheck.outputs.skip != 'true'
+        env:
+          GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
+        run: |
+          set -euo pipefail
+          image=$(bash pipeline/.github/scripts/require-needtoken-image.sh "$IMAGE")
+          echo "IMAGE=${image}" >>"$GITHUB_ENV"
+          if [[ -z "$GCP_WORKLOAD_IDENTITY_PROVIDER" || -z "$GCP_SERVICE_ACCOUNT" ]]; then
+            echo "::error::Set repository variables GCP_WORKLOAD_IDENTITY_PROVIDER and GCP_SERVICE_ACCOUNT. Do not create a JSON key."
+            exit 1
+          fi
+          if [[ "$GCP_WORKLOAD_IDENTITY_PROVIDER" == *"{"* || "$GCP_WORKLOAD_IDENTITY_PROVIDER" == *".json"* || "$GCP_SERVICE_ACCOUNT" == *"{"* ]]; then
+            echo "::error::refusing a JSON service-account key"
+            exit 1
+          fi
+          case "$GCP_SERVICE_ACCOUNT" in
+            *@*.iam.gserviceaccount.com) ;;
+            *)
+              echo "::error::GCP_SERVICE_ACCOUNT must be a service account email"
+              exit 1
+              ;;
+          esac
+          case "$GCP_WORKLOAD_IDENTITY_PROVIDER" in
+            projects/*/locations/global/workloadIdentityPools/*/providers/*) ;;
+            https://iam.googleapis.com/projects/*/locations/global/workloadIdentityPools/*/providers/*) ;;
+            *)
+              echo "::error::GCP_WORKLOAD_IDENTITY_PROVIDER is not a workload identity provider resource"
+              exit 1
+              ;;
+          esac
+
+      - name: Authenticate to Google Cloud
+        if: success() && steps.precheck.outputs.skip != 'true'
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up gcloud
+        if: success() && steps.precheck.outputs.skip != 'true'
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+
+      - name: Configure Artifact Registry docker auth
+        if: success() && steps.precheck.outputs.skip != 'true'
+        run: gcloud auth configure-docker asia-southeast1-docker.pkg.dev --quiet
+
+      - name: Plan image and rollback target
+        id: plan
+        if: success() && steps.precheck.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          describe="$RUNNER_TEMP/service-before.json"
+          gcloud run services describe "$SERVICE" \
+            --project "$GCP_PROJECT" \
+            --region "$GCP_REGION" \
+            --format=json >"$describe"
+          spec=$(jq -r '[.status.traffic[] | select(.percent != null) | "\(.revisionName)=\(.percent)"] | join(",")' "$describe")
+          sum=$(jq -r '[.status.traffic[] | select(.percent != null) | .percent] | add // 0' "$describe")
+          if [[ -z "$spec" || ! "$spec" =~ ^[A-Za-z0-9.=,-]+$ || "$sum" != "100" ]]; then
+            echo "::error::${SERVICE} has no restorable traffic percentage"
+            exit 1
+          fi
+          echo "PREVIOUS_TRAFFIC=${spec}" >>"$GITHUB_ENV"
+          rev100=$(jq -r '[.status.traffic[] | select(.percent == 100) | .revisionName] | first // empty' "$describe")
+          serving_image=""
+          if [[ -n "$rev100" ]]; then
+            serving_image=$(gcloud run revisions describe "$rev100" \
+              --project "$GCP_PROJECT" \
+              --region "$GCP_REGION" \
+              --format='value(spec.containers[0].image)')
+          fi
+          {
+            echo "## Current Cloud Run"
+            echo "- revision: \`${rev100:-none}\`"
+            echo "- image: \`${serving_image:-none}\`"
+            echo "- traffic: \`${spec}\`"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+          err="$RUNNER_TEMP/image-describe.err"
+          set +e
+          existing=$(gcloud artifacts docker images describe "${IMAGE}:${GIT_SHA}" \
+            --project "$GCP_PROJECT" \
+            --format='value(image_summary.digest)' 2>"$err")
+          code=$?
+          set -e
+          existing=$(printf '%s' "$existing" | tr -d '[:space:]')
+          reuse=false
+          if [[ "$code" -eq 0 && "$existing" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            reuse=true
+          elif [[ "$code" -ne 0 ]] && grep -Eiq 'not found|NOT_FOUND' "$err"; then
+            reuse=false
+          else
+            cat "$err" >&2
+            echo "::error::could not resolve the existing image tag"
+            exit 1
+          fi
+
+          if [[ "$reuse" == "true" && "$serving_image" == "${IMAGE}@${existing}" ]]; then
+            echo "skip=true" >>"$GITHUB_OUTPUT"
+            echo "reuse=true" >>"$GITHUB_OUTPUT"
+            echo "digest=${existing}" >>"$GITHUB_OUTPUT"
+            echo "DEPLOY_RESULT=skipped-already-serving" >>"$GITHUB_ENV"
+            echo "DEPLOY_DIGEST=${existing}" >>"$GITHUB_ENV"
+            {
+              echo "## Deploy skipped"
+              echo "\`${GIT_SHA}\` is already serving \`${IMAGE}@${existing}\`."
+            } >>"$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          echo "skip=false" >>"$GITHUB_OUTPUT"
+          if [[ "$reuse" == "true" ]]; then
+            echo "reuse=true" >>"$GITHUB_OUTPUT"
+            echo "digest=${existing}" >>"$GITHUB_OUTPUT"
+          else
+            echo "reuse=false" >>"$GITHUB_OUTPUT"
+            echo "digest=" >>"$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Docker Buildx
+        if: success() && steps.precheck.outputs.skip != 'true' && steps.plan.outputs.skip != 'true' && steps.plan.outputs.reuse != 'true'
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      # provenance and sbom stay off so Cloud Run receives a single linux/amd64 manifest.
+      - name: Build and push image
+        id: build
+        if: success() && steps.precheck.outputs.skip != 'true' && steps.plan.outputs.skip != 'true' && steps.plan.outputs.reuse != 'true'
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: src
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          sbom: false
+          tags: ${{ env.IMAGE }}:${{ env.GIT_SHA }}
+
+      - name: Select image digest
+        if: success() && steps.precheck.outputs.skip != 'true' && steps.plan.outputs.skip != 'true'
+        env:
+          REUSE: ${{ steps.plan.outputs.reuse }}
+          PLAN_DIGEST: ${{ steps.plan.outputs.digest }}
+          BUILD_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          if [[ "$REUSE" == "true" ]]; then
+            digest="$PLAN_DIGEST"
+          else
+            digest="$BUILD_DIGEST"
+          fi
+          digest=$(printf '%s' "$digest" | tr -d '[:space:]')
+          if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::refusing image digest"
+            exit 1
+          fi
+          echo "DEPLOY_DIGEST=${digest}" >>"$GITHUB_ENV"
+          echo "DEPLOY_RESULT=image-ready" >>"$GITHUB_ENV"
+
+      - name: Create revision without traffic
+        if: success() && steps.precheck.outputs.skip != 'true' && steps.plan.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          gcloud run services update "$SERVICE" \
+            --project "$GCP_PROJECT" \
+            --region "$GCP_REGION" \
+            --image="${IMAGE}@${DEPLOY_DIGEST}" \
+            --no-traffic \
+            --tag=candidate
+          after="$RUNNER_TEMP/service-candidate.json"
+          gcloud run services describe "$SERVICE" \
+            --project "$GCP_PROJECT" \
+            --region "$GCP_REGION" \
+            --format=json >"$after"
+          rev=$(jq -r '[.status.traffic[] | select(.tag=="candidate") | .revisionName] | first // empty' "$after")
+          url=$(jq -r '[.status.traffic[] | select(.tag=="candidate") | .url] | first // empty' "$after")
+          if [[ ! "$rev" =~ ^[a-z][a-z0-9-]{0,62}$ || ! "$url" =~ ^https://[A-Za-z0-9.-]+/?$ ]]; then
+            echo "::error::candidate revision URL was not assigned"
+            exit 1
+          fi
+          percent=$(jq -r --arg rev "$rev" '[.status.traffic[] | select(.revisionName==$rev and .percent != null) | .percent] | add // 0' "$after")
+          if [[ "$percent" != "0" ]]; then
+            echo "::error::revision ${rev} has production traffic before smoke; restoring"
+            gcloud run services update-traffic "$SERVICE" \
+              --project "$GCP_PROJECT" \
+              --region "$GCP_REGION" \
+              --to-revisions "$PREVIOUS_TRAFFIC"
+            echo "DEPLOY_RESULT=restored-before-smoke" >>"$GITHUB_ENV"
+            exit 1
+          fi
+          got=$(gcloud run revisions describe "$rev" \
+            --project "$GCP_PROJECT" \
+            --region "$GCP_REGION" \
+            --format='value(spec.containers[0].image)')
+          if [[ "$got" != "${IMAGE}@${DEPLOY_DIGEST}" ]]; then
+            echo "::error::revision image does not match the built digest"
+            exit 1
+          fi
+          ready=False
+          for _ in $(seq 1 30); do
+            ready=$(gcloud run revisions describe "$rev" \
+              --project "$GCP_PROJECT" \
+              --region "$GCP_REGION" \
+              --format=json | jq -r '[.status.conditions[] | select(.type=="Ready") | .status] | first // empty')
+            if [[ "$ready" == "True" ]]; then
+              break
+            fi
+            sleep 10
+          done
+          if [[ "$ready" != "True" ]]; then
+            echo "::error::revision ${rev} did not become Ready"
+            exit 1
+          fi
+          if ! bash pipeline/.github/scripts/smoke-url.sh "$url"; then
+            echo "DEPLOY_RESULT=candidate-smoke-failed" >>"$GITHUB_ENV"
+            echo "DEPLOY_REVISION=${rev}" >>"$GITHUB_ENV"
+            exit 1
+          fi
+          echo "DEPLOY_REVISION=${rev}" >>"$GITHUB_ENV"
+          echo "CANDIDATE_URL=${url}" >>"$GITHUB_ENV"
+          echo "DEPLOY_RESULT=candidate-smoked" >>"$GITHUB_ENV"
+
+      - name: Shift traffic and smoke the public URL
+        if: success() && steps.precheck.outputs.skip != 'true' && steps.plan.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          git -C src fetch --no-tags origin main
+          tip=$(git -C src rev-parse origin/main)
+          if [[ "$REQUIRE_TIP" == "true" && "$tip" != "$GIT_SHA" ]]; then
+            echo "DEPLOY_RESULT=skipped-stale-before-promote" >>"$GITHUB_ENV"
+            {
+              echo "## Promote skipped"
+              echo "main moved to \`${tip}\`. Candidate \`${DEPLOY_REVISION}\` stays at 0% traffic."
+            } >>"$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          gcloud run services update-traffic "$SERVICE" \
+            --project "$GCP_PROJECT" \
+            --region "$GCP_REGION" \
+            --to-revisions "${DEPLOY_REVISION}=100"
+          if ! bash pipeline/.github/scripts/smoke-url.sh "$PUBLIC_BASE_URL"; then
+            echo "::error::public smoke failed; restoring previous traffic"
+            gcloud run services update-traffic "$SERVICE" \
+              --project "$GCP_PROJECT" \
+              --region "$GCP_REGION" \
+              --to-revisions "$PREVIOUS_TRAFFIC"
+            echo "DEPLOY_RESULT=rolled-back" >>"$GITHUB_ENV"
+            exit 1
+          fi
+          echo "DEPLOY_RESULT=serving" >>"$GITHUB_ENV"
+          {
+            echo "## Deployed"
+            echo "- sha: \`${GIT_SHA}\`"
+            echo "- image: \`${IMAGE}@${DEPLOY_DIGEST}\`"
+            echo "- revision: \`${DEPLOY_REVISION}\`"
+            echo "- public: ${PUBLIC_BASE_URL}"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Write job summary
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## NeedToken Cloud Run"
+            echo "- job: \`${JOB_STATUS}\`"
+            echo "- result: \`${DEPLOY_RESULT:-not-run}\`"
+            echo "- sha: \`${GIT_SHA}\`"
+            echo "- image: \`${IMAGE}${DEPLOY_DIGEST:+@${DEPLOY_DIGEST}}\`"
+            echo "- revision: \`${DEPLOY_REVISION:-}\`"
+            echo "- candidate: ${CANDIDATE_URL:-}"
+            echo "- public: ${PUBLIC_BASE_URL}"
+          } >>"$GITHUB_STEP_SUMMARY"

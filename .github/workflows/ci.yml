@@ -1,8 +1,14 @@
 name: CI
 
+# Required verification for every pull request and every push to main.
+# Cloud Run deploy waits for this workflow to succeed on the main push SHA.
+# Path-filtered workflows are extra signals and are not the deploy gate.
+
 on:
   pull_request:
     types: [opened, synchronize, closed]
+  push:
+    branches: [main]
 
 permissions:
   contents: read
@@ -11,12 +17,12 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# Checkout the event commit in both jobs. A PR merge ref can disappear while
+# Checkout the event commit in each job. A PR merge ref can disappear while
 # queued runs start, and a base branch can advance after the merge event.
 jobs:
   backend:
     name: Backend vet, build, and test
-    if: github.event.action != 'closed' || github.event.pull_request.merged == true
+    if: github.event_name == 'push' || github.event.action != 'closed' || github.event.pull_request.merged == true
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
@@ -26,7 +32,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          repository: ${{ github.event.pull_request.base.repo.full_name }}
+          repository: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.repo.full_name || github.repository }}
           ref: ${{ github.sha }}
 
       - name: Set up Go
@@ -70,7 +76,7 @@ jobs:
 
   frontend:
     name: Frontend typecheck and test
-    if: github.event.action != 'closed' || github.event.pull_request.merged == true
+    if: github.event_name == 'push' || github.event.action != 'closed' || github.event.pull_request.merged == true
     runs-on: ubuntu-latest
     timeout-minutes: 10
     defaults:
@@ -81,7 +87,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          repository: ${{ github.event.pull_request.base.repo.full_name }}
+          repository: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.repo.full_name || github.repository }}
           ref: ${{ github.sha }}
 
       - name: Set up Bun
@@ -97,3 +103,83 @@ jobs:
 
       - name: Test
         run: bun run test
+
+  fulfillment:
+    name: NeedToken fulfillment databases
+    if: github.event_name == 'push' || github.event.action != 'closed' || github.event.pull_request.merged == true
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    services:
+      mysql:
+        image: mysql:5.7.44
+        env:
+          MYSQL_ROOT_PASSWORD: ci-local-only
+          MYSQL_DATABASE: granttest
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd "mysqladmin ping -h localhost -pci-local-only"
+          --health-interval 5s --health-timeout 5s --health-retries 30
+      postgres:
+        image: postgres:16.15-alpine3.24
+        env:
+          POSTGRES_USER: glue
+          POSTGRES_DB: granttest
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U glue" --health-interval 5s
+          --health-timeout 5s --health-retries 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.repo.full_name || github.repository }}
+          ref: ${{ github.sha }}
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Configure isolated MySQL database for native charset validation
+        run: >-
+          docker exec ${{ job.services.mysql.id }} mysql -uroot -pci-local-only
+          -e 'ALTER DATABASE granttest CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci'
+
+      - name: Vet fulfillment packages
+        run: go vet ./model ./middleware ./controller ./router
+
+      - name: Native grants and adjacent regressions on all three databases
+        env:
+          TEST_MYSQL_DSN: "root:ci-local-only@tcp(127.0.0.1:3306)/granttest?charset=utf8mb4&parseTime=True&loc=Local"
+          TEST_POSTGRES_DSN: "postgres://glue@127.0.0.1:5432/granttest?sslmode=disable"
+        run: go test ./model ./middleware ./controller ./router -count=1 -timeout=180s
+
+  ops-scripts:
+    name: Ops script checks
+    if: github.event_name == 'push' || github.event.action != 'closed' || github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.repo.full_name || github.repository }}
+          ref: ${{ github.sha }}
+
+      - name: Syntax-check ops scripts
+        run: |
+          set -euo pipefail
+          for file in .github/scripts/*.sh; do
+            bash -n "$file"
+          done
+
+      - name: Run ops script tests
+        run: |
+          set -euo pipefail
+          bash .github/scripts/resolve-upstream-channel.test.sh
+          bash .github/scripts/require-needtoken-image.test.sh
+          bash .github/scripts/require-success-json.test.sh
+          bash .github/scripts/sync-upstream-merge.test.sh
+          bash .github/scripts/workflow-guards.test.sh
