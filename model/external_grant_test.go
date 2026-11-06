@@ -9,6 +9,7 @@ import (
 	"os"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
@@ -228,6 +229,7 @@ func testExternalGrantContracts(t *testing.T, db *gorm.DB) {
 	assert.NotContains(t, string(encoded), user.Password)
 	assert.NotContains(t, string(encoded), "email")
 	assert.Positive(t, summary.CollectedAt)
+	testCustomerSubscriptionTimeZone(t, user, token)
 
 	// Repeated startup preserves the committed association and uniqueness.
 	for range 2 {
@@ -239,6 +241,76 @@ func testExternalGrantContracts(t *testing.T, db *gorm.DB) {
 	duplicate := *first
 	assert.Error(t, db.Create(&duplicate).Error)
 	testManagedSubscriptionGrant(t, db, user, plan)
+}
+
+func testCustomerSubscriptionTimeZone(t *testing.T, user User, token Token) {
+	t.Helper()
+	newYork, err := time.LoadLocation("America/New_York")
+	require.NoError(t, err)
+	shanghai, err := time.LoadLocation("Asia/Shanghai")
+	require.NoError(t, err)
+	utcReloaded, err := time.LoadLocation("UTC")
+	require.NoError(t, err)
+	alias, err := time.LoadLocation("US/Eastern")
+	require.NoError(t, err)
+	previous := time.Local
+	t.Cleanup(func() { time.Local = previous })
+	monthStart := time.Date(2026, time.February, 8, 17, 0, 0, 0, time.UTC).Unix()
+	yearStart := time.Date(2025, time.March, 8, 17, 0, 0, 0, time.UTC).Unix()
+	for _, test := range []struct {
+		name     string
+		location *time.Location
+		want     string
+		monthEnd time.Time
+		yearEnd  time.Time
+	}{
+		{"UTC", time.UTC, "UTC", time.Date(2026, time.March, 8, 17, 0, 0, 0, time.UTC), time.Date(2026, time.March, 8, 17, 0, 0, 0, time.UTC)},
+		{"reloaded_UTC", utcReloaded, "UTC", time.Date(2026, time.March, 8, 17, 0, 0, 0, time.UTC), time.Date(2026, time.March, 8, 17, 0, 0, 0, time.UTC)},
+		{"New_York_DST", newYork, "America/New_York", time.Date(2026, time.March, 8, 16, 0, 0, 0, time.UTC), time.Date(2026, time.March, 8, 16, 0, 0, 0, time.UTC)},
+		{"Shanghai", shanghai, "Asia/Shanghai", time.Date(2026, time.March, 8, 17, 0, 0, 0, time.UTC), time.Date(2026, time.March, 8, 17, 0, 0, 0, time.UTC)},
+		{"reloadable_IANA_alias", alias, "US/Eastern", time.Date(2026, time.March, 8, 16, 0, 0, 0, time.UTC), time.Date(2026, time.March, 8, 16, 0, 0, 0, time.UTC)},
+		{"unknown_Local", time.FixedZone("Local", 0), "", time.Time{}, time.Time{}},
+		{"unknown_fixed_zone", time.FixedZone("fixed-offset", 8*3600), "", time.Time{}, time.Time{}},
+		{"forged_IANA_name", time.FixedZone("America/New_York", -5*3600), "", time.Time{}, time.Time{}},
+		{"forged_UTC_name", time.FixedZone("UTC", 3600), "", time.Time{}, time.Time{}},
+	} {
+		t.Run("subscription_time_zone/"+test.name, func(t *testing.T) {
+			time.Local = test.location
+			t.Cleanup(func() { time.Local = previous })
+			summary, err := GetCustomerQuotaSummary(context.Background(), user.Id)
+			require.NoError(t, err)
+			assert.Equal(t, test.want, summary.SubscriptionTimeZone)
+			encoded, err := common.Marshal(summary)
+			require.NoError(t, err)
+			var data map[string]any
+			require.NoError(t, common.Unmarshal(encoded, &data))
+			assert.Equal(t, test.want, data["subscription_time_zone"], "unknown must remain an explicit empty field")
+			assert.NotContains(t, string(encoded), token.Key)
+			assert.NotContains(t, string(encoded), user.Password)
+			assert.NotContains(t, string(encoded), "email")
+			if test.want == "" {
+				return
+			}
+			location, err := time.LoadLocation(summary.SubscriptionTimeZone)
+			require.NoError(t, err)
+			for _, duration := range []struct {
+				unit  string
+				start int64
+				end   time.Time
+			}{
+				{SubscriptionDurationMonth, monthStart, test.monthEnd},
+				{SubscriptionDurationYear, yearStart, test.yearEnd},
+			} {
+				plan := SubscriptionPlan{DurationUnit: duration.unit, DurationValue: 1}
+				nativeEnd, err := calcPlanEndTime(time.Unix(duration.start, 0), &plan)
+				require.NoError(t, err)
+				assert.Equal(t, duration.end.Unix(), nativeEnd, "native %s duration", duration.unit)
+				verifiedEnd, err := calcPlanEndTime(time.Unix(duration.start, 0).In(location), &plan)
+				require.NoError(t, err)
+				assert.Equal(t, nativeEnd, verifiedEnd, "reported rules must reproduce native calendar arithmetic")
+			}
+		})
+	}
 }
 
 // Simulate the released receipt schema before managed_token_id existed. The
