@@ -1,9 +1,10 @@
 // Production Worker. workers.dev is off. No routes and no custom domain.
 // A minute cron keeps the single container instance-0 from going idle.
-// The image is a digest placeholder for an image copied into the Cloudflare
-// registry. It is not a path or tag built from this repository.
-// Replace ACCOUNT_ID and the digest before a real start. Do not commit secret values.
-// Secrets are Worker secrets (wrangler secret put) and are passed through at start.
+// image is the repository Dockerfile used for the production image.
+// Wrangler builds it on deploy. The build context is the repository root.
+// Do not set vars. A var with the same name replaces an existing secret.
+// SESSION_COOKIE_TRUSTED_URL, NEWAPI_BASE_URL, and GLUE_PUBLIC_URL stay unset here.
+// Secrets are Worker secrets and are passed through at start.
 // Custom sizes on the default policy need at least 1 vCPU and 3 GiB of memory
 // per vCPU, so 512 MiB is not legal. basic is the predefined type at 1 GiB,
 // above the current Cloud Run 512 MiB.
@@ -33,9 +34,13 @@
     {
       "class_name": "NeedtokenApiContainer",
       "scheduling_policy": "default",
-      "image": "registry.cloudflare.com/ACCOUNT_ID/IMAGE@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "image": "../Dockerfile",
+      "image_build_context": "..",
       "instance_type": "basic",
-      "max_instances": 2
+      "max_instances": 2,
+      "constraints": {
+        "regions": ["APAC"]
+      }
     }
   ],
   "durable_objects": {

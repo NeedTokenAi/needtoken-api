@@ -67,7 +67,7 @@ test("waitForPort accepts the first response and retries a closed port", async (
   assert.equal(calls, 2);
 });
 
-test("wrangler config is a digest placeholder with the production size", () => {
+test("wrangler config builds the production Dockerfile in APAC", () => {
   const text = readFileSync(new URL("../wrangler.jsonc", import.meta.url), "utf8");
   const json = JSON.parse(text.replace(/^\s*\/\/.*$/gm, ""));
   assert.equal(json.name, "needtoken-api");
@@ -76,14 +76,22 @@ test("wrangler config is a digest placeholder with the production size", () => {
   assert.equal(json.preview_urls, false);
   assert.equal(json.routes, undefined);
   assert.equal(json.route, undefined);
+  assert.equal(json.vars, undefined);
+  assert.equal(json.observability.enabled, true);
   assert.equal(text.includes("needtoken.ai"), false);
-  assert.equal(text.includes("Dockerfile"), false);
   assert.equal(text.includes("-staging"), false);
+  const serialized = JSON.stringify(json);
+  for (const key of ["SESSION_COOKIE_TRUSTED_URL", "NEWAPI_BASE_URL", "GLUE_PUBLIC_URL"]) {
+    assert.equal(serialized.includes(key), false);
+  }
   const container = json.containers[0];
+  assert.equal(container.scheduling_policy, "default");
   assert.equal(container.max_instances, 2);
   assert.equal(container.instance_type, "basic");
-  assert.match(container.image, /^registry\.cloudflare\.com\/ACCOUNT_ID\/IMAGE@sha256:0{64}$/);
-  assert.equal(container.image.includes("needtoken-api"), false);
+  assert.equal(container.image, "../Dockerfile");
+  assert.equal(container.image_build_context, "..");
+  assert.equal(container.image_vars, undefined);
+  assert.deepEqual(container.constraints.regions, ["APAC"]);
 });
 
 test("only instance-0 is addressed and sleep is the 6 hour maximum", () => {
