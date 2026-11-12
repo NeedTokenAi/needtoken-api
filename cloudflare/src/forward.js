@@ -9,6 +9,12 @@ export const INSTANCE_NAME = "instance-0";
 // The minute cron hits this instance so the timeout does not expire.
 export const INACTIVITY_TIMEOUT_MS = 6 * 60 * 60 * 1000;
 
+// One probe. A closed port returns 503 instead of blocking the caller.
+// The cron retries that 503 on the same instance until this deadline.
+export const PROBE_ATTEMPTS = 1;
+export const RETRY_AFTER_SECONDS = 5;
+export const READY_DEADLINE_MS = 4 * 60 * 1000;
+
 export function residentStub(namespace) {
   if (!namespace || typeof namespace.getByName !== "function") {
     throw new Error("container binding is absent");
@@ -44,9 +50,45 @@ export function containerRequest(request) {
   return forwarded;
 }
 
+export function containerNotReadyError(cause) {
+  const error = new Error("container did not become ready on port 8080");
+  error.name = "ContainerNotReadyError";
+  if (cause !== undefined) {
+    error.cause = cause;
+  }
+  return error;
+}
+
+export function isContainerNotReady(error) {
+  if (!error || typeof error !== "object") {
+    return false;
+  }
+  if (error.name === "ContainerNotReadyError") {
+    return true;
+  }
+  return typeof error.message === "string" && error.message.includes("did not become ready");
+}
+
+export function notReadyResponse() {
+  return new Response("container did not become ready on port 8080", {
+    status: 503,
+    headers: {
+      "retry-after": String(RETRY_AFTER_SECONDS),
+      "cache-control": "no-store",
+    },
+  });
+}
+
+export function startupFailureResponse(error) {
+  if (!isContainerNotReady(error)) {
+    return undefined;
+  }
+  return notReadyResponse();
+}
+
 // start() returns before the process listens. Any HTTP response means the
 // port accepted a connection. The response body is not read.
-export async function waitForPort(fetchPort, wait, attempts = 100) {
+export async function waitForPort(fetchPort, wait, attempts = PROBE_ATTEMPTS) {
   let lastError;
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     try {
@@ -62,7 +104,19 @@ export async function waitForPort(fetchPort, wait, attempts = 100) {
       await wait(200);
     }
   }
-  const error = new Error("container port 8080 did not accept a connection");
-  error.cause = lastError;
-  throw error;
+  throw containerNotReadyError(lastError);
+}
+
+// Retry a 503 from the one routed instance. Other statuses are returned as-is.
+export async function awaitInstance(fetchInstance, wait, deadlineMs = READY_DEADLINE_MS, now = Date.now) {
+  const started = now();
+  let response = await fetchInstance();
+  while (response.status === 503 && now() - started < deadlineMs) {
+    if (response.body && typeof response.body.cancel === "function") {
+      await response.body.cancel();
+    }
+    await wait(RETRY_AFTER_SECONDS * 1000);
+    response = await fetchInstance();
+  }
+  return response;
 }
