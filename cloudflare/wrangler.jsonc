@@ -1,4 +1,5 @@
-// Production Worker. Serves on workers.dev only: no routes and no custom domain.
+// Production Worker. workers.dev is off. No routes and no custom domain.
+// A minute cron keeps the single container instance-0 from going idle.
 // The image is a digest placeholder for an image copied into the Cloudflare
 // registry. It is not a path or tag built from this repository.
 // Replace ACCOUNT_ID and the digest before a real start. Do not commit secret values.
@@ -12,7 +13,10 @@
   "main": "src/index.js",
   "compatibility_date": "2026-11-12",
   "compatibility_flags": ["nodejs_compat"],
-  "workers_dev": true,
+  "workers_dev": false,
+  "triggers": {
+    "crons": ["* * * * *"]
+  },
   "preview_urls": false,
   "observability": {
     "enabled": true,

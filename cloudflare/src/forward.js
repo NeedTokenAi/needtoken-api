@@ -1,6 +1,21 @@
 // App port the Worker dials. The container is given the same port below.
 export const APP_PORT = 8080;
 
+// One Durable Object name. max_instances 2 would allow a second container,
+// and each container runs the in-process loops. Only this name is used.
+export const INSTANCE_NAME = "instance-0";
+
+// setInactivityTimeout rejects a duration above 6 hours. 24h is not accepted.
+// The minute cron hits this instance so the timeout does not expire.
+export const INACTIVITY_TIMEOUT_MS = 6 * 60 * 60 * 1000;
+
+export function residentStub(namespace) {
+  if (!namespace || typeof namespace.getByName !== "function") {
+    throw new Error("container binding is absent");
+  }
+  return namespace.getByName(INSTANCE_NAME);
+}
+
 // Copy Worker vars and secrets as strings. Bindings that are not strings are
 // omitted because container env values must be strings. Other values are not
 // rewritten, including an empty Redis prefix. PORT is set to 8080 because

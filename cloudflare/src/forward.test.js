@@ -1,7 +1,15 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
-import { APP_PORT, containerEnv, containerRequest, waitForPort } from "./forward.js";
+import {
+  APP_PORT,
+  INACTIVITY_TIMEOUT_MS,
+  INSTANCE_NAME,
+  containerEnv,
+  containerRequest,
+  residentStub,
+  waitForPort,
+} from "./forward.js";
 
 test("forwards to port 8080 and copies env strings unchanged", () => {
   assert.equal(APP_PORT, 8080);
@@ -63,7 +71,8 @@ test("wrangler config is a digest placeholder with the production size", () => {
   const text = readFileSync(new URL("../wrangler.jsonc", import.meta.url), "utf8");
   const json = JSON.parse(text.replace(/^\s*\/\/.*$/gm, ""));
   assert.equal(json.name, "needtoken-api");
-  assert.equal(json.workers_dev, true);
+  assert.equal(json.workers_dev, false);
+  assert.deepEqual(json.triggers.crons, ["* * * * *"]);
   assert.equal(json.preview_urls, false);
   assert.equal(json.routes, undefined);
   assert.equal(json.route, undefined);
@@ -75,4 +84,18 @@ test("wrangler config is a digest placeholder with the production size", () => {
   assert.equal(container.instance_type, "basic");
   assert.match(container.image, /^registry\.cloudflare\.com\/ACCOUNT_ID\/IMAGE@sha256:0{64}$/);
   assert.equal(container.image.includes("needtoken-api"), false);
+});
+
+test("only instance-0 is addressed and sleep is the 6 hour maximum", () => {
+  const names = [];
+  const stub = residentStub({
+    getByName(name) {
+      names.push(name);
+      return { name };
+    },
+  });
+  assert.equal(INSTANCE_NAME, "instance-0");
+  assert.deepEqual(names, ["instance-0"]);
+  assert.equal(stub.name, "instance-0");
+  assert.equal(INACTIVITY_TIMEOUT_MS, 6 * 60 * 60 * 1000);
 });
