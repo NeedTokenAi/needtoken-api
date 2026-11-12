@@ -1,0 +1,59 @@
+name: Cloudflare staging image
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cloudflare-staging-image
+  cancel-in-progress: false
+
+jobs:
+  image:
+    name: Build and push the staging image
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+      repository: ${{ steps.push.outputs.repository }}
+      sha: ${{ steps.push.outputs.sha }}
+      run_id: ${{ steps.push.outputs.run_id }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Build and push
+        id: push
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CLOUDFLARE_API_TOKEN}" ] || [ -z "${CLOUDFLARE_ACCOUNT_ID}" ]; then
+            echo "Cloudflare registry credentials are absent"
+            exit 1
+          fi
+          npm install --global wrangler@4.160.1
+          npx wrangler containers build -p -t needtoken-api-staging .
+          image="registry.cloudflare.com/${CLOUDFLARE_ACCOUNT_ID}/needtoken-api-staging"
+          digest="$(docker image inspect --format '{{join .RepoDigests "\n"}}' "${image}" 2>/dev/null | awk '/^registry\.cloudflare\.com\// { print; exit }' || true)"
+          if [ -z "${digest}" ]; then
+            hash="$(docker manifest inspect -v "${image}:latest" | python3 -c 'import json,sys; print(json.load(sys.stdin)["Descriptor"]["digest"])')"
+            digest="${image}@${hash}"
+          fi
+          case "${digest}" in
+            registry.cloudflare.com/*/needtoken-api-staging@sha256:*) ;;
+            *) echo "push did not return a registry digest"; exit 1 ;;
+          esac
+          {
+            echo "digest=${digest}"
+            echo "repository=${GITHUB_REPOSITORY}"
+            echo "sha=${GITHUB_SHA}"
+            echo "run_id=${GITHUB_RUN_ID}"
+          } >> "${GITHUB_OUTPUT}"
+          echo "repository=${GITHUB_REPOSITORY}"
+          echo "sha=${GITHUB_SHA}"
+          echo "run_id=${GITHUB_RUN_ID}"
+          echo "digest=${digest}"
