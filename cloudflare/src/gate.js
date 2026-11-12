@@ -30,12 +30,46 @@ export function parseAllowlist(value) {
     .filter((item) => item !== "")
 }
 
+export const ALLOWED_DATABASE_HOST = "ep-aged-sunset-b33os2qw.c-4.ap-southeast-1.aws.neon.tech"
+
+export function neonPoolerTwin(host) {
+  const name = String(host || "").trim().toLowerCase()
+  const dot = name.indexOf(".")
+  if (dot <= 0) {
+    return ""
+  }
+  const first = name.slice(0, dot)
+  const rest = name.slice(dot + 1)
+  if (first.includes("*") || first.includes("/")) {
+    return ""
+  }
+  const marker = "-pooler"
+  if (first.endsWith(marker)) {
+    const base = first.slice(0, -marker.length)
+    if (base === "" || base.endsWith("-")) {
+      return ""
+    }
+    return base + "." + rest
+  }
+  return first + marker + "." + rest
+}
+
+export function databaseHostAllowed(host, allowlist) {
+  const name = String(host || "").trim().toLowerCase()
+  const pooler = neonPoolerTwin(ALLOWED_DATABASE_HOST)
+  if (name !== ALLOWED_DATABASE_HOST && name !== pooler) {
+    return false
+  }
+  return hostOnAllowlist(name, allowlist)
+}
+
 export function hostOnAllowlist(host, allowlist) {
   const name = String(host || "").trim().toLowerCase()
   if (name === "" || name.includes("*") || name.includes("/") || name.includes(",")) {
     return false
   }
-  return allowlist.some((entry) => entry === name)
+  const twin = neonPoolerTwin(name)
+  return allowlist.some((entry) => entry === name || (twin !== "" && entry === twin))
 }
 
 export function writerPermitAccepted(value) {

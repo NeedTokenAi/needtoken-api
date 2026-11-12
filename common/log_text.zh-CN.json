@@ -866,6 +866,7 @@
   "cloudflare profile refuses LOG_SQL_DSN that is not a separate isolated database": "Cloudflare 配置拒绝不是独立隔离库的 LOG_SQL_DSN",
   "cloudflare profile refuses LOG_SQL_DSN that is not the isolated main database": "Cloudflare 配置拒绝不是隔离主库的 LOG_SQL_DSN",
   "cloudflare profile refuses a Redis host outside the isolated allowlist": "Cloudflare 配置拒绝隔离名单之外的 Redis 主机",
+  "cloudflare profile refuses to consume production queues": "Cloudflare 配置拒绝消费生产队列",
   "cloudflare profile refuses a test writer permit": "Cloudflare 配置拒绝测试用的写入许可",
   "cloudflare profile refuses a writer permit that is absent": "Cloudflare 配置拒绝缺失的写入许可",
   "cloudflare profile refuses SQL before isolation and the writer permit": "Cloudflare 配置拒绝在隔离和写入许可之前打开 SQL",

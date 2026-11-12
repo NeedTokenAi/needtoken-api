@@ -6,6 +6,8 @@ import { createController, schedulerWait, userTrafficReady, waitForReady } from 
 import { containerRequest, forwardUpstream } from "../src/proxy.js"
 import { routeSingleton, secretBindings, SINGLETON_NAME } from "../src/singleton.js"
 
+const DATABASE_HOST = "ep-aged-sunset-b33os2qw.c-4.ap-southeast-1.aws.neon.tech"
+const DATABASE_POOLER = "ep-aged-sunset-b33os2qw-pooler.c-4.ap-southeast-1.aws.neon.tech"
 const DIGEST = "sha256:" + "ab".repeat(32)
 const PREVIOUS = "sha256:" + "cd".repeat(32)
 const ACCOUNT = "a".repeat(32)
@@ -21,15 +23,15 @@ function fixtureEnv(overrides = {}) {
     CLOUDFLARE_PROFILE: "1",
     NEEDTOKEN_RUNTIME: "staging",
     NEEDTOKEN_LOG_SQL: "main",
-    SQL_DSN: "postgres://db.staging.internal/needtoken",
-    LOG_SQL_DSN: "postgres://db.staging.internal/needtoken",
+    SQL_DSN: "postgres://" + DATABASE_HOST + "/needtoken",
+    LOG_SQL_DSN: "postgres://" + DATABASE_HOST + "/needtoken",
     SESSION_SECRET: "fixture-session",
     CRYPTO_SECRET: "fixture-crypto",
-    REDIS_CONN_STRING: "redis://redis.staging.internal:6379",
-    DATABASE_HOST: "db.staging.internal",
-    REDIS_HOST: "redis.staging.internal",
-    NEEDTOKEN_HOST_ALLOWLIST: "db.staging.internal,redis.staging.internal",
+    REDIS_CONN_STRING: "rediss://us1-example.upstash.io:6379",
+    DATABASE_HOST: DATABASE_HOST,
+    NEEDTOKEN_HOST_ALLOWLIST: DATABASE_HOST,
     NEEDTOKEN_WRITER_PERMIT: "staging-writer",
+    NEEDTOKEN_QUEUE_CONSUMERS: "off",
     NEEDTOKEN_BUILD_REPOSITORY: "NeedTokenAi/needtoken-api",
     NEEDTOKEN_BUILD_SHA: "b33721ae32f468dba889071b9cbba252b27d7f0c",
     NEEDTOKEN_BUILD_RUN_ID: "43174047407",
@@ -166,6 +168,24 @@ test("boot follows the injected allowlist and the attested image", () => {
   const missingCrypto = planBoot(fixtureEnv({ CRYPTO_SECRET: "" }), images)
   assert.equal(missingCrypto.reason, "CRYPTO_SECRET binding is absent")
 
+  const sharedRedis = planBoot(fixtureEnv({
+    REDIS_CONN_STRING: "rediss://production.upstash.io:6379",
+    REDIS_HOST: "production.upstash.io",
+  }), images)
+  assert.equal(sharedRedis.authorizesBoot, true)
+  assert.equal(sharedRedis.start.env.REDIS_HOST, undefined)
+
+  const pooler = planBoot(fixtureEnv({
+    SQL_DSN: "postgres://" + DATABASE_POOLER + "/needtoken",
+    LOG_SQL_DSN: "postgres://" + DATABASE_POOLER + "/needtoken",
+    DATABASE_HOST: DATABASE_POOLER,
+  }), images)
+  assert.equal(pooler.authorizesBoot, true)
+
+  const consumers = planBoot(fixtureEnv({ NEEDTOKEN_QUEUE_CONSUMERS: "on" }), images)
+  assert.equal(consumers.authorizesBoot, false)
+  assert.equal(consumers.reason, "production queue consumers are not stopped")
+
   const allowed = planBoot(fixtureEnv(), images)
   assert.equal(allowed.authorizesBoot, true)
   assert.equal(allowed.ok, true)
@@ -173,9 +193,10 @@ test("boot follows the injected allowlist and the attested image", () => {
   assert.deepEqual(allowed.attestedDigests, [IMAGE])
   assert.equal(allowed.start.enableInternet, true)
   assert.deepEqual(allowed.start.instance, { vcpu: 1, memoryMib: 2048, diskMb: 8000 })
-  assert.equal(allowed.start.env.SQL_DSN, "postgres://db.staging.internal/needtoken")
+  assert.equal(allowed.start.env.SQL_DSN, "postgres://" + DATABASE_HOST + "/needtoken")
   assert.equal(allowed.start.env.LOG_SQL_DSN, allowed.start.env.SQL_DSN)
   assert.equal(allowed.start.env.CRYPTO_SECRET, "fixture-crypto")
+  assert.equal(allowed.start.env.NEEDTOKEN_QUEUE_CONSUMERS, "off")
   assert.equal(allowed.start.env.CLOUDFLARE_API_TOKEN, undefined)
   assert.equal(allowed.start.image, IMAGE)
 })

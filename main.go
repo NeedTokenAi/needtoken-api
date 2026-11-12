@@ -110,7 +110,9 @@ func main() {
 
 		go model.SyncChannelCache(common.SyncFrequency)
 	}
-	wsmanager.StartSubscriber(context.Background())
+	if !cloudflareprofile.QueueConsumersStopped(os.Getenv) {
+		wsmanager.StartSubscriber(context.Background())
+	}
 
 	// Warm pricing after channel cache initialization so Advanced Custom
 	// endpoint inference can read cached route settings on first request.
@@ -126,7 +128,7 @@ func main() {
 	// 数据看板
 	go model.UpdateQuotaData()
 
-	if os.Getenv("CHANNEL_UPDATE_FREQUENCY") != "" {
+	if os.Getenv("CHANNEL_UPDATE_FREQUENCY") != "" && !cloudflareprofile.QueueConsumersStopped(os.Getenv) {
 		frequency, err := strconv.Atoi(os.Getenv("CHANNEL_UPDATE_FREQUENCY"))
 		if err != nil {
 			common.FatalLog(common.LogText("failed to parse CHANNEL_UPDATE_FREQUENCY: %s", err.Error()))
@@ -134,15 +136,19 @@ func main() {
 		go controller.AutomaticallyUpdateChannels(frequency)
 	}
 
-	// Codex credential auto-refresh check every 10 minutes, refresh when expires within 1 day
-	service.StartCodexCredentialAutoRefreshTask()
-
-	// Subscription quota reset task (daily/weekly/monthly/custom)
-	service.StartSubscriptionQuotaResetTask()
-
 	// Report this process as a system instance so the System Info page can show
 	// all currently alive nodes in multi-instance deployments.
 	service.StartSystemInstanceReporter()
+
+	// Staging shares the existing Upstash. The switch keeps this process from
+	// claiming scheduled work or subscribing to the shared Redis channel.
+	if !cloudflareprofile.QueueConsumersStopped(os.Getenv) {
+		// Codex credential auto-refresh check every 10 minutes, refresh when expires within 1 day
+		service.StartCodexCredentialAutoRefreshTask()
+
+		// Subscription quota reset task (daily/weekly/monthly/custom)
+		service.StartSubscriptionQuotaResetTask()
+	}
 
 	// Wire task polling adaptor factory (breaks service -> relay import cycle).
 	// Must run before the system task runner starts: the async_task_poll handler
@@ -155,13 +161,15 @@ func main() {
 		return a
 	}
 
-	// Register the periodic channel test, upstream model update, and async task
-	// polling (Midjourney / Suno / video) jobs as scheduled system tasks
-	// (DB-lease dedup across masters + run history), then start the runner that
-	// schedules and executes them. Master-only execution and the UpdateTask
-	// switch are enforced inside the runner and each handler's Enabled().
-	controller.RegisterScheduledSystemTasks()
-	service.StartSystemTaskRunner()
+	if !cloudflareprofile.QueueConsumersStopped(os.Getenv) {
+		// Register the periodic channel test, upstream model update, and async task
+		// polling (Midjourney / Suno / video) jobs as scheduled system tasks
+		// (DB-lease dedup across masters + run history), then start the runner that
+		// schedules and executes them. Master-only execution and the UpdateTask
+		// switch are enforced inside the runner and each handler's Enabled().
+		controller.RegisterScheduledSystemTasks()
+		service.StartSystemTaskRunner()
+	}
 
 	if os.Getenv("BATCH_UPDATE_ENABLED") == "true" {
 		common.BatchUpdateEnabled = true
@@ -457,7 +465,9 @@ func InitResources(profileLost chan struct{}) (*cloudflareprofile.Runtime, error
 		// Don't return error, custom OAuth is not critical
 	}
 
-	service.StartAuthArtifactCleanup()
+	if !cloudflareprofile.QueueConsumersStopped(os.Getenv) {
+		service.StartAuthArtifactCleanup()
+	}
 
 	committed = true
 	return profileRuntime, nil

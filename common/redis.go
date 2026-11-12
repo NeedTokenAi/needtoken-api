@@ -35,6 +35,9 @@ func InitRedisClient() (err error) {
 		SyncFrequency = 60
 	}
 	SysLog(LogText("Redis is enabled"))
+	// REDIS_KEY_PREFIX is not applied. go-redis/v8 Options has no key prefix,
+	// and this process passes the caller's key through. Prefixing those keys
+	// would change cache, quota, session, and lock behavior.
 	opt, err := redis.ParseURL(os.Getenv("REDIS_CONN_STRING"))
 	if err != nil {
 		FatalLog(LogText("failed to parse Redis connection string: %s", err.Error()))

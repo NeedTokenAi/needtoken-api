@@ -89,8 +89,12 @@ export function lintRepo(repo = root) {
       errors.push("image workflow does not output " + field)
     }
   }
-  if (/postgres:\/\/|redis:\/\/|mysql:\/\/|BEGIN PRIVATE|AKIA/.test(readFileSync(wranglerPath, "utf8") + readFileSync(path.join(repo, "cloudflare/wrangler.staging.jsonc"), "utf8"))) {
+  const wranglerText = readFileSync(wranglerPath, "utf8") + readFileSync(path.join(repo, "cloudflare/wrangler.staging.jsonc"), "utf8")
+  if (/postgres:\/\/|redis:\/\/|mysql:\/\/|BEGIN PRIVATE|AKIA/.test(wranglerText)) {
     errors.push("wrangler file contains a credential")
+  }
+  if (/"r2_buckets"/.test(wranglerText)) {
+    errors.push("this service does not use R2")
   }
   if (workflowDeploys(workflow)) {
     errors.push("candidate workflow deploys or follows a push trigger")

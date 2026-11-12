@@ -24,19 +24,20 @@ func TestValidateFailClosedDoesNotEchoSecrets(t *testing.T) {
 			return ""
 		}
 	}
+	const databaseHost = "ep-aged-sunset-b33os2qw.c-4.ap-southeast-1.aws.neon.tech"
 	base := map[string]string{
-		"CLOUDFLARE_PROFILE":       "1",
-		"SQL_DSN":                  "postgres://user:" + secret + "@db.staging.internal/needtoken",
-		"LOG_SQL_DSN":              "postgres://user:" + secret + "@db.staging.internal/needtoken",
-		"SESSION_SECRET":           "session-" + secret,
-		"CRYPTO_SECRET":            "crypto-" + secret,
-		"NEEDTOKEN_LOG_SQL":        "main",
-		"REDIS_CONN_STRING":        "redis://:" + secret + "@redis.staging.internal:6379",
-		"DATABASE_HOST":            "db.staging.internal",
-		"REDIS_HOST":               "redis.staging.internal",
-		"NEEDTOKEN_HOST_ALLOWLIST": "db.staging.internal,redis.staging.internal",
-		"NEEDTOKEN_WRITER_PERMIT":  "staging-writer",
-		"NEEDTOKEN_RUNTIME":        RuntimeStaging,
+		"CLOUDFLARE_PROFILE":        "1",
+		"SQL_DSN":                   "postgres://user:" + secret + "@" + databaseHost + "/needtoken",
+		"LOG_SQL_DSN":               "postgres://user:" + secret + "@" + databaseHost + "/needtoken",
+		"SESSION_SECRET":            "session-" + secret,
+		"CRYPTO_SECRET":             "crypto-" + secret,
+		"NEEDTOKEN_LOG_SQL":         "main",
+		"REDIS_CONN_STRING":         "rediss://default:" + secret + "@us1-example.upstash.io:6379",
+		"DATABASE_HOST":             databaseHost,
+		"NEEDTOKEN_HOST_ALLOWLIST":  databaseHost,
+		"NEEDTOKEN_WRITER_PERMIT":   "staging-writer",
+		"NEEDTOKEN_QUEUE_CONSUMERS": "off",
+		"NEEDTOKEN_RUNTIME":         RuntimeStaging,
 	}
 
 	t.Run("profile off does nothing", func(t *testing.T) {
@@ -125,15 +126,38 @@ func TestValidateFailClosedDoesNotEchoSecrets(t *testing.T) {
 	})
 
 	t.Run("production host and a marker suffix stay outside the allowlist", func(t *testing.T) {
-		for _, host := range []string{"ep-prod.neon.tech", "ep-prod.neon.tech.isolated", "db.staging.internal.isolated"} {
+		for _, host := range []string{"ep-prod.neon.tech", "ep-prod.neon.tech.isolated", "db.staging.internal.isolated", "ep-other-pooler.c-4.ap-southeast-1.aws.neon.tech"} {
 			values := cloneMap(base)
 			values["SQL_DSN"] = "postgres://user:" + secret + "@" + host + "/needtoken"
 			values["LOG_SQL_DSN"] = values["SQL_DSN"]
 			values["DATABASE_HOST"] = host
+			values["NEEDTOKEN_HOST_ALLOWLIST"] = host
 			err := Validate(getenv(values))
 			require.EqualError(t, err, "cloudflare profile refuses a SQL host outside the isolated allowlist")
 			require.NotContains(t, err.Error(), secret)
 			require.NotContains(t, err.Error(), host)
+		}
+	})
+
+	t.Run("the neon pooler is allowed and redis stays on upstash", func(t *testing.T) {
+		values := cloneMap(base)
+		pooler := "ep-aged-sunset-b33os2qw-pooler.c-4.ap-southeast-1.aws.neon.tech"
+		values["SQL_DSN"] = "postgres://user:" + secret + "@" + pooler + "/needtoken"
+		values["LOG_SQL_DSN"] = values["SQL_DSN"]
+		values["DATABASE_HOST"] = pooler
+		values["REDIS_HOST"] = "ep-prod.redis.example"
+		require.NoError(t, Validate(getenv(values)))
+		require.NotContains(t, base["NEEDTOKEN_HOST_ALLOWLIST"], "upstash")
+	})
+
+	t.Run("queue consumers stay stopped", func(t *testing.T) {
+		require.True(t, QueueConsumersStopped(getenv(base)))
+		require.False(t, QueueConsumersStopped(getenv(map[string]string{})))
+		for _, value := range []string{"", "on", "staging:"} {
+			values := cloneMap(base)
+			values["NEEDTOKEN_QUEUE_CONSUMERS"] = value
+			err := Validate(getenv(values))
+			require.EqualError(t, err, "cloudflare profile refuses to consume production queues")
 		}
 	})
 
@@ -174,7 +198,8 @@ func TestValidateFailClosedDoesNotEchoSecrets(t *testing.T) {
 		separateHost["LOG_SQL_DSN"] = "postgres://user:" + secret + "@logs.staging.internal/logs"
 		err = Validate(getenv(separateHost))
 		require.EqualError(t, err, "cloudflare profile refuses a SQL host outside the isolated allowlist")
-		separateHost["NEEDTOKEN_HOST_ALLOWLIST"] = "db.staging.internal,redis.staging.internal,logs.staging.internal"
+		pooler := "ep-aged-sunset-b33os2qw-pooler.c-4.ap-southeast-1.aws.neon.tech"
+		separateHost["LOG_SQL_DSN"] = "postgres://user:" + secret + "@" + pooler + "/logs"
 		require.NoError(t, Validate(getenv(separateHost)))
 	})
 

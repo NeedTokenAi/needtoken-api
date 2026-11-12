@@ -1,7 +1,7 @@
 import {
   PLACEHOLDER_DIGEST,
   attestedDigests,
-  hostOnAllowlist,
+  databaseHostAllowed,
   parseAllowlist,
   writerPermitAccepted,
 } from "./gate.js"
@@ -20,9 +20,9 @@ const PASSTHROUGH_ENV = [
   "CRYPTO_SECRET",
   "NEEDTOKEN_LOG_SQL",
   "DATABASE_HOST",
-  "REDIS_HOST",
   "NEEDTOKEN_HOST_ALLOWLIST",
   "NEEDTOKEN_WRITER_PERMIT",
+  "NEEDTOKEN_QUEUE_CONSUMERS",
 ]
 
 export function planBoot(env, images) {
@@ -55,17 +55,16 @@ export function planBoot(env, images) {
   if (!writerPermitAccepted(source.NEEDTOKEN_WRITER_PERMIT)) {
     return refuse("writer permit is a test value")
   }
+  if (text(source.NEEDTOKEN_QUEUE_CONSUMERS) !== "off") {
+    return refuse("production queue consumers are not stopped")
+  }
   const allowlist = parseAllowlist(source.NEEDTOKEN_HOST_ALLOWLIST)
   if (allowlist.length === 0) {
     return refuse("host allowlist is absent")
   }
   const databaseHost = sqlHost(dsn)
-  const redisHost = sqlHost(source.REDIS_CONN_STRING)
-  if (databaseHost === "" || databaseHost !== text(source.DATABASE_HOST).toLowerCase() || !hostOnAllowlist(databaseHost, allowlist)) {
+  if (databaseHost === "" || databaseHost !== text(source.DATABASE_HOST).toLowerCase() || !databaseHostAllowed(databaseHost, allowlist)) {
     return refuse("SQL host is outside the isolated allowlist")
-  }
-  if (redisHost === "" || redisHost !== text(source.REDIS_HOST).toLowerCase() || !hostOnAllowlist(redisHost, allowlist)) {
-    return refuse("Redis host is outside the isolated allowlist")
   }
   const logSQL = logDatabase(source, allowlist, dsn)
   if (!logSQL.ok) {
@@ -127,7 +126,7 @@ function logDatabase(source, allowlist, sqlDSN) {
       return refuse("LOG_SQL_DSN is not a separate isolated database")
     }
     const host = sqlHost(dsn)
-    if (!hostOnAllowlist(host, allowlist)) {
+    if (!databaseHostAllowed(host, allowlist)) {
       return refuse("log SQL host is outside the isolated allowlist")
     }
     return { ok: true, mode }

@@ -14,21 +14,27 @@ import (
 )
 
 const (
-	envProfile   = "CLOUDFLARE_PROFILE"
-	envRuntime   = "NEEDTOKEN_RUNTIME"
-	envSQL       = "SQL_DSN"
-	envSession   = "SESSION_SECRET"
-	envRedis     = "REDIS_CONN_STRING"
-	envCrypto    = "CRYPTO_SECRET"
-	envLogMode   = "NEEDTOKEN_LOG_SQL"
-	envLogSQL    = "LOG_SQL_DSN"
-	envAllowlist = "NEEDTOKEN_HOST_ALLOWLIST"
-	envDBHost    = "DATABASE_HOST"
-	envRedisHost = "REDIS_HOST"
-	envPermit    = "NEEDTOKEN_WRITER_PERMIT"
-	envSQLite    = "SQLITE_PATH"
-	envPprof     = "ENABLE_PPROF"
-	envToken     = "GENERATE_DEFAULT_TOKEN"
+	envProfile        = "CLOUDFLARE_PROFILE"
+	envRuntime        = "NEEDTOKEN_RUNTIME"
+	envSQL            = "SQL_DSN"
+	envSession        = "SESSION_SECRET"
+	envRedis          = "REDIS_CONN_STRING"
+	envCrypto         = "CRYPTO_SECRET"
+	envLogMode        = "NEEDTOKEN_LOG_SQL"
+	envLogSQL         = "LOG_SQL_DSN"
+	envAllowlist      = "NEEDTOKEN_HOST_ALLOWLIST"
+	envDBHost         = "DATABASE_HOST"
+	envPermit         = "NEEDTOKEN_WRITER_PERMIT"
+	envQueueConsumers = "NEEDTOKEN_QUEUE_CONSUMERS"
+
+	// allowedDatabaseHost is the isolated Neon database. The pooler hostname
+	// inserts "-pooler" before the first dot. Redis is the existing Upstash
+	// and is not on this list.
+	allowedDatabaseHost = "ep-aged-sunset-b33os2qw.c-4.ap-southeast-1.aws.neon.tech"
+	queueConsumersOff   = "off"
+	envSQLite           = "SQLITE_PATH"
+	envPprof            = "ENABLE_PPROF"
+	envToken            = "GENERATE_DEFAULT_TOKEN"
 
 	// RuntimeStaging is the isolated staging process. It is not a production
 	// cutover, and the old Cloud Run process does not read this value.
@@ -47,8 +53,8 @@ const (
 	errDefaultToken    = "cloudflare profile refuses generating a default token"
 	errRuntime         = "cloudflare profile refuses to start a writer"
 	errSQLHost         = "cloudflare profile refuses a SQL host outside the isolated allowlist"
-	errRedisHost       = "cloudflare profile refuses a Redis host outside the isolated allowlist"
 	errPermitAbsent    = "cloudflare profile refuses a writer permit that is absent"
+	errQueueConsumers  = "cloudflare profile refuses to consume production queues"
 	errPermitTest      = "cloudflare profile refuses a test writer permit"
 	errLogMainMismatch = "cloudflare profile refuses LOG_SQL_DSN that is not the isolated main database"
 	errLogSeparateSame = "cloudflare profile refuses LOG_SQL_DSN that is not a separate isolated database"
@@ -118,6 +124,9 @@ func Validate(getenv func(string) string) error {
 	if err := validateWriterPermit(getenv(envPermit)); err != nil {
 		return err
 	}
+	if err := validateQueueConsumers(getenv(envQueueConsumers)); err != nil {
+		return err
+	}
 	allowlist := parseAllowlist(getenv(envAllowlist))
 	if len(allowlist) == 0 {
 		return errors.New(errSQLHost)
@@ -125,11 +134,22 @@ func Validate(getenv func(string) string) error {
 	if err := requireDeclaredHost(dsn, getenv(envDBHost), allowlist); err != nil {
 		return errors.New(errSQLHost)
 	}
-	if err := requireDeclaredHost(getenv(envRedis), getenv(envRedisHost), allowlist); err != nil {
-		return errors.New(errRedisHost)
-	}
 	if err := validateLogDatabase(getenv, dsn, allowlist); err != nil {
 		return err
+	}
+	return nil
+}
+
+// QueueConsumersStopped reports the staging switch. The normal process is
+// unchanged and keeps its schedulers and subscribers. Redis stays the existing
+// Upstash connection; this switch does not rename keys.
+func QueueConsumersStopped(getenv func(string) string) bool {
+	return Enabled(getenv) && strings.TrimSpace(getenv(envQueueConsumers)) == queueConsumersOff
+}
+
+func validateQueueConsumers(value string) error {
+	if strings.TrimSpace(value) != queueConsumersOff {
+		return errors.New(errQueueConsumers)
 	}
 	return nil
 }
@@ -208,10 +228,19 @@ func validateLogDatabase(getenv func(string) string, sqlDSN string, allowlist []
 
 func requireDeclaredHost(dsn, declared string, allowlist []string) error {
 	host, err := hostOfChecked(dsn)
-	if err != nil || !strings.EqualFold(host, strings.TrimSpace(declared)) || !hostOnAllowlist(host, allowlist) {
+	if err != nil || !strings.EqualFold(host, strings.TrimSpace(declared)) || !databaseHostAllowed(host, allowlist) {
 		return errors.New(errSQLHost)
 	}
 	return nil
+}
+
+func databaseHostAllowed(host string, allowlist []string) bool {
+	name := strings.ToLower(strings.TrimSpace(host))
+	pooler := neonPoolerTwin(allowedDatabaseHost)
+	if name != allowedDatabaseHost && name != pooler {
+		return false
+	}
+	return hostOnAllowlist(name, allowlist)
 }
 
 func hostOf(dsn string) string {
@@ -243,12 +272,31 @@ func hostOnAllowlist(host string, allowlist []string) bool {
 	if name == "" || strings.ContainsAny(name, "*/") {
 		return false
 	}
+	twin := neonPoolerTwin(name)
 	for _, entry := range allowlist {
-		if entry == name {
+		if entry == name || (twin != "" && entry == twin) {
 			return true
 		}
 	}
 	return false
+}
+
+// neonPoolerTwin maps a Neon host to its direct or pooler pair. The marker is
+// the "-pooler" suffix of the first label, not a suffix of the whole host.
+func neonPoolerTwin(host string) string {
+	first, rest, ok := strings.Cut(strings.ToLower(strings.TrimSpace(host)), ".")
+	if !ok || first == "" || rest == "" || strings.ContainsAny(first, "*/") {
+		return ""
+	}
+	const marker = "-pooler"
+	if strings.HasSuffix(first, marker) {
+		base := strings.TrimSuffix(first, marker)
+		if base == "" || strings.HasSuffix(base, "-") {
+			return ""
+		}
+		return base + "." + rest
+	}
+	return first + marker + "." + rest
 }
 
 // ForbidsSQLite reports the SQLite fallback that chooseDB would otherwise
