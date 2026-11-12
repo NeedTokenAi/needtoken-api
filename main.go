@@ -81,6 +81,10 @@ func main() {
 		}
 	}()
 
+	if err = cloudflareprofile.PermitSQL(); err != nil {
+		common.FatalLog(common.LogText("failed to initialize resources: %s", err.Error()))
+		return
+	}
 	if common.RedisEnabled {
 		// for compatibility with old versions
 		common.MemoryCacheEnabled = true
@@ -234,6 +238,7 @@ func main() {
 	common.SysLog(common.LogText("received signal: %v, shutting down...", sig))
 	if profileRuntime != nil {
 		profileRuntime.BeginDrain()
+		common.StopCloudflareBackgroundWrites()
 	}
 
 	// SSE streams may run for minutes; give them time to finish before forced exit
@@ -247,12 +252,16 @@ func main() {
 		if err := profileRuntime.WaitIdle(ctx); err != nil {
 			common.SysError(common.LogText("cloudflare profile drain timed out; writer fence was not released"))
 			profileRuntime.StopRenewing()
-		} else if err := profileRuntime.StopAndRelease(context.Background()); err != nil {
-			common.SysError(common.LogText("cloudflare profile failed to release the writer fence: %s", err.Error()))
+		} else {
+			if common.DataExportEnabled {
+				model.SaveQuotaDataCache()
+			}
+			model.FlushPendingBatchUpdates()
+			if err := profileRuntime.StopAndRelease(context.Background()); err != nil {
+				common.SysError(common.LogText("cloudflare profile failed to release the writer fence: %s", err.Error()))
+			}
 		}
-	}
-	// 内存中的看板数据保存入库，避免重启丢失未落库数据 (issue #5679)
-	if common.DataExportEnabled {
+	} else if common.DataExportEnabled {
 		model.SaveQuotaDataCache()
 	}
 	common.SysLog(common.LogText("server exited"))
@@ -363,6 +372,7 @@ func InitResources(profileLost chan struct{}) (*cloudflareprofile.Runtime, error
 		if err = profileRuntime.Beat(context.Background()); err != nil {
 			return nil, err
 		}
+		cloudflareprofile.GrantSQLPermit()
 		go profileRuntime.Loop(context.Background())
 	}
 

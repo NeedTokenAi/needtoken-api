@@ -66,6 +66,9 @@ func StartSystemMonitor() {
 		usage := newContainerUsage()
 		var detector overloadDetector
 		for {
+			if !CloudflareBackgroundWritesAllowed() {
+				return
+			}
 			config := GetPerformanceMonitorConfig()
 			if !config.Enabled {
 				detector = overloadDetector{}

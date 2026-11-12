@@ -6,6 +6,7 @@ on:
       - "cloudflare/**"
       - "cloudflareprofile/**"
       - "common/cloudflare_profile.go"
+      - "common/cloudflare_background.go"
       - "common/init.go"
       - "common/redis.go"
       - "model/main.go"

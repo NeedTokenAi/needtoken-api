@@ -35,9 +35,18 @@ func InitBatchUpdater() {
 	gopool.Go(func() {
 		for {
 			time.Sleep(time.Duration(common.BatchUpdateInterval) * time.Second)
-			batchUpdate()
+			if !common.RunCloudflareBackground(batchUpdate) {
+				return
+			}
 		}
 	})
+}
+
+// FlushPendingBatchUpdates writes the queued quota rows once. The Cloudflare
+// profile calls it after background loops have stopped and before it releases
+// the lease. It does not change how a row is updated.
+func FlushPendingBatchUpdates() {
+	batchUpdate()
 }
 
 func addNewRecord(type_ int, id int, value int) {

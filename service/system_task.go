@@ -135,31 +135,37 @@ func StartSystemTaskRunner() {
 
 			var lastScheduler time.Time
 			var lastStaleLockCleanup time.Time
-			runPass := func() {
-				// The scheduler/stale-lock pass is throttled independently of the
-				// claim pass: wakeups (e.g. a manual log cleanup) should claim
-				// immediately without re-running the scheduler every time.
-				now := time.Now()
-				if now.Sub(lastStaleLockCleanup) >= systemTaskStaleLockInterval {
-					lastStaleLockCleanup = now
-					if err := model.ExpireStaleSystemTaskLocks(common.GetTimestamp()); err != nil {
-						logger.LogWarn(context.Background(), common.LogText("system task stale lock cleanup failed: %v", err))
+			runPass := func() bool {
+				return common.RunCloudflareBackground(func() {
+					// The scheduler/stale-lock pass is throttled independently of the
+					// claim pass: wakeups (e.g. a manual log cleanup) should claim
+					// immediately without re-running the scheduler every time.
+					now := time.Now()
+					if now.Sub(lastStaleLockCleanup) >= systemTaskStaleLockInterval {
+						lastStaleLockCleanup = now
+						if err := model.ExpireStaleSystemTaskLocks(common.GetTimestamp()); err != nil {
+							logger.LogWarn(context.Background(), common.LogText("system task stale lock cleanup failed: %v", err))
+						}
 					}
-				}
-				if now.Sub(lastScheduler) >= systemTaskSchedulerInterval {
-					lastScheduler = now
-					runSystemTaskScheduler()
-				}
-				runSystemTaskClaimPass(runnerID)
+					if now.Sub(lastScheduler) >= systemTaskSchedulerInterval {
+						lastScheduler = now
+						runSystemTaskScheduler()
+					}
+					runSystemTaskClaimPass(runnerID)
+				})
 			}
 
-			runPass()
+			if !runPass() {
+				return
+			}
 			for {
 				select {
 				case <-ticker.C:
 				case <-systemTaskWakeup:
 				}
-				runPass()
+				if !runPass() {
+					return
+				}
 			}
 		})
 	})

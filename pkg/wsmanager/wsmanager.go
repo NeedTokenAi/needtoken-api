@@ -158,6 +158,8 @@ func receiveChannelCloseEvents(ctx context.Context, ch <-chan *redis.Message, or
 		select {
 		case <-ctx.Done():
 			return
+		case <-common.CloudflareBackgroundStop():
+			return
 		case msg, ok := <-ch:
 			if !ok {
 				return

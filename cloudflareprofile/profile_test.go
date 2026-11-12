@@ -26,8 +26,10 @@ func TestValidateFailClosedDoesNotEchoSecrets(t *testing.T) {
 	}
 	base := map[string]string{
 		"CLOUDFLARE_PROFILE":       "1",
-		"SQL_DSN":                  "postgres://user:" + secret + "@db.example/needtoken",
+		"SQL_DSN":                  "postgres://user:" + secret + "@isolated.example/needtoken",
 		"SESSION_SECRET":           "session-" + secret,
+		"CRYPTO_SECRET":            "crypto-" + secret,
+		"NEEDTOKEN_LOG_SQL":        "main",
 		"REDIS_CONN_STRING":        "redis://:" + secret + "@redis.example:6379",
 		"NEEDTOKEN_RUNTIME":        RuntimeIsolatedCandidate,
 		"NEEDTOKEN_CONTAINER_BOOT": BootTestFixture,
@@ -116,12 +118,45 @@ func TestValidateFailClosedDoesNotEchoSecrets(t *testing.T) {
 		require.NotContains(t, err.Error(), secret)
 	})
 
+	t.Run("production host is not isolated by the test switch", func(t *testing.T) {
+		values := cloneMap(base)
+		values["SQL_DSN"] = "postgres://user:" + secret + "@ep-prod.neon.tech/needtoken"
+		err := Validate(getenv(values))
+		require.EqualError(t, err, "cloudflare profile refuses a SQL host outside the isolated allowlist")
+		require.NotContains(t, err.Error(), secret)
+		require.NotContains(t, err.Error(), "neon")
+	})
+
+	t.Run("missing crypto is not a session alias", func(t *testing.T) {
+		values := cloneMap(base)
+		delete(values, "CRYPTO_SECRET")
+		err := Validate(getenv(values))
+		require.EqualError(t, err, "cloudflare profile refuses to start: CRYPTO_SECRET binding is absent")
+		require.Equal(t, "absent", CryptoSecretSource(getenv(values)))
+		require.NotContains(t, err.Error(), secret)
+	})
+
+	t.Run("log database keeps an explicit meaning", func(t *testing.T) {
+		missing := cloneMap(base)
+		delete(missing, "NEEDTOKEN_LOG_SQL")
+		err := Validate(getenv(missing))
+		require.EqualError(t, err, "cloudflare profile refuses an implicit log database")
+
+		conflict := cloneMap(base)
+		conflict["LOG_SQL_DSN"] = "postgres://user:" + secret + "@isolated.example/logs"
+		err = Validate(getenv(conflict))
+		require.EqualError(t, err, "cloudflare profile refuses LOG_SQL_DSN when logs stay on the main database")
+		require.NotContains(t, err.Error(), secret)
+
+		separate := cloneMap(base)
+		separate["NEEDTOKEN_LOG_SQL"] = "separate"
+		err = Validate(getenv(separate))
+		require.EqualError(t, err, "cloudflare profile refuses a separate log database without LOG_SQL_DSN")
+	})
+
 	t.Run("bindings present", func(t *testing.T) {
 		require.NoError(t, Validate(getenv(base)))
-		withCrypto := cloneMap(base)
-		withCrypto["CRYPTO_SECRET"] = "crypto-" + secret
-		require.Equal(t, "binding", CryptoSecretSource(getenv(withCrypto)))
-		require.Equal(t, "session-secret-alias", CryptoSecretSource(getenv(base)))
+		require.Equal(t, "binding", CryptoSecretSource(getenv(base)))
 	})
 }
 
@@ -410,6 +445,53 @@ func (f *fakeLease) Advance(d time.Duration) {
 
 func (f *fakeLease) expired() bool {
 	return f.holder == "" || !f.now.Before(f.expiry)
+}
+
+func TestSQLPermitBackgroundStopAndGCPAreSeparate(t *testing.T) {
+	ResetSQLPermitForTest()
+	t.Cleanup(ResetSQLPermitForTest)
+	common.ResetCloudflareBackgroundForTest()
+	t.Cleanup(common.ResetCloudflareBackgroundForTest)
+	t.Setenv("CLOUDFLARE_PROFILE", "1")
+
+	require.EqualError(t, PermitSQL(), "cloudflare profile refuses SQL before isolation and the writer permit")
+	require.EqualError(t, RefuseDefaultAdmin(), "cloudflare profile refuses the default root account")
+	GrantSQLPermit()
+	require.NoError(t, PermitSQL())
+
+	ran := 0
+	require.True(t, common.RunCloudflareBackground(func() { ran++ }))
+	started := make(chan struct{})
+	release := make(chan struct{})
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		common.RunCloudflareBackground(func() {
+			close(started)
+			<-release
+		})
+	}()
+	<-started
+	stopped := make(chan struct{})
+	go func() {
+		common.StopCloudflareBackgroundWrites()
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+		t.Fatal("stop returned while a background write was still running")
+	case <-time.After(30 * time.Millisecond):
+	}
+	close(release)
+	<-stopped
+	<-finished
+	require.False(t, common.RunCloudflareBackground(func() { ran++ }))
+	assert.Equal(t, 1, ran)
+
+	writer := newRuntime(newFakeLease(), "writer-a", time.Second)
+	require.NoError(t, writer.Acquire(context.Background()))
+	require.NoError(t, writer.Beat(context.Background()))
+	assert.False(t, writer.Status().GCPFenced)
 }
 
 func (f *fakeLease) Acquire(ctx context.Context, holder string, ttl time.Duration) (int64, error) {

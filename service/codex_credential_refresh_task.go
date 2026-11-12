@@ -43,9 +43,13 @@ func StartCodexCredentialAutoRefreshTask() {
 			ticker := time.NewTicker(codexCredentialRefreshTickInterval)
 			defer ticker.Stop()
 
-			runCodexCredentialAutoRefreshOnce()
+			if !common.RunCloudflareBackground(runCodexCredentialAutoRefreshOnce) {
+				return
+			}
 			for range ticker.C {
-				runCodexCredentialAutoRefreshOnce()
+				if !common.RunCloudflareBackground(runCodexCredentialAutoRefreshOnce) {
+					return
+				}
 			}
 		})
 	})

@@ -44,9 +44,13 @@ type QuotaDataLogParams struct {
 
 func UpdateQuotaData() {
 	for {
-		if common.DataExportEnabled {
-			common.SysLog(common.LogText("updating dashboard data..."))
-			SaveQuotaDataCache()
+		if !common.RunCloudflareBackground(func() {
+			if common.DataExportEnabled {
+				common.SysLog(common.LogText("updating dashboard data..."))
+				SaveQuotaDataCache()
+			}
+		}) {
+			return
 		}
 		time.Sleep(time.Duration(common.DataExportInterval) * time.Minute)
 	}

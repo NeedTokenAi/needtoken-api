@@ -61,6 +61,8 @@ func InitEnv() {
 	}
 	if os.Getenv("CRYPTO_SECRET") != "" {
 		CryptoSecret = os.Getenv("CRYPTO_SECRET")
+	} else if CloudflareProfileRequested() {
+		log.Fatal(LogText("cloudflare profile refuses to start: CRYPTO_SECRET binding is absent"))
 	} else {
 		CryptoSecret = SessionSecret
 	}

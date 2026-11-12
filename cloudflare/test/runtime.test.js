@@ -1,19 +1,26 @@
 import assert from "node:assert/strict"
 import test from "node:test"
 import { ALARM_INTERVAL_MS, INACTIVITY_TIMEOUT_MS, planBoot } from "../src/boot.js"
-import { createController, userTrafficReady } from "../src/controller.js"
-import { forwardUpstream } from "../src/proxy.js"
+import { createController, schedulerWait, userTrafficReady, waitForReady } from "../src/controller.js"
+import { containerRequest, forwardUpstream } from "../src/proxy.js"
 import { routeSingleton, secretBindings, SINGLETON_NAME } from "../src/singleton.js"
 
 const DIGEST = "sha256:" + "ab".repeat(32)
+const PREVIOUS = "sha256:" + "cd".repeat(32)
+
+globalThis.scheduler = {
+  async wait() {},
+}
 
 function fixtureEnv(overrides = {}) {
   return {
     CLOUDFLARE_PROFILE: "1",
     NEEDTOKEN_RUNTIME: "isolated-candidate",
     NEEDTOKEN_CONTAINER_BOOT: "test-fixture",
+    NEEDTOKEN_LOG_SQL: "main",
     SQL_DSN: "postgres://isolated.example/needtoken",
     SESSION_SECRET: "fixture-session",
+    CRYPTO_SECRET: "fixture-crypto",
     REDIS_CONN_STRING: "redis://isolated.example:6379",
     CONTAINER_VCPU: "1",
     CONTAINER_MEMORY_MIB: "2048",
@@ -102,6 +109,8 @@ test("secret bindings are names only", () => {
   for (const item of secretBindings) {
     assert.equal(Object.hasOwn(item, "value"), false)
   }
+  assert.equal(secretBindings.find((item) => item.secret === "CRYPTO_SECRET").required, true)
+  assert.equal(secretBindings.find((item) => item.secret === "LOG_SQL_DSN").explicit, "main-or-separate")
 })
 
 test("boot stays refused without the test switch and does not copy unrelated secrets", () => {
@@ -122,12 +131,25 @@ test("boot stays refused without the test switch and does not copy unrelated sec
   const basic = planBoot(fixtureEnv({ CONTAINER_INSTANCE: "basic" }), images)
   assert.equal(basic.ok, false)
 
+  const production = planBoot(fixtureEnv({ SQL_DSN: "postgres://user:supersecret@ep-prod.neon.tech/needtoken" }), images)
+  assert.equal(production.ok, false)
+  assert.equal(production.reason, "SQL host is outside the isolated allowlist")
+  assert.equal(JSON.stringify(production).includes("supersecret"), false)
+  assert.equal(production.start, undefined)
+
+  const missingCrypto = planBoot(fixtureEnv({ CRYPTO_SECRET: "" }), images)
+  assert.equal(missingCrypto.reason, "CRYPTO_SECRET binding is absent")
+
   const allowed = planBoot(fixtureEnv(), images)
-  assert.equal(allowed.ok, true)
+  assert.equal(allowed.authorizesBoot, false)
+  assert.equal(allowed.isolated, true)
+  assert.equal(allowed.ok, false)
   assert.equal(allowed.start.enableInternet, true)
   assert.deepEqual(allowed.start.instance, { vcpu: 1, memoryMib: 2048, diskMb: 8000 })
   assert.equal(allowed.start.env.SQL_DSN, "postgres://isolated.example/needtoken")
+  assert.equal(allowed.start.env.CRYPTO_SECRET, "fixture-crypto")
   assert.equal(allowed.start.env.NEEDTOKEN_CONTAINER_BOOT, "test-fixture")
+  assert.equal(allowed.start.env.LOG_SQL_DSN, undefined)
   assert.equal(allowed.start.env.CLOUDFLARE_API_TOKEN, undefined)
   assert.equal(allowed.start.image.endsWith(DIGEST), true)
 })
@@ -172,13 +194,18 @@ test("readiness stays closed until background is running, including at zero user
   }
   const controller = createController({
     env: fixtureEnv(),
-    images: { newapi: "registry.cloudflare.com/ACCOUNT_ID/needtoken-api@" + DIGEST },
+    images: {
+      newapi: "registry.cloudflare.com/ACCOUNT_ID/needtoken-api@" + DIGEST,
+      previous: "registry.cloudflare.com/ACCOUNT_ID/needtoken-api@" + PREVIOUS,
+    },
     storage,
     container,
     now: () => 1_000,
     probe: async () => status,
+    unitTestStart: true,
   })
   await controller.hydrate()
+  assert.equal(storage.alarms.length, 1)
   const early = await controller.onFetch(new Request("https://api.example/v1/chat"))
   assert.equal(early.status, 503)
   assert.equal(container.calls.start, 0)
@@ -332,4 +359,163 @@ test("drain timeout does not start a second writer", async () => {
   assert.equal(result.sawIdleWriter, true)
   assert.equal(container.calls.destroy, 0)
   assert.equal(container.calls.start, 0)
+})
+
+function readyStatus() {
+  return {
+    ready: true,
+    background_running: true,
+    fence_held: true,
+    accepting: true,
+    user_requests: 0,
+  }
+}
+
+test("readiness retries ECONNREFUSED and then becomes ready", async () => {
+  const waits = []
+  let probes = 0
+  const status = await waitForReady(
+    async () => {
+      probes += 1
+      if (probes < 3) {
+        const error = new Error("connect ECONNREFUSED 127.0.0.1:3000")
+        error.code = "ECONNREFUSED"
+        throw error
+      }
+      return readyStatus()
+    },
+    async (ms) => {
+      waits.push(ms)
+    },
+    5,
+  )
+  assert.equal(probes, 3)
+  assert.deepEqual(waits, [200, 200])
+  assert.equal(status.user_requests, 0)
+  assert.equal(status.background_running, true)
+})
+
+test("a closed port, a failed start, a non-zero exit, and a rebuilt durable object stay on the current image", async () => {
+  const storage = memoryStorage()
+  const container = fakeContainer()
+  let probes = 0
+  const images = {
+    newapi: "registry.cloudflare.com/ACCOUNT_ID/needtoken-api@" + DIGEST,
+    previous: "registry.cloudflare.com/ACCOUNT_ID/needtoken-api@" + PREVIOUS,
+  }
+  container.start = (options) => {
+    container.calls.start += 1
+    container.calls.options = options
+    if (container.calls.start === 1) {
+      throw new Error("start failed")
+    }
+    container.running = true
+  }
+  container.monitor = () => {
+    container.calls.monitor += 1
+    if (container.calls.monitor === 1) {
+      return Promise.reject(new Error("exit 1"))
+    }
+    return new Promise(() => {})
+  }
+  const controller = createController({
+    env: fixtureEnv(),
+    images,
+    storage,
+    container,
+    now: () => 5_000,
+    unitTestStart: true,
+    probe: async () => {
+      probes += 1
+      if (probes === 1) {
+        const error = new Error("connect ECONNREFUSED")
+        error.code = "ECONNREFUSED"
+        throw error
+      }
+      return readyStatus()
+    },
+  })
+  await controller.hydrate()
+  assert.equal(storage.alarms.length, 1)
+  await controller.onAlarm()
+  assert.equal(container.calls.start, 1)
+  assert.equal(controller.state.lastBootError, "start failed")
+  assert.equal(container.running, false)
+  assert.equal(storage.values.get("containerEpoch"), undefined)
+
+  await controller.onAlarm()
+  assert.equal(container.calls.start, 2)
+  assert.equal(container.calls.options.image.endsWith(DIGEST), true)
+  assert.equal(container.calls.options.image.endsWith(PREVIOUS), false)
+  assert.equal(controller.state.recovery.rollback, false)
+  assert.equal(controller.state.recovery.switchesImage, false)
+  assert.equal(storage.values.get("recovery").rollback, false)
+  assert.equal(controller.state.userRequests, 0)
+  assert.equal(controller.state.backgroundContinuedWithoutUserTraffic, true)
+
+  container.running = false
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  assert.equal(controller.state.lastExit, "nonzero")
+  const rebuilt = createController({
+    env: fixtureEnv(),
+    images,
+    storage,
+    container,
+    now: () => 9_000,
+    unitTestStart: true,
+    probe: async () => readyStatus(),
+  })
+  await rebuilt.hydrate()
+  await rebuilt.onAlarm()
+  assert.equal(container.calls.start, 3)
+  assert.equal(container.calls.options.image.endsWith(DIGEST), true)
+  assert.equal(rebuilt.state.userRequests, 0)
+  assert.equal(container.calls.signal.length, 0)
+  assert.equal(rebuilt.state.recovery.rollback, false)
+})
+
+test("proxy keeps the original request signal, stream, and payment body", async () => {
+  const raw = JSON.stringify({ id: "pay_1", amount: "10.00", sign: "abc" })
+  const payment = new Request("https://pay.example/api/payment/callback?x=1", {
+    method: "POST",
+    headers: { "content-type": "application/json", host: "pay.example" },
+    body: raw,
+  })
+  const forwardedPayment = containerRequest(payment)
+  assert.equal(forwardedPayment.url, "http://container/api/payment/callback?x=1")
+  assert.equal(forwardedPayment.headers.get("host"), null)
+  assert.equal(await forwardedPayment.text(), raw)
+
+  const source = new AbortController()
+  const stream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode("data: token\n\n"))
+    },
+  })
+  const live = new Request("https://api.example/v1/chat/completions", {
+    method: "POST",
+    headers: { "content-type": "text/event-stream", upgrade: "websocket" },
+    body: stream,
+    duplex: "half",
+    signal: source.signal,
+  })
+  const forwarded = containerRequest(live)
+  assert.equal(new URL(forwarded.url).host, "container")
+  assert.equal(forwarded.headers.get("upgrade"), "websocket")
+  assert.equal(forwarded.bodyUsed, false)
+  source.abort()
+  assert.equal(forwarded.signal.aborted, true)
+  const reader = forwarded.body.getReader()
+  const chunk = await reader.read()
+  assert.equal(new TextDecoder().decode(chunk.value), "data: token\n\n")
+  await reader.cancel()
+})
+
+test("scheduler.wait is required for the readiness delay", async () => {
+  const previous = globalThis.scheduler
+  globalThis.scheduler = undefined
+  await assert.rejects(async () => {
+    await schedulerWait(200)
+  }, /scheduler\.wait is required/)
+  globalThis.scheduler = previous
 })

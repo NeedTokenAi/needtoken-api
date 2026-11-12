@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/QuantumNous/new-api/cloudflareprofile"
 	"github.com/QuantumNous/new-api/common"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -217,4 +218,15 @@ func TestMigrationSchemaStability(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCloudflareProfileRefusesDefaultRootBeforeDatabase(t *testing.T) {
+	cloudflareprofile.ResetSQLPermitForTest()
+	t.Cleanup(cloudflareprofile.ResetSQLPermitForTest)
+	t.Setenv("CLOUDFLARE_PROFILE", "1")
+	err := createRootAccountIfNeed()
+	require.EqualError(t, err, "cloudflare profile refuses SQL before isolation and the writer permit")
+	cloudflareprofile.GrantSQLPermit()
+	err = createRootAccountIfNeed()
+	require.EqualError(t, err, "cloudflare profile refuses the default root account")
 }

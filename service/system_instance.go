@@ -65,12 +65,16 @@ type SystemInstanceStorageMetrics struct {
 func StartSystemInstanceReporter() {
 	systemInstanceReporterOnce.Do(func() {
 		gopool.Go(func() {
-			reportSystemInstanceWithLog()
+			if !common.RunCloudflareBackground(reportSystemInstanceWithLog) {
+				return
+			}
 
 			ticker := time.NewTicker(systemInstanceReportInterval)
 			defer ticker.Stop()
 			for range ticker.C {
-				reportSystemInstanceWithLog()
+				if !common.RunCloudflareBackground(reportSystemInstanceWithLog) {
+					return
+				}
 			}
 		})
 	})

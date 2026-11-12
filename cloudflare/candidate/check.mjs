@@ -1,7 +1,8 @@
 import { readFileSync } from "node:fs"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
-import { PLACEHOLDER_DIGEST } from "../src/boot.js"
+import { ISOLATED_SQL_HOSTS, PLACEHOLDER_DIGEST, imageReference, isolatedSQLHost } from "../src/boot.js"
+import { recoveryState } from "../src/recovery.js"
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..")
 
@@ -29,12 +30,47 @@ export function lintRepo(repo = root) {
   if (container && Object.hasOwn(container, "max_instances")) {
     errors.push("durable_object policy must not set max_instances")
   }
-  const image = container && container.images && container.images.newapi && container.images.newapi.image
-  if (!image || !image.startsWith("registry.cloudflare.com/") || !image.includes("@sha256:")) {
+  const images = container && container.images
+  const image = imageReference(images && images.newapi)
+  const previous = imageReference(images && images.previous)
+  if (!pinnedCloudflareDigest(image) || !pinnedCloudflareDigest(previous)) {
     errors.push("image must be a Cloudflare registry digest")
+  }
+  if (image && previous && image === previous) {
+    errors.push("previous digest must be a distinct recovery record")
+  }
+  const recovery = recoveryState({
+    newapi: images && images.newapi,
+    previous: images && images.previous,
+  })
+  if (recovery.rollback !== false || recovery.switchesImage !== false) {
+    errors.push("recovery state must not claim a rollback")
   }
   if (/pkg\.dev|gcr\.io|docker\.io/.test(JSON.stringify(wrangler))) {
     errors.push("image must not reference another registry")
+  }
+  const uses = workflow.match(/^[ \t]*uses:[ \t]*(\S+)/gm) || []
+  if (uses.length === 0) {
+    errors.push("workflow does not pin actions")
+  }
+  for (const line of uses) {
+    if (!/@[0-9a-f]{40}\b/.test(line)) {
+      errors.push("action is not pinned to a commit SHA: " + line.trim())
+    }
+  }
+  const buildSource = JSON.parse(readFileSync(path.join(repo, "cloudflare/candidate/build-source.json"), "utf8"))
+  if (buildSource.authorizesBoot !== false || buildSource.rollback !== false) {
+    errors.push("build source must stay fail-closed")
+  }
+  if (buildSource.digest !== image.slice(image.lastIndexOf("@") + 1)) {
+    errors.push("build source digest is not the pinned candidate")
+  }
+  const allowlist = JSON.parse(readFileSync(path.join(repo, "cloudflareprofile/isolated_hosts.json"), "utf8"))
+  if (!allowlist.hosts || allowlist.hosts.join(",") !== ISOLATED_SQL_HOSTS.join(",")) {
+    errors.push("isolated SQL allowlist drifted")
+  }
+  if (allowlist.hosts.some((host) => /neon\.tech|googleapis|cloudsql/i.test(host))) {
+    errors.push("isolated SQL allowlist contains a production host")
   }
   if (/postgres:\/\/|redis:\/\/|mysql:\/\/|BEGIN PRIVATE|AKIA/.test(readFileSync(wranglerPath, "utf8"))) {
     errors.push("wrangler file contains a credential")
@@ -50,7 +86,17 @@ export function lintRepo(repo = root) {
   if (workflow.includes("secrets.")) {
     errors.push("workflow reads repository secrets")
   }
-  return { ok: errors.length === 0, errors, pinnedDigest: image ? image.slice(image.lastIndexOf("@") + 1) : "" }
+  return {
+    ok: errors.length === 0,
+    errors,
+    pinnedDigest: image ? image.slice(image.lastIndexOf("@") + 1) : "",
+    previousDigest: previous ? previous.slice(previous.lastIndexOf("@") + 1) : "",
+    buildSource,
+  }
+}
+
+function pinnedCloudflareDigest(image) {
+  return typeof image === "string" && image.startsWith("registry.cloudflare.com/") && /@sha256:[0-9a-f]{64}$/.test(image)
 }
 
 export function bindCandidate(input) {
@@ -76,10 +122,41 @@ export function bindCandidate(input) {
   if (input.workflowDeploys) {
     errors.push("candidate check refuses to deploy")
   }
+  const source = input.buildSource || {}
+  if (source.sourceSHA !== input.mainSHA) {
+    errors.push("digest is not tied to the main SHA")
+  }
+  if (source.digest !== input.imageDigest) {
+    errors.push("digest is not the recorded build source")
+  }
+  if (!source.runId) {
+    errors.push("build run is absent")
+  }
+  if (source.rollback !== false) {
+    errors.push("rollback is not available")
+  }
+  if (source.authorizesBoot !== false) {
+    errors.push("this skeleton cannot authorize boot")
+  }
+  if (input.sqlDSN && !isolatedSQLHost(input.sqlDSN)) {
+    errors.push("SQL host is outside the isolated allowlist")
+  }
+  if (input.sqlHost && !ISOLATED_SQL_HOSTS.includes(input.sqlHost)) {
+    errors.push("SQL host is outside the isolated allowlist")
+  }
   if (errors.length > 0) {
     return { ok: false, errors }
   }
-  return { ok: true, deploy: false, mainSHA: input.mainSHA, imageDigest: input.imageDigest }
+  return {
+    ok: true,
+    deploy: false,
+    boot: false,
+    live: false,
+    rollback: false,
+    gcpFenced: false,
+    mainSHA: input.mainSHA,
+    imageDigest: input.imageDigest,
+  }
 }
 
 function fail(message) {
@@ -110,6 +187,7 @@ function main() {
     imageDigest: process.env.CANDIDATE_IMAGE_DIGEST,
     pinnedDigest: lint.pinnedDigest,
     workflowDeploys: false,
+    buildSource: lint.buildSource,
   })
   if (!bound.ok) {
     return fail(bound.errors.join("\n"))

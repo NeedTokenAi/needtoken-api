@@ -5,10 +5,15 @@
 package cloudflareprofile
 
 import (
+	_ "embed"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
+	"sync/atomic"
+
+	"github.com/QuantumNous/new-api/common"
 )
 
 const (
@@ -19,6 +24,8 @@ const (
 	envSession = "SESSION_SECRET"
 	envRedis   = "REDIS_CONN_STRING"
 	envCrypto  = "CRYPTO_SECRET"
+	envLogMode = "NEEDTOKEN_LOG_SQL"
+	envLogSQL  = "LOG_SQL_DSN"
 	envSQLite  = "SQLITE_PATH"
 	envPprof   = "ENABLE_PPROF"
 	envToken   = "GENERATE_DEFAULT_TOKEN"
@@ -26,9 +33,9 @@ const (
 	// RuntimeIsolatedCandidate is the only mode that may pass validation.
 	// It is not a production cutover.
 	RuntimeIsolatedCandidate = "isolated-candidate"
-	// BootTestFixture is the only switch that may open SQL. It does not
-	// prove a DSN is non-production. This repository never sets it in a
-	// deploy workflow.
+	// BootTestFixture is an extra lock. It does not prove the DSN host is
+	// isolated. SQL also has to match isolated_hosts.json. This repository
+	// never sets the switch in a deploy workflow.
 	BootTestFixture = "test-fixture"
 )
 
@@ -44,8 +51,20 @@ const (
 	errDefaultToken    = "cloudflare profile refuses generating a default token"
 	errRuntime         = "cloudflare profile refuses to start a writer"
 	errBoot            = "cloudflare profile refuses to open SQL without the isolated test switch"
+	errSQLHost         = "cloudflare profile refuses a SQL host outside the isolated allowlist"
+	errCryptoAbsent    = "cloudflare profile refuses to start: CRYPTO_SECRET binding is absent"
+	errLogImplicit     = "cloudflare profile refuses an implicit log database"
+	errLogMainConflict = "cloudflare profile refuses LOG_SQL_DSN when logs stay on the main database"
+	errLogSeparate     = "cloudflare profile refuses a separate log database without LOG_SQL_DSN"
+	errSQLPermit       = "cloudflare profile refuses SQL before isolation and the writer permit"
+	errDefaultAdmin    = "cloudflare profile refuses the default root account"
 	errBootstrap       = "cloudflare profile refuses bootstrap"
 )
+
+//go:embed isolated_hosts.json
+var isolatedHostsJSON []byte
+
+var sqlPermit atomic.Bool
 
 // Enabled is true only when the process environment asks for the profile.
 func Enabled(getenv func(string) string) bool {
@@ -100,7 +119,103 @@ func Validate(getenv func(string) string) error {
 	if getenv(envBoot) != BootTestFixture {
 		return errors.New(errBoot)
 	}
+	if strings.TrimSpace(getenv(envCrypto)) == "" {
+		return errors.New(errCryptoAbsent)
+	}
+	if err := validateLogDatabase(getenv); err != nil {
+		return err
+	}
+	if _, err := requireIsolatedHost(dsn); err != nil {
+		return err
+	}
 	return nil
+}
+
+// GrantSQLPermit runs only after isolation has succeeded and the Redis lease
+// is held. InitDB, migrations, and the default admin path check PermitSQL
+// and do nothing before that. The lease is not read by Cloud Run.
+func GrantSQLPermit() {
+	sqlPermit.Store(true)
+}
+
+// ResetSQLPermitForTest clears the in-process permit. Production startup does
+// not call it.
+func ResetSQLPermitForTest() {
+	sqlPermit.Store(false)
+}
+
+// PermitSQL fails closed while the profile is on and the writer permit has
+// not been granted. The normal process is allowed through.
+func PermitSQL() error {
+	if !Enabled(os.Getenv) {
+		return nil
+	}
+	if !sqlPermit.Load() {
+		return errors.New(errSQLPermit)
+	}
+	return nil
+}
+
+// RefuseDefaultAdmin rejects the built-in root/123456 account. The profile
+// does not create one before or after the writer permit.
+func RefuseDefaultAdmin() error {
+	if !Enabled(os.Getenv) {
+		return nil
+	}
+	return errors.New(errDefaultAdmin)
+}
+
+func validateLogDatabase(getenv func(string) string) error {
+	mode := strings.TrimSpace(getenv(envLogMode))
+	dsn := strings.TrimSpace(getenv(envLogSQL))
+	switch mode {
+	case "main":
+		if dsn != "" {
+			return errors.New(errLogMainConflict)
+		}
+		return nil
+	case "separate":
+		if dsn == "" {
+			return errors.New(errLogSeparate)
+		}
+		if _, err := requireIsolatedHost(dsn); err != nil {
+			return err
+		}
+		return nil
+	default:
+		return errors.New(errLogImplicit)
+	}
+}
+
+func requireIsolatedHost(dsn string) (string, error) {
+	host, err := sqlHost(dsn)
+	if err != nil || !isolatedHostAllowed(host) {
+		return "", errors.New(errSQLHost)
+	}
+	return host, nil
+}
+
+func sqlHost(dsn string) (string, error) {
+	parsed, err := url.Parse(strings.TrimSpace(dsn))
+	if err != nil || parsed.Hostname() == "" {
+		return "", errors.New(errSQLHost)
+	}
+	return strings.ToLower(parsed.Hostname()), nil
+}
+
+func isolatedHostAllowed(host string) bool {
+	var document struct {
+		Hosts []string `json:"hosts"`
+	}
+	if err := common.Unmarshal(isolatedHostsJSON, &document); err != nil {
+		return false
+	}
+	for _, allowed := range document.Hosts {
+		if strings.EqualFold(strings.TrimSpace(allowed), host) {
+			return true
+		}
+	}
+	return false
 }
 
 // ForbidsSQLite reports the SQLite fallback that chooseDB would otherwise
@@ -114,14 +229,13 @@ func ForbidsSQLite(getenv func(string) string, dsn string) bool {
 	return dsn == "" || strings.HasPrefix(dsn, "local")
 }
 
-// CryptoSecretSource reports where the existing process takes CRYPTO_SECRET.
-// An absent binding aliases the provided SESSION_SECRET. This profile does
-// not generate a replacement key.
+// CryptoSecretSource reports the explicit CRYPTO_SECRET binding. The profile
+// does not alias a missing value to SESSION_SECRET and does not generate one.
 func CryptoSecretSource(getenv func(string) string) string {
 	if strings.TrimSpace(getenv(envCrypto)) != "" {
 		return "binding"
 	}
-	return "session-secret-alias"
+	return "absent"
 }
 
 // RefuseBootstrap rejects an uninitialized database. The setup handler must

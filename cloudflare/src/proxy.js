@@ -1,19 +1,18 @@
-// Forward a container response without reading it. SSE and WebSocket upgrades
-// stay intact only when the caller returns this same response.
-export function forwardUpstream(response) {
-  return response
-}
-
+// containerRequest follows the current Containers fetch example:
+// rewrite the URL to http://container and construct the request from the
+// original Request so its body stream, cancellation signal, and upgrade are
+// kept. The host header is removed after that copy.
 export function containerRequest(request) {
   const url = new URL(request.url)
   url.protocol = "http:"
   url.host = "container"
-  const headers = new Headers(request.headers)
-  headers.delete("host")
-  const init = { method: request.method, headers }
-  if (request.method !== "GET" && request.method !== "HEAD" && request.body) {
-    init.body = request.body
-    init.duplex = "half"
-  }
-  return new Request(url, init)
+  const forwarded = new Request(url, request)
+  forwarded.headers.delete("host")
+  return forwarded
+}
+
+// forwardUpstream returns the container response itself. SSE is not read
+// or buffered here.
+export function forwardUpstream(response) {
+  return response
 }

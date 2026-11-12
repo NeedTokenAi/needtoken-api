@@ -69,6 +69,12 @@ var DB *gorm.DB
 var LOG_DB *gorm.DB
 
 func createRootAccountIfNeed() error {
+	if err := cloudflareprofile.PermitSQL(); err != nil {
+		return err
+	}
+	if err := cloudflareprofile.RefuseDefaultAdmin(); err != nil {
+		return err
+	}
 	var user User
 	//if user.Status != common.UserStatusEnabled {
 	if err := DB.First(&user).Error; err != nil {
@@ -188,6 +194,9 @@ func chooseDB(envName string, isLog bool) (*gorm.DB, common.DatabaseType, error)
 }
 
 func InitDB() (err error) {
+	if err = cloudflareprofile.PermitSQL(); err != nil {
+		return err
+	}
 	db, dbType, err := chooseDB("SQL_DSN", false)
 	if err == nil {
 		common.SetMainDatabaseType(dbType)
@@ -239,6 +248,9 @@ func InitDB() (err error) {
 }
 
 func InitLogDB() (err error) {
+	if err = cloudflareprofile.PermitSQL(); err != nil {
+		return err
+	}
 	if os.Getenv("LOG_SQL_DSN") == "" {
 		LOG_DB = DB
 		common.SetLogDatabaseType(common.MainDatabaseType())

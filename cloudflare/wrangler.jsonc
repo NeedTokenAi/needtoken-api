@@ -18,6 +18,9 @@
       "images": {
         "newapi": {
           "image": "registry.cloudflare.com/ACCOUNT_ID/needtoken-api@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+        },
+        "previous": {
+          "image": "registry.cloudflare.com/ACCOUNT_ID/needtoken-api@sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
         }
       }
     }

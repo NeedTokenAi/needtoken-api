@@ -23,8 +23,33 @@ test("binding requires current main, a real digest, and approval", () => {
     pinnedDigest: pinned,
     workflowDeploys: false,
   }
-  assert.equal(bindCandidate(good).deploy, false)
-  assert.equal(bindCandidate({ ...good, approval: "no" }).ok, false)
+  const source = {
+    digest: DIGEST,
+    sourceSHA: SHA,
+    runId: "build-1",
+    rollback: false,
+    authorizesBoot: false,
+  }
+  const bound = bindCandidate({ ...good, buildSource: source })
+  assert.equal(bound.ok, true)
+  assert.equal(bound.deploy, false)
+  assert.equal(bound.boot, false)
+  assert.equal(bound.live, false)
+  assert.equal(bound.rollback, false)
+  assert.equal(bound.gcpFenced, false)
+  assert.equal(bindCandidate(good).ok, false)
+  assert.equal(bindCandidate({ ...good, buildSource: { ...source, authorizesBoot: true } }).ok, false)
+  assert.equal(bindCandidate({ ...good, buildSource: { ...source, rollback: true } }).ok, false)
+  assert.equal(bindCandidate({ ...good, buildSource: { ...source, sourceSHA: "" } }).ok, false)
+  assert.equal(
+    bindCandidate({
+      ...good,
+      buildSource: source,
+      sqlDSN: "postgres://user:supersecret@ep-prod.neon.tech/needtoken",
+    }).ok,
+    false,
+  )
+  assert.equal(bindCandidate({ ...good, approval: "no", buildSource: source }).ok, false)
   assert.equal(bindCandidate({ ...good, originMainSHA: "a".repeat(40) }).ok, false)
   assert.equal(bindCandidate({ ...good, imageDigest: PLACEHOLDER_DIGEST, pinnedDigest: PLACEHOLDER_DIGEST }).ok, false)
   assert.equal(bindCandidate({ ...good, imageDigest: "sha256:" + "cd".repeat(32) }).ok, false)

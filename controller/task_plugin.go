@@ -999,8 +999,12 @@ func SyncTaskPluginsOnce() {
 }
 
 func SyncTaskPlugins() {
-	SyncTaskPluginsOnce()
+	if !common.RunCloudflareBackground(SyncTaskPluginsOnce) {
+		return
+	}
 	for range time.NewTicker(30 * time.Second).C {
-		SyncTaskPluginsOnce()
+		if !common.RunCloudflareBackground(SyncTaskPluginsOnce) {
+			return
+		}
 	}
 }

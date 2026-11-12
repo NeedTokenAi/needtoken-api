@@ -781,8 +781,12 @@ func UpdateAllChannelsBalance(c *gin.Context) {
 func AutomaticallyUpdateChannels(frequency int) {
 	for {
 		time.Sleep(time.Duration(frequency) * time.Minute)
-		common.SysLog(common.LogText("updating all channels"))
-		_ = updateAllChannelsBalance()
-		common.SysLog(common.LogText("channels update done"))
+		if !common.RunCloudflareBackground(func() {
+			common.SysLog(common.LogText("updating all channels"))
+			_ = updateAllChannelsBalance()
+			common.SysLog(common.LogText("channels update done"))
+		}) {
+			return
+		}
 	}
 }

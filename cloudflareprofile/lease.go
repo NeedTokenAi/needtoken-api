@@ -10,8 +10,8 @@ import (
 
 const (
 	// writerLeaseTTL is deliberately short. A process that cannot renew is
-	// no longer the writer. This is not a claim that the container stays up
-	// for any particular wall time.
+	// no longer the writer among processes that run this profile. Cloud Run
+	// does not read the lease, so the epoch does not stop an old GCP writer.
 	writerLeaseTTL = 30 * time.Second
 
 	errRedisClient = "cloudflare profile refuses to start without Redis"

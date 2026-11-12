@@ -10,6 +10,7 @@ export class NewAPIContainer extends DurableObject {
       images: ctx.container && ctx.container.images,
       storage: ctx.storage,
       container: ctx.container,
+      waitUntil: (pending) => ctx.waitUntil(pending),
     })
     void ctx.blockConcurrencyWhile(() => this.controller.hydrate())
   }

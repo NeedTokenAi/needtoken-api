@@ -4,8 +4,8 @@ export const secretBindings = [
   { secret: "SQL_DSN", binding: "SQL_DSN", required: true },
   { secret: "SESSION_SECRET", binding: "SESSION_SECRET", required: true },
   { secret: "REDIS_CONN_STRING", binding: "REDIS_CONN_STRING", required: true },
-  { secret: "CRYPTO_SECRET", binding: "CRYPTO_SECRET", required: false },
-  { secret: "LOG_SQL_DSN", binding: "LOG_SQL_DSN", required: false },
+  { secret: "CRYPTO_SECRET", binding: "CRYPTO_SECRET", required: true },
+  { secret: "LOG_SQL_DSN", binding: "LOG_SQL_DSN", explicit: "main-or-separate" },
 ]
 
 // routeSingleton ignores every instance name carried by the request.

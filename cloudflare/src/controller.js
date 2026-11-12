@@ -1,26 +1,35 @@
 import { ALARM_INTERVAL_MS, CONTAINER_PORT, INACTIVITY_TIMEOUT_MS, planBoot } from "./boot.js"
 import { SINGLETON_NAME } from "./singleton.js"
 import { containerRequest, forwardUpstream } from "./proxy.js"
+import { recoveryState } from "./recovery.js"
 
 const STATUS_PATH = "/internal/cloudflare/runtime"
+const READINESS_ATTEMPTS = 20
+const READINESS_WAIT_MS = 200
 
 export function createController(options) {
   const env = options.env || {}
   const container = options.container
   const storage = options.storage
+  const images = options.images || {}
   const now = options.now || (() => Date.now())
+  const wait = options.wait || schedulerWait
   const probe = options.probe || (() => probeRuntime(container))
-  const plan = planBoot(env, options.images || {})
+  const plan = planBoot(env, images)
   const state = {
     plan,
+    images,
     readyForUsers: false,
     draining: false,
     alarms: 0,
     userRequests: 0,
     backgroundContinuedWithoutUserTraffic: false,
-    lastBootRefusal: plan.ok ? "" : plan.reason,
+    lastBootRefusal: plan.authorizesBoot ? "" : plan.reason || "boot is not authorized",
     lastStatus: null,
-    started: false,
+    lastExit: null,
+    alarmArmed: false,
+    observing: false,
+    recovery: recoveryState(images),
   }
 
   return {
@@ -31,42 +40,48 @@ export function createController(options) {
         throw new Error("refusing non-singleton durable object")
       }
       await storage.put("singleton", SINGLETON_NAME)
+      await storage.put("recovery", state.recovery)
       if (container.running) {
-        state.started = true
         await container.setInactivityTimeout(INACTIVITY_TIMEOUT_MS)
-        container.monitor()
+        observeExit(container, storage, state, options.waitUntil)
       }
-      await storage.setAlarm(now() + ALARM_INTERVAL_MS)
+      await armAlarm(storage, state, now)
     },
     async onAlarm() {
       state.alarms += 1
       try {
         if (container.running) {
           await container.setInactivityTimeout(INACTIVITY_TIMEOUT_MS)
+        } else {
+          await startContainer(container, storage, plan, state, options)
         }
-        const status = await probe()
-        state.lastStatus = status
-        if (status && status.user_requests === 0 && status.background_running === true) {
-          state.backgroundContinuedWithoutUserTraffic = true
-        }
-        state.readyForUsers = userTrafficReady(status, state.draining)
         if (!container.running) {
-          await startContainer(container, storage, plan, state)
+          state.readyForUsers = false
+        } else {
+          const status = await waitForReady(() => probe(), wait, READINESS_ATTEMPTS)
+          state.lastStatus = status
+          if (status && status.user_requests === 0 && status.background_running === true) {
+            state.backgroundContinuedWithoutUserTraffic = true
+          }
+          state.readyForUsers = userTrafficReady(status, state.draining)
         }
       } catch {
         state.readyForUsers = false
       }
-      await storage.setAlarm(now() + ALARM_INTERVAL_MS)
+      await armAlarm(storage, state, now)
     },
     async onFetch(request) {
       const url = new URL(request.url)
+      if (!state.alarmArmed) {
+        await armAlarm(storage, state, now)
+      }
       if (url.pathname === STATUS_PATH) {
         return new Response(null, { status: 404 })
       }
       if (request.method === "POST" && url.pathname === "/api/setup") {
         return new Response(null, { status: 403 })
       }
-      if (!state.readyForUsers || state.draining) {
+      if (!state.readyForUsers || state.draining || !container.running) {
         return new Response(null, { status: 503 })
       }
       state.userRequests += 1
@@ -80,7 +95,7 @@ export function createController(options) {
       let sawIdleWriter = false
       for (let step = 0; step < maxSteps; step += 1) {
         const status = await readStatus()
-        if (status && status.accepting === false && status.fence_held === false) {
+        if (status && status.accepting === false && status.fence_held === false && status.background_running === false) {
           return { ok: true, destroyed: false, sawIdleWriter }
         }
         if (
@@ -105,20 +120,90 @@ export function userTrafficReady(status, draining) {
   return status.ready === true && status.background_running === true && status.fence_held === true && status.accepting !== false
 }
 
-async function startContainer(container, storage, plan, state) {
-  if (container.running || state.started) {
+// waitForReady retries a closed port. Containers start() returns before the
+// process listens, and getTcpPort().fetch throws until it does. Durable
+// Object code waits with scheduler.wait, not setTimeout.
+export async function waitForReady(probe, wait, attempts = READINESS_ATTEMPTS) {
+  let lastError
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      const status = await probe()
+      if (userTrafficReady(status, false)) {
+        return status
+      }
+      lastError = new Error("container port is not ready")
+    } catch (error) {
+      lastError = error
+    }
+    if (attempt + 1 < attempts) {
+      await wait(READINESS_WAIT_MS)
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error("container port is not ready")
+}
+
+export function schedulerWait(ms) {
+  const scheduler = globalThis.scheduler
+  if (!scheduler || typeof scheduler.wait !== "function") {
+    throw new Error("Durable Object scheduler.wait is required")
+  }
+  return scheduler.wait(ms)
+}
+
+async function armAlarm(storage, state, now) {
+  await storage.setAlarm(now() + ALARM_INTERVAL_MS)
+  state.alarmArmed = true
+}
+
+async function startContainer(container, storage, plan, state, options) {
+  if (container.running) {
     return
   }
-  if (!plan.ok) {
-    state.lastBootRefusal = plan.reason
+  const allowed = plan.isolated === true && plan.start && (plan.authorizesBoot === true || options.unitTestStart === true)
+  if (!allowed) {
+    state.lastBootRefusal = plan.reason || "boot is not authorized"
+    return
+  }
+  if (plan.authorizesBoot === true) {
+    state.lastBootRefusal = "phase-1 skeleton does not boot a container"
+    return
+  }
+  try {
+    container.start(plan.start)
+  } catch {
+    state.lastBootError = "start failed"
     return
   }
   const current = Number((await storage.get("containerEpoch")) || 0)
-  container.start(plan.start)
-  state.started = true
   await storage.put("containerEpoch", current + 1)
+  state.recovery = recoveryState(state.images)
+  await storage.put("recovery", state.recovery)
   await container.setInactivityTimeout(INACTIVITY_TIMEOUT_MS)
-  container.monitor()
+  observeExit(container, storage, state, options.waitUntil)
+}
+
+function observeExit(container, storage, state, waitUntil) {
+  if (state.observing) {
+    return
+  }
+  state.observing = true
+  const pending = Promise.resolve()
+    .then(() => container.monitor())
+    .then(() => {
+      state.lastExit = 0
+    })
+    .catch(() => {
+      state.lastExit = "nonzero"
+      state.recovery = recoveryState(state.images)
+      state.recovery.lastExit = "nonzero"
+      return storage.put("recovery", state.recovery)
+    })
+    .finally(() => {
+      state.observing = false
+    })
+  if (typeof waitUntil === "function") {
+    waitUntil(pending)
+  }
 }
 
 export async function probeRuntime(container) {

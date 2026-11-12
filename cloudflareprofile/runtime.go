@@ -20,6 +20,9 @@ type Status struct {
 	UserRequests      int64 `json:"user_requests"`
 	Accepting         bool  `json:"accepting"`
 	Draining          bool  `json:"draining"`
+	// GCPFenced is always false. The existing Cloud Run process does not
+	// read this lease, so an epoch is not a cross-cloud single writer.
+	GCPFenced bool `json:"gcp_fenced"`
 }
 
 // Runtime is the in-process writer supervisor. Background beats run whether
@@ -241,6 +244,7 @@ func (rt *Runtime) statusLocked() Status {
 		UserRequests:      rt.userRequests,
 		Accepting:         rt.accepting,
 		Draining:          rt.draining,
+		GCPFenced:         false,
 	}
 }
 

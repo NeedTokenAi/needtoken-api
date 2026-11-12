@@ -226,8 +226,12 @@ func loadOptionsFromDatabase() {
 func SyncOptions(frequency int) {
 	for {
 		time.Sleep(time.Duration(frequency) * time.Second)
-		common.SysLog(common.LogText("syncing options from database"))
-		loadOptionsFromDatabase()
+		if !common.RunCloudflareBackground(func() {
+			common.SysLog(common.LogText("syncing options from database"))
+			loadOptionsFromDatabase()
+		}) {
+			return
+		}
 	}
 }
 
