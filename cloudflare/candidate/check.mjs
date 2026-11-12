@@ -96,6 +96,17 @@ export function lintRepo(repo = root) {
   if (/"r2_buckets"/.test(wranglerText)) {
     errors.push("this service does not use R2")
   }
+  const runtimeSources = [
+    "cloudflare/src/boot.js",
+    "cloudflare/src/gate.js",
+    "cloudflareprofile/profile.go",
+  ].map((name) => readFileSync(path.join(repo, name), "utf8")).join("\n")
+  if (!runtimeSources.includes("DATABASE_HOST") || !runtimeSources.includes("ep-aged-sunset-b33os2qw.c-4.ap-southeast-1.aws.neon.tech")) {
+    errors.push("staging DATABASE_HOST allowlist is missing")
+  }
+  if (runtimeSources.includes("NEEDTOKEN_HOST_ALLOWLIST")) {
+    errors.push("Redis and arbitrary hosts are not the staging database allowlist")
+  }
   if (workflowDeploys(workflow)) {
     errors.push("candidate workflow deploys or follows a push trigger")
   }

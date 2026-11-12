@@ -34,7 +34,6 @@ func TestValidateFailClosedDoesNotEchoSecrets(t *testing.T) {
 		"NEEDTOKEN_LOG_SQL":         "main",
 		"REDIS_CONN_STRING":         "rediss://default:" + secret + "@us1-example.upstash.io:6379",
 		"DATABASE_HOST":             databaseHost,
-		"NEEDTOKEN_HOST_ALLOWLIST":  databaseHost,
 		"NEEDTOKEN_WRITER_PERMIT":   "staging-writer",
 		"NEEDTOKEN_QUEUE_CONSUMERS": "off",
 		"NEEDTOKEN_RUNTIME":         RuntimeStaging,
@@ -125,29 +124,31 @@ func TestValidateFailClosedDoesNotEchoSecrets(t *testing.T) {
 		}
 	})
 
-	t.Run("production host and a marker suffix stay outside the allowlist", func(t *testing.T) {
-		for _, host := range []string{"ep-prod.neon.tech", "ep-prod.neon.tech.isolated", "db.staging.internal.isolated", "ep-other-pooler.c-4.ap-southeast-1.aws.neon.tech"} {
+	t.Run("every host outside the staging database is refused", func(t *testing.T) {
+		for _, host := range []string{"ep-prod.neon.tech", "ep-prod.neon.tech.isolated", "db.example.test", "ep-other-pooler.c-4.ap-southeast-1.aws.neon.tech"} {
 			values := cloneMap(base)
 			values["SQL_DSN"] = "postgres://user:" + secret + "@" + host + "/needtoken"
 			values["LOG_SQL_DSN"] = values["SQL_DSN"]
 			values["DATABASE_HOST"] = host
-			values["NEEDTOKEN_HOST_ALLOWLIST"] = host
 			err := Validate(getenv(values))
 			require.EqualError(t, err, "cloudflare profile refuses a SQL host outside the isolated allowlist")
 			require.NotContains(t, err.Error(), secret)
 			require.NotContains(t, err.Error(), host)
 		}
+		mismatch := cloneMap(base)
+		mismatch["DATABASE_HOST"] = "ep-aged-sunset-b33os2qw-pooler.c-4.ap-southeast-1.aws.neon.tech"
+		err := Validate(getenv(mismatch))
+		require.EqualError(t, err, "cloudflare profile refuses a SQL host outside the isolated allowlist")
 	})
 
-	t.Run("the neon pooler is allowed and redis stays on upstash", func(t *testing.T) {
+	t.Run("the staging pooler is allowed and redis stays on upstash", func(t *testing.T) {
 		values := cloneMap(base)
 		pooler := "ep-aged-sunset-b33os2qw-pooler.c-4.ap-southeast-1.aws.neon.tech"
 		values["SQL_DSN"] = "postgres://user:" + secret + "@" + pooler + "/needtoken"
 		values["LOG_SQL_DSN"] = values["SQL_DSN"]
 		values["DATABASE_HOST"] = pooler
-		values["REDIS_HOST"] = "ep-prod.redis.example"
+		values["REDIS_HOST"] = "ignored.upstash.io"
 		require.NoError(t, Validate(getenv(values)))
-		require.NotContains(t, base["NEEDTOKEN_HOST_ALLOWLIST"], "upstash")
 	})
 
 	t.Run("queue consumers stay stopped", func(t *testing.T) {
@@ -195,9 +196,10 @@ func TestValidateFailClosedDoesNotEchoSecrets(t *testing.T) {
 
 		separateHost := cloneMap(base)
 		separateHost["NEEDTOKEN_LOG_SQL"] = "separate"
-		separateHost["LOG_SQL_DSN"] = "postgres://user:" + secret + "@logs.staging.internal/logs"
+		separateHost["LOG_SQL_DSN"] = "postgres://user:" + secret + "@logs.example.test/logs"
 		err = Validate(getenv(separateHost))
 		require.EqualError(t, err, "cloudflare profile refuses a SQL host outside the isolated allowlist")
+		require.NotContains(t, err.Error(), secret)
 		pooler := "ep-aged-sunset-b33os2qw-pooler.c-4.ap-southeast-1.aws.neon.tech"
 		separateHost["LOG_SQL_DSN"] = "postgres://user:" + secret + "@" + pooler + "/logs"
 		require.NoError(t, Validate(getenv(separateHost)))

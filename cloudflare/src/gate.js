@@ -23,13 +23,6 @@ const TEST_PERMITS = new Set([
 
 const FULL_IMAGE = /^registry\.cloudflare\.com\/[a-z0-9]{32}\/needtoken-api-staging@sha256:[0-9a-f]{64}$/
 
-export function parseAllowlist(value) {
-  return String(value || "")
-    .split(",")
-    .map((item) => item.trim().toLowerCase())
-    .filter((item) => item !== "")
-}
-
 export const ALLOWED_DATABASE_HOST = "ep-aged-sunset-b33os2qw.c-4.ap-southeast-1.aws.neon.tech"
 
 export function neonPoolerTwin(host) {
@@ -54,22 +47,9 @@ export function neonPoolerTwin(host) {
   return first + marker + "." + rest
 }
 
-export function databaseHostAllowed(host, allowlist) {
+export function stagingDatabaseHost(host) {
   const name = String(host || "").trim().toLowerCase()
-  const pooler = neonPoolerTwin(ALLOWED_DATABASE_HOST)
-  if (name !== ALLOWED_DATABASE_HOST && name !== pooler) {
-    return false
-  }
-  return hostOnAllowlist(name, allowlist)
-}
-
-export function hostOnAllowlist(host, allowlist) {
-  const name = String(host || "").trim().toLowerCase()
-  if (name === "" || name.includes("*") || name.includes("/") || name.includes(",")) {
-    return false
-  }
-  const twin = neonPoolerTwin(name)
-  return allowlist.some((entry) => entry === name || (twin !== "" && entry === twin))
+  return name === ALLOWED_DATABASE_HOST || name === neonPoolerTwin(ALLOWED_DATABASE_HOST)
 }
 
 export function writerPermitAccepted(value) {

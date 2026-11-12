@@ -29,7 +29,6 @@ function fixtureEnv(overrides = {}) {
     CRYPTO_SECRET: "fixture-crypto",
     REDIS_CONN_STRING: "rediss://us1-example.upstash.io:6379",
     DATABASE_HOST: DATABASE_HOST,
-    NEEDTOKEN_HOST_ALLOWLIST: DATABASE_HOST,
     NEEDTOKEN_WRITER_PERMIT: "staging-writer",
     NEEDTOKEN_QUEUE_CONSUMERS: "off",
     NEEDTOKEN_BUILD_REPOSITORY: "NeedTokenAi/needtoken-api",
@@ -148,15 +147,16 @@ test("boot follows the injected allowlist and the attested image", () => {
   const basic = planBoot(fixtureEnv({ CONTAINER_INSTANCE: "basic" }), images)
   assert.equal(basic.ok, false)
 
-  for (const host of ["ep-prod.neon.tech", "ep-prod.neon.tech.isolated", "db.staging.internal.isolated"]) {
-    const production = planBoot(fixtureEnv({
+  for (const host of ["ep-prod.neon.tech", "ep-prod.neon.tech.isolated", "db.example.test"]) {
+    const refused = planBoot(fixtureEnv({
       SQL_DSN: "postgres://user:supersecret@" + host + "/needtoken",
       LOG_SQL_DSN: "postgres://user:supersecret@" + host + "/needtoken",
       DATABASE_HOST: host,
     }), images)
-    assert.equal(production.reason, "SQL host is outside the isolated allowlist")
-    assert.equal(JSON.stringify(production).includes("supersecret"), false)
-    assert.equal(production.start, undefined)
+    assert.equal(refused.authorizesBoot, false)
+    assert.equal(refused.reason, "SQL host is outside the isolated allowlist")
+    assert.equal(JSON.stringify(refused).includes("supersecret"), false)
+    assert.equal(refused.start, undefined)
   }
 
   const bare = planBoot(fixtureEnv({ NEEDTOKEN_BUILD_DIGEST: DIGEST }), images)
@@ -194,6 +194,7 @@ test("boot follows the injected allowlist and the attested image", () => {
   assert.equal(allowed.start.enableInternet, true)
   assert.deepEqual(allowed.start.instance, { vcpu: 1, memoryMib: 2048, diskMb: 8000 })
   assert.equal(allowed.start.env.SQL_DSN, "postgres://" + DATABASE_HOST + "/needtoken")
+  assert.equal(allowed.start.env.DATABASE_HOST, DATABASE_HOST)
   assert.equal(allowed.start.env.LOG_SQL_DSN, allowed.start.env.SQL_DSN)
   assert.equal(allowed.start.env.CRYPTO_SECRET, "fixture-crypto")
   assert.equal(allowed.start.env.NEEDTOKEN_QUEUE_CONSUMERS, "off")

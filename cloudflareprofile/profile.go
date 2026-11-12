@@ -22,22 +22,22 @@ const (
 	envCrypto         = "CRYPTO_SECRET"
 	envLogMode        = "NEEDTOKEN_LOG_SQL"
 	envLogSQL         = "LOG_SQL_DSN"
-	envAllowlist      = "NEEDTOKEN_HOST_ALLOWLIST"
 	envDBHost         = "DATABASE_HOST"
 	envPermit         = "NEEDTOKEN_WRITER_PERMIT"
 	envQueueConsumers = "NEEDTOKEN_QUEUE_CONSUMERS"
 
-	// allowedDatabaseHost is the isolated Neon database. The pooler hostname
-	// inserts "-pooler" before the first dot. Redis is the existing Upstash
-	// and is not on this list.
+	// allowedDatabaseHost is the only staging database. Its pooler hostname
+	// inserts "-pooler" before the first dot. Every other host is refused.
+	// After cutover, the profile-off process keeps the existing production
+	// database. NeedOps supplies that DSN later. Redis stays the existing Upstash.
 	allowedDatabaseHost = "ep-aged-sunset-b33os2qw.c-4.ap-southeast-1.aws.neon.tech"
 	queueConsumersOff   = "off"
 	envSQLite           = "SQLITE_PATH"
 	envPprof            = "ENABLE_PPROF"
 	envToken            = "GENERATE_DEFAULT_TOKEN"
 
-	// RuntimeStaging is the isolated staging process. It is not a production
-	// cutover, and the old Cloud Run process does not read this value.
+	// RuntimeStaging is the Cloudflare staging process. It does not replace
+	// Cloud Run and must not open the production database.
 	RuntimeStaging = "staging"
 )
 
@@ -127,14 +127,10 @@ func Validate(getenv func(string) string) error {
 	if err := validateQueueConsumers(getenv(envQueueConsumers)); err != nil {
 		return err
 	}
-	allowlist := parseAllowlist(getenv(envAllowlist))
-	if len(allowlist) == 0 {
-		return errors.New(errSQLHost)
+	if err := requireStagingDatabase(dsn, getenv(envDBHost)); err != nil {
+		return err
 	}
-	if err := requireDeclaredHost(dsn, getenv(envDBHost), allowlist); err != nil {
-		return errors.New(errSQLHost)
-	}
-	if err := validateLogDatabase(getenv, dsn, allowlist); err != nil {
+	if err := validateLogDatabase(getenv, dsn); err != nil {
 		return err
 	}
 	return nil
@@ -201,7 +197,7 @@ func validateWriterPermit(value string) error {
 	}
 }
 
-func validateLogDatabase(getenv func(string) string, sqlDSN string, allowlist []string) error {
+func validateLogDatabase(getenv func(string) string, sqlDSN string) error {
 	mode := strings.TrimSpace(getenv(envLogMode))
 	dsn := strings.TrimSpace(getenv(envLogSQL))
 	switch mode {
@@ -217,8 +213,8 @@ func validateLogDatabase(getenv func(string) string, sqlDSN string, allowlist []
 		if dsn == sqlDSN {
 			return errors.New(errLogSeparateSame)
 		}
-		if err := requireDeclaredHost(dsn, hostOf(dsn), allowlist); err != nil {
-			return errors.New(errSQLHost)
+		if err := requireStagingDatabase(dsn, hostOf(dsn)); err != nil {
+			return err
 		}
 		return nil
 	default:
@@ -226,21 +222,17 @@ func validateLogDatabase(getenv func(string) string, sqlDSN string, allowlist []
 	}
 }
 
-func requireDeclaredHost(dsn, declared string, allowlist []string) error {
+func requireStagingDatabase(dsn, declared string) error {
 	host, err := hostOfChecked(dsn)
-	if err != nil || !strings.EqualFold(host, strings.TrimSpace(declared)) || !databaseHostAllowed(host, allowlist) {
+	if err != nil || !strings.EqualFold(host, strings.TrimSpace(declared)) || !stagingDatabaseHost(host) {
 		return errors.New(errSQLHost)
 	}
 	return nil
 }
 
-func databaseHostAllowed(host string, allowlist []string) bool {
+func stagingDatabaseHost(host string) bool {
 	name := strings.ToLower(strings.TrimSpace(host))
-	pooler := neonPoolerTwin(allowedDatabaseHost)
-	if name != allowedDatabaseHost && name != pooler {
-		return false
-	}
-	return hostOnAllowlist(name, allowlist)
+	return name == allowedDatabaseHost || name == neonPoolerTwin(allowedDatabaseHost)
 }
 
 func hostOf(dsn string) string {
@@ -254,31 +246,6 @@ func hostOfChecked(dsn string) (string, error) {
 		return "", errors.New(errSQLHost)
 	}
 	return strings.ToLower(parsed.Hostname()), nil
-}
-
-func parseAllowlist(value string) []string {
-	var hosts []string
-	for item := range strings.SplitSeq(value, ",") {
-		host := strings.ToLower(strings.TrimSpace(item))
-		if host != "" {
-			hosts = append(hosts, host)
-		}
-	}
-	return hosts
-}
-
-func hostOnAllowlist(host string, allowlist []string) bool {
-	name := strings.ToLower(strings.TrimSpace(host))
-	if name == "" || strings.ContainsAny(name, "*/") {
-		return false
-	}
-	twin := neonPoolerTwin(name)
-	for _, entry := range allowlist {
-		if entry == name || (twin != "" && entry == twin) {
-			return true
-		}
-	}
-	return false
 }
 
 // neonPoolerTwin maps a Neon host to its direct or pooler pair. The marker is

@@ -1,8 +1,7 @@
 import {
   PLACEHOLDER_DIGEST,
   attestedDigests,
-  databaseHostAllowed,
-  parseAllowlist,
+  stagingDatabaseHost,
   writerPermitAccepted,
 } from "./gate.js"
 
@@ -20,7 +19,6 @@ const PASSTHROUGH_ENV = [
   "CRYPTO_SECRET",
   "NEEDTOKEN_LOG_SQL",
   "DATABASE_HOST",
-  "NEEDTOKEN_HOST_ALLOWLIST",
   "NEEDTOKEN_WRITER_PERMIT",
   "NEEDTOKEN_QUEUE_CONSUMERS",
 ]
@@ -58,15 +56,11 @@ export function planBoot(env, images) {
   if (text(source.NEEDTOKEN_QUEUE_CONSUMERS) !== "off") {
     return refuse("production queue consumers are not stopped")
   }
-  const allowlist = parseAllowlist(source.NEEDTOKEN_HOST_ALLOWLIST)
-  if (allowlist.length === 0) {
-    return refuse("host allowlist is absent")
-  }
   const databaseHost = sqlHost(dsn)
-  if (databaseHost === "" || databaseHost !== text(source.DATABASE_HOST).toLowerCase() || !databaseHostAllowed(databaseHost, allowlist)) {
+  if (databaseHost === "" || databaseHost !== text(source.DATABASE_HOST).toLowerCase() || !stagingDatabaseHost(databaseHost)) {
     return refuse("SQL host is outside the isolated allowlist")
   }
-  const logSQL = logDatabase(source, allowlist, dsn)
+  const logSQL = logDatabase(source, dsn)
   if (!logSQL.ok) {
     return logSQL
   }
@@ -106,7 +100,7 @@ export function sqlHost(dsn) {
   }
 }
 
-function logDatabase(source, allowlist, sqlDSN) {
+function logDatabase(source, sqlDSN) {
   const mode = text(source.NEEDTOKEN_LOG_SQL)
   const dsn = text(source.LOG_SQL_DSN)
   if (mode === "main") {
@@ -125,8 +119,7 @@ function logDatabase(source, allowlist, sqlDSN) {
     if (dsn === sqlDSN) {
       return refuse("LOG_SQL_DSN is not a separate isolated database")
     }
-    const host = sqlHost(dsn)
-    if (!databaseHostAllowed(host, allowlist)) {
+    if (!stagingDatabaseHost(sqlHost(dsn))) {
       return refuse("log SQL host is outside the isolated allowlist")
     }
     return { ok: true, mode }
