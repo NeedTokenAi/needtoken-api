@@ -4,7 +4,8 @@
 // Replace ACCOUNT_ID and the digest before a real start. Do not commit secret values.
 // Secrets are Worker secrets (wrangler secret put) and are passed through at start.
 // Custom sizes on the default policy need at least 1 vCPU and 3 GiB of memory
-// per vCPU, so 512 MiB is not legal. lite is the smallest predefined type.
+// per vCPU, so 512 MiB is not legal. basic is the predefined type at 1 GiB,
+// above the current Cloud Run 512 MiB.
 // max_instances is set here because the durable_object policy rejects that field.
 {
   "name": "needtoken-api",
@@ -29,7 +30,7 @@
       "class_name": "NeedtokenApiContainer",
       "scheduling_policy": "default",
       "image": "registry.cloudflare.com/ACCOUNT_ID/IMAGE@sha256:0000000000000000000000000000000000000000000000000000000000000000",
-      "instance_type": "lite",
+      "instance_type": "basic",
       "max_instances": 2
     }
   ],

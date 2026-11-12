@@ -72,7 +72,7 @@ test("wrangler config is a digest placeholder with the production size", () => {
   assert.equal(text.includes("-staging"), false);
   const container = json.containers[0];
   assert.equal(container.max_instances, 2);
-  assert.equal(container.instance_type, "lite");
+  assert.equal(container.instance_type, "basic");
   assert.match(container.image, /^registry\.cloudflare\.com\/ACCOUNT_ID\/IMAGE@sha256:0{64}$/);
   assert.equal(container.image.includes("needtoken-api"), false);
 });
