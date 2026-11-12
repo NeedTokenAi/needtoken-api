@@ -1,0 +1,44 @@
+// Staging worker only. No production route, custom domain, workers.dev URL,
+// or preview URL.
+// The image digest is the workflow output NEEDTOKEN_BUILD_DIGEST. A placeholder
+// does not match a build record, so this file does not boot by itself.
+//
+// Secret and variable names only. Values are not stored here:
+// SQL_DSN, SESSION_SECRET, REDIS_CONN_STRING, CRYPTO_SECRET, LOG_SQL_DSN,
+// NEEDTOKEN_LOG_SQL, DATABASE_HOST, NEEDTOKEN_WRITER_PERMIT,
+// NEEDTOKEN_QUEUE_CONSUMERS, NEEDTOKEN_BUILD_REPOSITORY, NEEDTOKEN_BUILD_SHA,
+// NEEDTOKEN_BUILD_RUN_ID, NEEDTOKEN_BUILD_DIGEST
+// No R2 binding. Staging DATABASE_HOST is the allowlisted Neon host or its
+// pooler. Redis stays the existing Upstash. NeedOps sets the production DSN later.
+{
+  "name": "needtoken-api-staging",
+  "main": "src/index.js",
+  "compatibility_date": "2026-11-12",
+  "workers_dev": false,
+  "preview_urls": false,
+  "containers": [
+    {
+      "class_name": "NewAPIContainer",
+      "scheduling_policy": "durable_object",
+      "images": {
+        "newapi": {
+          "image": "registry.cloudflare.com/ACCOUNT_ID/needtoken-api-staging@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      }
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "NEWAPI_CONTAINER",
+        "class_name": "NewAPIContainer"
+      }
+    ]
+  },
+  "exports": {
+    "NewAPIContainer": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    }
+  }
+}
