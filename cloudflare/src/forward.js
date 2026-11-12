@@ -11,7 +11,10 @@ export const INACTIVITY_TIMEOUT_MS = 6 * 60 * 60 * 1000;
 
 // One probe. A closed port returns 503 instead of blocking the caller.
 // The cron retries that 503 on the same instance until this deadline.
+// After a Durable Object rebuild the container may already be running, and
+// its first response can take longer than one second. This is that budget.
 export const PROBE_ATTEMPTS = 1;
+export const PROBE_TIMEOUT_MS = 5000;
 export const RETRY_AFTER_SECONDS = 5;
 export const READY_DEADLINE_MS = 4 * 60 * 1000;
 

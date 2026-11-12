@@ -3,6 +3,7 @@ import {
   APP_PORT,
   INACTIVITY_TIMEOUT_MS,
   PROBE_ATTEMPTS,
+  PROBE_TIMEOUT_MS,
   awaitInstance,
   containerEnv,
   containerNotReadyError,
@@ -26,7 +27,6 @@ export class NeedtokenApiContainer extends DurableObject {
   async fetch(request) {
     try {
       await this.ensureStarted();
-      return await this.ctx.container.getTcpPort(APP_PORT).fetch(containerRequest(request));
     } catch (error) {
       this.portReady = false;
       const response = startupFailureResponse(error);
@@ -35,6 +35,7 @@ export class NeedtokenApiContainer extends DurableObject {
       }
       throw error;
     }
+    return this.ctx.container.getTcpPort(APP_PORT).fetch(containerRequest(request));
   }
 
   async ensureStarted() {
@@ -63,7 +64,7 @@ export class NeedtokenApiContainer extends DurableObject {
     await container.setInactivityTimeout(INACTIVITY_TIMEOUT_MS);
     await waitForPort(
       () => container.getTcpPort(APP_PORT).fetch("http://container/", {
-        signal: AbortSignal.timeout(1000),
+        signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
       }),
       (ms) => scheduler.wait(ms),
       PROBE_ATTEMPTS,
