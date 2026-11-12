@@ -1,12 +1,15 @@
-export const PLACEHOLDER_DIGEST = "sha256:" + "0".repeat(64)
+import {
+  PLACEHOLDER_DIGEST,
+  attestedDigests,
+  hostOnAllowlist,
+  parseAllowlist,
+  writerPermitAccepted,
+} from "./gate.js"
+
+export { PLACEHOLDER_DIGEST }
 export const INACTIVITY_TIMEOUT_MS = 6 * 60 * 60 * 1000
 export const ALARM_INTERVAL_MS = 60 * 1000
 export const CONTAINER_PORT = 3000
-
-// ISOLATED_SQL_HOSTS is the only SQL host this candidate may open.
-// A test-fixture label is not a member of this list. Keep it aligned with
-// cloudflareprofile/isolated_hosts.json.
-export const ISOLATED_SQL_HOSTS = ["isolated.example"]
 
 const PASSTHROUGH_ENV = [
   "CLOUDFLARE_PROFILE",
@@ -16,6 +19,10 @@ const PASSTHROUGH_ENV = [
   "REDIS_CONN_STRING",
   "CRYPTO_SECRET",
   "NEEDTOKEN_LOG_SQL",
+  "DATABASE_HOST",
+  "REDIS_HOST",
+  "NEEDTOKEN_HOST_ALLOWLIST",
+  "NEEDTOKEN_WRITER_PERMIT",
 ]
 
 export function planBoot(env, images) {
@@ -23,11 +30,8 @@ export function planBoot(env, images) {
   if (source.CLOUDFLARE_PROFILE !== "1") {
     return refuse("profile off")
   }
-  if (source.NEEDTOKEN_RUNTIME !== "isolated-candidate") {
+  if (source.NEEDTOKEN_RUNTIME !== "staging") {
     return refuse("production writer refused")
-  }
-  if (source.NEEDTOKEN_CONTAINER_BOOT !== "test-fixture") {
-    return refuse("phase-1 skeleton does not boot a container")
   }
   const dsn = text(source.SQL_DSN)
   if (dsn === "") {
@@ -35,9 +39,6 @@ export function planBoot(env, images) {
   }
   if (dsn.startsWith("local")) {
     return refuse("SQLite refused")
-  }
-  if (!isolatedSQLHost(dsn)) {
-    return refuse("SQL host is outside the isolated allowlist")
   }
   if (text(source.SESSION_SECRET) === "") {
     return refuse("SESSION_SECRET binding is absent")
@@ -51,7 +52,22 @@ export function planBoot(env, images) {
   if (text(source.REDIS_CONN_STRING) === "") {
     return refuse("REDIS_CONN_STRING binding is absent")
   }
-  const logSQL = logDatabase(source)
+  if (!writerPermitAccepted(source.NEEDTOKEN_WRITER_PERMIT)) {
+    return refuse("writer permit is a test value")
+  }
+  const allowlist = parseAllowlist(source.NEEDTOKEN_HOST_ALLOWLIST)
+  if (allowlist.length === 0) {
+    return refuse("host allowlist is absent")
+  }
+  const databaseHost = sqlHost(dsn)
+  const redisHost = sqlHost(source.REDIS_CONN_STRING)
+  if (databaseHost === "" || databaseHost !== text(source.DATABASE_HOST).toLowerCase() || !hostOnAllowlist(databaseHost, allowlist)) {
+    return refuse("SQL host is outside the isolated allowlist")
+  }
+  if (redisHost === "" || redisHost !== text(source.REDIS_HOST).toLowerCase() || !hostOnAllowlist(redisHost, allowlist)) {
+    return refuse("Redis host is outside the isolated allowlist")
+  }
+  const logSQL = logDatabase(source, allowlist, dsn)
   if (!logSQL.ok) {
     return logSQL
   }
@@ -60,24 +76,20 @@ export function planBoot(env, images) {
     return size
   }
   const image = images && images.newapi
-  const digest = imageDigest(imageReference(image))
-  if (!String(image || "").startsWith("registry.cloudflare.com/") || !/^sha256:[0-9a-f]{64}$/.test(digest)) {
+  const reference = imageReference(image)
+  const attested = attestedDigests(source)
+  if (attested.length !== 1 || attested[0] !== reference) {
+    return refuse("image is not an attested build")
+  }
+  if (!reference.startsWith("registry.cloudflare.com/") || !reference.includes("@sha256:")) {
     return refuse("image digest is not pinned")
   }
-  if (digest === PLACEHOLDER_DIGEST) {
-    return refuse("placeholder digest")
-  }
-  const previous = imageDigest(imageReference(images && images.previous))
-  if (previous && previous === digest) {
-    return refuse("previous digest is not a second boot target")
-  }
-  // A real digest still does not authorize boot. The candidate records it
-  // and stays fail-closed until a later phase that this skeleton is not.
   return {
-    ok: false,
-    authorizesBoot: false,
+    ok: true,
+    authorizesBoot: true,
     isolated: true,
-    reason: "phase-1 skeleton does not boot a container",
+    rollback: false,
+    attestedDigests: attested,
     start: {
       image,
       enableInternet: true,
@@ -85,11 +97,6 @@ export function planBoot(env, images) {
       env: passThrough(source, logSQL),
     },
   }
-}
-
-export function isolatedSQLHost(dsn) {
-  const host = sqlHost(dsn)
-  return host !== "" && ISOLATED_SQL_HOSTS.includes(host)
 }
 
 export function sqlHost(dsn) {
@@ -100,12 +107,15 @@ export function sqlHost(dsn) {
   }
 }
 
-function logDatabase(source) {
+function logDatabase(source, allowlist, sqlDSN) {
   const mode = text(source.NEEDTOKEN_LOG_SQL)
   const dsn = text(source.LOG_SQL_DSN)
   if (mode === "main") {
-    if (dsn !== "") {
-      return refuse("LOG_SQL_DSN is set while logs stay on the main database")
+    if (dsn === "") {
+      return refuse("LOG_SQL_DSN binding is absent")
+    }
+    if (dsn !== sqlDSN) {
+      return refuse("LOG_SQL_DSN is not the isolated main database")
     }
     return { ok: true, mode }
   }
@@ -113,7 +123,11 @@ function logDatabase(source) {
     if (dsn === "") {
       return refuse("LOG_SQL_DSN binding is absent")
     }
-    if (!isolatedSQLHost(dsn)) {
+    if (dsn === sqlDSN) {
+      return refuse("LOG_SQL_DSN is not a separate isolated database")
+    }
+    const host = sqlHost(dsn)
+    if (!hostOnAllowlist(host, allowlist)) {
       return refuse("log SQL host is outside the isolated allowlist")
     }
     return { ok: true, mode }
@@ -167,11 +181,8 @@ function passThrough(env, logSQL) {
       out[key] = env[key]
     }
   }
-  if (logSQL && logSQL.mode === "separate" && text(env.LOG_SQL_DSN) !== "") {
+  if (logSQL && logSQL.ok && text(env.LOG_SQL_DSN) !== "") {
     out.LOG_SQL_DSN = env.LOG_SQL_DSN
-  }
-  if (env.NEEDTOKEN_CONTAINER_BOOT === "test-fixture") {
-    out.NEEDTOKEN_CONTAINER_BOOT = "test-fixture"
   }
   return out
 }
@@ -181,5 +192,5 @@ function text(value) {
 }
 
 function refuse(reason) {
-  return { ok: false, reason }
+  return { ok: false, authorizesBoot: false, rollback: false, attestedDigests: [], reason }
 }

@@ -1,12 +1,16 @@
 import assert from "node:assert/strict"
 import test from "node:test"
 import { ALARM_INTERVAL_MS, INACTIVITY_TIMEOUT_MS, planBoot } from "../src/boot.js"
+import { attestedDigests, handFilledRecord } from "../src/gate.js"
 import { createController, schedulerWait, userTrafficReady, waitForReady } from "../src/controller.js"
 import { containerRequest, forwardUpstream } from "../src/proxy.js"
 import { routeSingleton, secretBindings, SINGLETON_NAME } from "../src/singleton.js"
 
 const DIGEST = "sha256:" + "ab".repeat(32)
 const PREVIOUS = "sha256:" + "cd".repeat(32)
+const ACCOUNT = "a".repeat(32)
+const IMAGE = "registry.cloudflare.com/" + ACCOUNT + "/needtoken-api-staging@" + DIGEST
+const PREVIOUS_IMAGE = "registry.cloudflare.com/" + ACCOUNT + "/needtoken-api-staging@" + PREVIOUS
 
 globalThis.scheduler = {
   async wait() {},
@@ -15,19 +19,31 @@ globalThis.scheduler = {
 function fixtureEnv(overrides = {}) {
   return {
     CLOUDFLARE_PROFILE: "1",
-    NEEDTOKEN_RUNTIME: "isolated-candidate",
-    NEEDTOKEN_CONTAINER_BOOT: "test-fixture",
+    NEEDTOKEN_RUNTIME: "staging",
     NEEDTOKEN_LOG_SQL: "main",
-    SQL_DSN: "postgres://isolated.example/needtoken",
+    SQL_DSN: "postgres://db.staging.internal/needtoken",
+    LOG_SQL_DSN: "postgres://db.staging.internal/needtoken",
     SESSION_SECRET: "fixture-session",
     CRYPTO_SECRET: "fixture-crypto",
-    REDIS_CONN_STRING: "redis://isolated.example:6379",
+    REDIS_CONN_STRING: "redis://redis.staging.internal:6379",
+    DATABASE_HOST: "db.staging.internal",
+    REDIS_HOST: "redis.staging.internal",
+    NEEDTOKEN_HOST_ALLOWLIST: "db.staging.internal,redis.staging.internal",
+    NEEDTOKEN_WRITER_PERMIT: "staging-writer",
+    NEEDTOKEN_BUILD_REPOSITORY: "NeedTokenAi/needtoken-api",
+    NEEDTOKEN_BUILD_SHA: "b33721ae32f468dba889071b9cbba252b27d7f0c",
+    NEEDTOKEN_BUILD_RUN_ID: "43174047407",
+    NEEDTOKEN_BUILD_DIGEST: IMAGE,
     CONTAINER_VCPU: "1",
     CONTAINER_MEMORY_MIB: "2048",
     CONTAINER_DISK_MB: "8000",
     CLOUDFLARE_API_TOKEN: "do-not-copy",
     ...overrides,
   }
+}
+
+function candidateImages() {
+  return { newapi: IMAGE, previous: PREVIOUS_IMAGE }
 }
 
 function memoryStorage(initial = {}) {
@@ -113,14 +129,13 @@ test("secret bindings are names only", () => {
   assert.equal(secretBindings.find((item) => item.secret === "LOG_SQL_DSN").explicit, "main-or-separate")
 })
 
-test("boot stays refused without the test switch and does not copy unrelated secrets", () => {
-  const images = { newapi: "registry.cloudflare.com/ACCOUNT_ID/needtoken-api@" + DIGEST }
-  const refused = planBoot(fixtureEnv({ NEEDTOKEN_CONTAINER_BOOT: "" }), images)
-  assert.equal(refused.ok, false)
-  assert.equal(refused.reason, "phase-1 skeleton does not boot a container")
-  assert.equal(JSON.stringify(refused).includes("fixture-session"), false)
+test("boot follows the injected allowlist and the attested image", () => {
+  const images = candidateImages()
+  const permit = planBoot(fixtureEnv({ NEEDTOKEN_WRITER_PERMIT: "APPROVED" }), images)
+  assert.equal(permit.authorizesBoot, false)
+  assert.equal(permit.reason, "writer permit is a test value")
 
-  const sqlite = planBoot(fixtureEnv({ SQL_DSN: "local-supersecret-do-not-leak" }), images)
+  const sqlite = planBoot(fixtureEnv({ SQL_DSN: "local-supersecret-do-not-leak", LOG_SQL_DSN: "local-supersecret-do-not-leak" }), images)
   assert.equal(sqlite.ok, false)
   assert.equal(sqlite.reason, "SQLite refused")
   assert.equal(sqlite.reason.includes("supersecret"), false)
@@ -131,27 +146,38 @@ test("boot stays refused without the test switch and does not copy unrelated sec
   const basic = planBoot(fixtureEnv({ CONTAINER_INSTANCE: "basic" }), images)
   assert.equal(basic.ok, false)
 
-  const production = planBoot(fixtureEnv({ SQL_DSN: "postgres://user:supersecret@ep-prod.neon.tech/needtoken" }), images)
-  assert.equal(production.ok, false)
-  assert.equal(production.reason, "SQL host is outside the isolated allowlist")
-  assert.equal(JSON.stringify(production).includes("supersecret"), false)
-  assert.equal(production.start, undefined)
+  for (const host of ["ep-prod.neon.tech", "ep-prod.neon.tech.isolated", "db.staging.internal.isolated"]) {
+    const production = planBoot(fixtureEnv({
+      SQL_DSN: "postgres://user:supersecret@" + host + "/needtoken",
+      LOG_SQL_DSN: "postgres://user:supersecret@" + host + "/needtoken",
+      DATABASE_HOST: host,
+    }), images)
+    assert.equal(production.reason, "SQL host is outside the isolated allowlist")
+    assert.equal(JSON.stringify(production).includes("supersecret"), false)
+    assert.equal(production.start, undefined)
+  }
+
+  const bare = planBoot(fixtureEnv({ NEEDTOKEN_BUILD_DIGEST: DIGEST }), images)
+  assert.equal(bare.authorizesBoot, false)
+  assert.deepEqual(attestedDigests(fixtureEnv({ NEEDTOKEN_BUILD_DIGEST: DIGEST })), [])
+  assert.equal(handFilledRecord(DIGEST), true)
+  assert.equal(handFilledRecord(JSON.stringify({ sourceSHA: "abc", digest: DIGEST })), true)
 
   const missingCrypto = planBoot(fixtureEnv({ CRYPTO_SECRET: "" }), images)
   assert.equal(missingCrypto.reason, "CRYPTO_SECRET binding is absent")
 
   const allowed = planBoot(fixtureEnv(), images)
-  assert.equal(allowed.authorizesBoot, false)
-  assert.equal(allowed.isolated, true)
-  assert.equal(allowed.ok, false)
+  assert.equal(allowed.authorizesBoot, true)
+  assert.equal(allowed.ok, true)
+  assert.equal(allowed.rollback, false)
+  assert.deepEqual(allowed.attestedDigests, [IMAGE])
   assert.equal(allowed.start.enableInternet, true)
   assert.deepEqual(allowed.start.instance, { vcpu: 1, memoryMib: 2048, diskMb: 8000 })
-  assert.equal(allowed.start.env.SQL_DSN, "postgres://isolated.example/needtoken")
+  assert.equal(allowed.start.env.SQL_DSN, "postgres://db.staging.internal/needtoken")
+  assert.equal(allowed.start.env.LOG_SQL_DSN, allowed.start.env.SQL_DSN)
   assert.equal(allowed.start.env.CRYPTO_SECRET, "fixture-crypto")
-  assert.equal(allowed.start.env.NEEDTOKEN_CONTAINER_BOOT, "test-fixture")
-  assert.equal(allowed.start.env.LOG_SQL_DSN, undefined)
   assert.equal(allowed.start.env.CLOUDFLARE_API_TOKEN, undefined)
-  assert.equal(allowed.start.image.endsWith(DIGEST), true)
+  assert.equal(allowed.start.image, IMAGE)
 })
 
 test("streaming proxy returns the upstream response without reading it", async () => {
@@ -195,14 +221,12 @@ test("readiness stays closed until background is running, including at zero user
   const controller = createController({
     env: fixtureEnv(),
     images: {
-      newapi: "registry.cloudflare.com/ACCOUNT_ID/needtoken-api@" + DIGEST,
-      previous: "registry.cloudflare.com/ACCOUNT_ID/needtoken-api@" + PREVIOUS,
+      ...candidateImages(),
     },
     storage,
     container,
     now: () => 1_000,
     probe: async () => status,
-    unitTestStart: true,
   })
   await controller.hydrate()
   assert.equal(storage.alarms.length, 1)
@@ -286,7 +310,7 @@ test("restart reuses the running container and the same epoch", async () => {
   container.running = true
   const controller = createController({
     env: fixtureEnv(),
-    images: { newapi: "registry.cloudflare.com/ACCOUNT_ID/needtoken-api@" + DIGEST },
+    images: candidateImages(),
     storage,
     container,
     now: () => 10,
@@ -400,8 +424,7 @@ test("a closed port, a failed start, a non-zero exit, and a rebuilt durable obje
   const container = fakeContainer()
   let probes = 0
   const images = {
-    newapi: "registry.cloudflare.com/ACCOUNT_ID/needtoken-api@" + DIGEST,
-    previous: "registry.cloudflare.com/ACCOUNT_ID/needtoken-api@" + PREVIOUS,
+    ...candidateImages(),
   }
   container.start = (options) => {
     container.calls.start += 1
@@ -424,7 +447,6 @@ test("a closed port, a failed start, a non-zero exit, and a rebuilt durable obje
     storage,
     container,
     now: () => 5_000,
-    unitTestStart: true,
     probe: async () => {
       probes += 1
       if (probes === 1) {
@@ -462,7 +484,6 @@ test("a closed port, a failed start, a non-zero exit, and a rebuilt durable obje
     storage,
     container,
     now: () => 9_000,
-    unitTestStart: true,
     probe: async () => readyStatus(),
   })
   await rebuilt.hydrate()

@@ -5,38 +5,34 @@
 package cloudflareprofile
 
 import (
-	_ "embed"
 	"errors"
 	"fmt"
 	"net/url"
 	"os"
 	"strings"
 	"sync/atomic"
-
-	"github.com/QuantumNous/new-api/common"
 )
 
 const (
-	envProfile = "CLOUDFLARE_PROFILE"
-	envRuntime = "NEEDTOKEN_RUNTIME"
-	envBoot    = "NEEDTOKEN_CONTAINER_BOOT"
-	envSQL     = "SQL_DSN"
-	envSession = "SESSION_SECRET"
-	envRedis   = "REDIS_CONN_STRING"
-	envCrypto  = "CRYPTO_SECRET"
-	envLogMode = "NEEDTOKEN_LOG_SQL"
-	envLogSQL  = "LOG_SQL_DSN"
-	envSQLite  = "SQLITE_PATH"
-	envPprof   = "ENABLE_PPROF"
-	envToken   = "GENERATE_DEFAULT_TOKEN"
+	envProfile   = "CLOUDFLARE_PROFILE"
+	envRuntime   = "NEEDTOKEN_RUNTIME"
+	envSQL       = "SQL_DSN"
+	envSession   = "SESSION_SECRET"
+	envRedis     = "REDIS_CONN_STRING"
+	envCrypto    = "CRYPTO_SECRET"
+	envLogMode   = "NEEDTOKEN_LOG_SQL"
+	envLogSQL    = "LOG_SQL_DSN"
+	envAllowlist = "NEEDTOKEN_HOST_ALLOWLIST"
+	envDBHost    = "DATABASE_HOST"
+	envRedisHost = "REDIS_HOST"
+	envPermit    = "NEEDTOKEN_WRITER_PERMIT"
+	envSQLite    = "SQLITE_PATH"
+	envPprof     = "ENABLE_PPROF"
+	envToken     = "GENERATE_DEFAULT_TOKEN"
 
-	// RuntimeIsolatedCandidate is the only mode that may pass validation.
-	// It is not a production cutover.
-	RuntimeIsolatedCandidate = "isolated-candidate"
-	// BootTestFixture is an extra lock. It does not prove the DSN host is
-	// isolated. SQL also has to match isolated_hosts.json. This repository
-	// never sets the switch in a deploy workflow.
-	BootTestFixture = "test-fixture"
+	// RuntimeStaging is the isolated staging process. It is not a production
+	// cutover, and the old Cloud Run process does not read this value.
+	RuntimeStaging = "staging"
 )
 
 const (
@@ -50,19 +46,19 @@ const (
 	errPprof           = "cloudflare profile refuses ENABLE_PPROF disk profiles"
 	errDefaultToken    = "cloudflare profile refuses generating a default token"
 	errRuntime         = "cloudflare profile refuses to start a writer"
-	errBoot            = "cloudflare profile refuses to open SQL without the isolated test switch"
 	errSQLHost         = "cloudflare profile refuses a SQL host outside the isolated allowlist"
+	errRedisHost       = "cloudflare profile refuses a Redis host outside the isolated allowlist"
+	errPermitAbsent    = "cloudflare profile refuses a writer permit that is absent"
+	errPermitTest      = "cloudflare profile refuses a test writer permit"
+	errLogMainMismatch = "cloudflare profile refuses LOG_SQL_DSN that is not the isolated main database"
+	errLogSeparateSame = "cloudflare profile refuses LOG_SQL_DSN that is not a separate isolated database"
 	errCryptoAbsent    = "cloudflare profile refuses to start: CRYPTO_SECRET binding is absent"
 	errLogImplicit     = "cloudflare profile refuses an implicit log database"
-	errLogMainConflict = "cloudflare profile refuses LOG_SQL_DSN when logs stay on the main database"
 	errLogSeparate     = "cloudflare profile refuses a separate log database without LOG_SQL_DSN"
 	errSQLPermit       = "cloudflare profile refuses SQL before isolation and the writer permit"
 	errDefaultAdmin    = "cloudflare profile refuses the default root account"
 	errBootstrap       = "cloudflare profile refuses bootstrap"
 )
-
-//go:embed isolated_hosts.json
-var isolatedHostsJSON []byte
 
 var sqlPermit atomic.Bool
 
@@ -113,19 +109,26 @@ func Validate(getenv func(string) string) error {
 	if boolEnv(getenv, envToken) {
 		return errors.New(errDefaultToken)
 	}
-	if getenv(envRuntime) != RuntimeIsolatedCandidate {
+	if getenv(envRuntime) != RuntimeStaging {
 		return errors.New(errRuntime)
-	}
-	if getenv(envBoot) != BootTestFixture {
-		return errors.New(errBoot)
 	}
 	if strings.TrimSpace(getenv(envCrypto)) == "" {
 		return errors.New(errCryptoAbsent)
 	}
-	if err := validateLogDatabase(getenv); err != nil {
+	if err := validateWriterPermit(getenv(envPermit)); err != nil {
 		return err
 	}
-	if _, err := requireIsolatedHost(dsn); err != nil {
+	allowlist := parseAllowlist(getenv(envAllowlist))
+	if len(allowlist) == 0 {
+		return errors.New(errSQLHost)
+	}
+	if err := requireDeclaredHost(dsn, getenv(envDBHost), allowlist); err != nil {
+		return errors.New(errSQLHost)
+	}
+	if err := requireDeclaredHost(getenv(envRedis), getenv(envRedisHost), allowlist); err != nil {
+		return errors.New(errRedisHost)
+	}
+	if err := validateLogDatabase(getenv, dsn, allowlist); err != nil {
 		return err
 	}
 	return nil
@@ -165,21 +168,37 @@ func RefuseDefaultAdmin() error {
 	return errors.New(errDefaultAdmin)
 }
 
-func validateLogDatabase(getenv func(string) string) error {
+func validateWriterPermit(value string) error {
+	permit := strings.TrimSpace(value)
+	if permit == "" {
+		return errors.New(errPermitAbsent)
+	}
+	switch strings.ToLower(permit) {
+	case "approved", "approve", "test", "test-fixture", "fixture", "true", "false", "1", "0", "yes", "no", "isolated", "isolated-candidate", "isolated.example", "placeholder", "random_string":
+		return errors.New(errPermitTest)
+	default:
+		return nil
+	}
+}
+
+func validateLogDatabase(getenv func(string) string, sqlDSN string, allowlist []string) error {
 	mode := strings.TrimSpace(getenv(envLogMode))
 	dsn := strings.TrimSpace(getenv(envLogSQL))
 	switch mode {
 	case "main":
-		if dsn != "" {
-			return errors.New(errLogMainConflict)
+		if dsn == "" || dsn != sqlDSN {
+			return errors.New(errLogMainMismatch)
 		}
 		return nil
 	case "separate":
 		if dsn == "" {
 			return errors.New(errLogSeparate)
 		}
-		if _, err := requireIsolatedHost(dsn); err != nil {
-			return err
+		if dsn == sqlDSN {
+			return errors.New(errLogSeparateSame)
+		}
+		if err := requireDeclaredHost(dsn, hostOf(dsn), allowlist); err != nil {
+			return errors.New(errSQLHost)
 		}
 		return nil
 	default:
@@ -187,15 +206,20 @@ func validateLogDatabase(getenv func(string) string) error {
 	}
 }
 
-func requireIsolatedHost(dsn string) (string, error) {
-	host, err := sqlHost(dsn)
-	if err != nil || !isolatedHostAllowed(host) {
-		return "", errors.New(errSQLHost)
+func requireDeclaredHost(dsn, declared string, allowlist []string) error {
+	host, err := hostOfChecked(dsn)
+	if err != nil || !strings.EqualFold(host, strings.TrimSpace(declared)) || !hostOnAllowlist(host, allowlist) {
+		return errors.New(errSQLHost)
 	}
-	return host, nil
+	return nil
 }
 
-func sqlHost(dsn string) (string, error) {
+func hostOf(dsn string) string {
+	host, _ := hostOfChecked(dsn)
+	return host
+}
+
+func hostOfChecked(dsn string) (string, error) {
 	parsed, err := url.Parse(strings.TrimSpace(dsn))
 	if err != nil || parsed.Hostname() == "" {
 		return "", errors.New(errSQLHost)
@@ -203,15 +227,24 @@ func sqlHost(dsn string) (string, error) {
 	return strings.ToLower(parsed.Hostname()), nil
 }
 
-func isolatedHostAllowed(host string) bool {
-	var document struct {
-		Hosts []string `json:"hosts"`
+func parseAllowlist(value string) []string {
+	var hosts []string
+	for item := range strings.SplitSeq(value, ",") {
+		host := strings.ToLower(strings.TrimSpace(item))
+		if host != "" {
+			hosts = append(hosts, host)
+		}
 	}
-	if err := common.Unmarshal(isolatedHostsJSON, &document); err != nil {
+	return hosts
+}
+
+func hostOnAllowlist(host string, allowlist []string) bool {
+	name := strings.ToLower(strings.TrimSpace(host))
+	if name == "" || strings.ContainsAny(name, "*/") {
 		return false
 	}
-	for _, allowed := range document.Hosts {
-		if strings.EqualFold(strings.TrimSpace(allowed), host) {
+	for _, entry := range allowlist {
+		if entry == name {
 			return true
 		}
 	}

@@ -1,7 +1,9 @@
 import { readFileSync } from "node:fs"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
-import { ISOLATED_SQL_HOSTS, PLACEHOLDER_DIGEST, imageReference, isolatedSQLHost } from "../src/boot.js"
+import { existsSync } from "node:fs"
+import { imageReference } from "../src/boot.js"
+import { attestedDigests, handFilledRecord } from "../src/gate.js"
 import { recoveryState } from "../src/recovery.js"
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..")
@@ -13,7 +15,7 @@ export function parseJSONC(text) {
 }
 
 export function workflowDeploys(text) {
-  const patterns = [/wrangler\s+deploy/, /npx\s+wrangler/, /\bgcloud\b/, /cloud\s+run/i, /^\s*push\s*:/m]
+  const patterns = [/wrangler\s+deploy/, /wrangler\s+versions\s+upload/, /\bgcloud\b/, /cloud\s+run/i, /^\s*push\s*:/m]
   return patterns.some((pattern) => pattern.test(text))
 }
 
@@ -58,30 +60,46 @@ export function lintRepo(repo = root) {
       errors.push("action is not pinned to a commit SHA: " + line.trim())
     }
   }
-  const buildSource = JSON.parse(readFileSync(path.join(repo, "cloudflare/candidate/build-source.json"), "utf8"))
-  if (buildSource.authorizesBoot !== false || buildSource.rollback !== false) {
-    errors.push("build source must stay fail-closed")
+  if (existsSync(path.join(repo, "cloudflare/candidate/build-source.json"))) {
+    errors.push("hand-filled build JSON is not a build record")
   }
-  if (buildSource.digest !== image.slice(image.lastIndexOf("@") + 1)) {
-    errors.push("build source digest is not the pinned candidate")
+  if (existsSync(path.join(repo, "cloudflareprofile/isolated_hosts.json"))) {
+    errors.push("hardcoded host list is not the injected allowlist")
   }
-  const allowlist = JSON.parse(readFileSync(path.join(repo, "cloudflareprofile/isolated_hosts.json"), "utf8"))
-  if (!allowlist.hosts || allowlist.hosts.join(",") !== ISOLATED_SQL_HOSTS.join(",")) {
-    errors.push("isolated SQL allowlist drifted")
+  const source = readFileSync(path.join(repo, "cloudflare/src/controller.js"), "utf8")
+  if (source.includes("unitTestStart")) {
+    errors.push("unitTestStart is not a boot gate")
   }
-  if (allowlist.hosts.some((host) => /neon\.tech|googleapis|cloudsql/i.test(host))) {
-    errors.push("isolated SQL allowlist contains a production host")
+  const staging = parseJSONC(readFileSync(path.join(repo, "cloudflare/wrangler.staging.jsonc"), "utf8"))
+  if (!String(staging.name || "").endsWith("-staging")) {
+    errors.push("staging worker name must end in -staging")
   }
-  if (/postgres:\/\/|redis:\/\/|mysql:\/\/|BEGIN PRIVATE|AKIA/.test(readFileSync(wranglerPath, "utf8"))) {
+  if (staging.workers_dev !== false || staging.routes || staging.route) {
+    errors.push("staging worker must not publish a route")
+  }
+  const imageWorkflow = readFileSync(path.join(repo, ".github/workflows/cloudflare-staging-image.yml"), "utf8")
+  if (!imageWorkflow.includes("workflow_dispatch") || /pull_request:/.test(imageWorkflow) || /^\s*push\s*:/m.test(imageWorkflow)) {
+    errors.push("image workflow must be workflow_dispatch only")
+  }
+  if (workflowDeploys(imageWorkflow) || !imageWorkflow.includes("containers build")) {
+    errors.push("image workflow must push the image without deploying")
+  }
+  for (const field of ["GITHUB_REPOSITORY", "GITHUB_SHA", "GITHUB_RUN_ID", "digest"]) {
+    if (!imageWorkflow.includes(field)) {
+      errors.push("image workflow does not output " + field)
+    }
+  }
+  if (/postgres:\/\/|redis:\/\/|mysql:\/\/|BEGIN PRIVATE|AKIA/.test(readFileSync(wranglerPath, "utf8") + readFileSync(path.join(repo, "cloudflare/wrangler.staging.jsonc"), "utf8"))) {
     errors.push("wrangler file contains a credential")
   }
   if (workflowDeploys(workflow)) {
     errors.push("candidate workflow deploys or follows a push trigger")
   }
-  for (const required of ["workflow_dispatch", "approval", "cloudflare-candidate-approval", "check.mjs --lint", "check.mjs --bind"]) {
-    if (!workflow.includes(required)) {
-      errors.push("workflow is missing " + required)
-    }
+  if (!workflow.includes("check.mjs --lint")) {
+    errors.push("workflow is missing check.mjs --lint")
+  }
+  if (workflow.includes("workflow_dispatch") || workflow.includes("CANDIDATE_IMAGE_DIGEST")) {
+    errors.push("candidate workflow accepts a hand-filled digest")
   }
   if (workflow.includes("secrets.")) {
     errors.push("workflow reads repository secrets")
@@ -91,7 +109,6 @@ export function lintRepo(repo = root) {
     errors,
     pinnedDigest: image ? image.slice(image.lastIndexOf("@") + 1) : "",
     previousDigest: previous ? previous.slice(previous.lastIndexOf("@") + 1) : "",
-    buildSource,
   }
 }
 
@@ -100,63 +117,15 @@ function pinnedCloudflareDigest(image) {
 }
 
 export function bindCandidate(input) {
-  const errors = []
-  if (input.approval !== "approved") {
-    errors.push("approval gate rejected")
+  if (handFilledRecord(input.buildSource) || handFilledRecord(input.imageDigest) || handFilledRecord(input.json)) {
+    return { ok: false, boot: false, deploy: false, rollback: false, live: false, errors: ["hand-filled SHA or JSON is not a build record"] }
   }
-  if (!/^[0-9a-f]{40}$/.test(input.mainSHA || "")) {
-    errors.push("main SHA is not a commit")
+  const attested = attestedDigests(input.env || {})
+  const image = imageReference(input.images && input.images.newapi)
+  if (attested.length !== 1 || attested[0] !== image) {
+    return { ok: false, boot: false, deploy: false, rollback: false, live: false, attestedDigests: attested, errors: ["image is not an attested build"] }
   }
-  if (input.mainSHA !== input.headSHA || input.mainSHA !== input.originMainSHA) {
-    errors.push("main SHA is not the current origin/main")
-  }
-  if (!/^sha256:[0-9a-f]{64}$/.test(input.imageDigest || "")) {
-    errors.push("image digest is not pinned")
-  }
-  if (input.imageDigest === PLACEHOLDER_DIGEST) {
-    errors.push("placeholder digest")
-  }
-  if (input.imageDigest !== input.pinnedDigest) {
-    errors.push("image digest is not the pinned candidate")
-  }
-  if (input.workflowDeploys) {
-    errors.push("candidate check refuses to deploy")
-  }
-  const source = input.buildSource || {}
-  if (source.sourceSHA !== input.mainSHA) {
-    errors.push("digest is not tied to the main SHA")
-  }
-  if (source.digest !== input.imageDigest) {
-    errors.push("digest is not the recorded build source")
-  }
-  if (!source.runId) {
-    errors.push("build run is absent")
-  }
-  if (source.rollback !== false) {
-    errors.push("rollback is not available")
-  }
-  if (source.authorizesBoot !== false) {
-    errors.push("this skeleton cannot authorize boot")
-  }
-  if (input.sqlDSN && !isolatedSQLHost(input.sqlDSN)) {
-    errors.push("SQL host is outside the isolated allowlist")
-  }
-  if (input.sqlHost && !ISOLATED_SQL_HOSTS.includes(input.sqlHost)) {
-    errors.push("SQL host is outside the isolated allowlist")
-  }
-  if (errors.length > 0) {
-    return { ok: false, errors }
-  }
-  return {
-    ok: true,
-    deploy: false,
-    boot: false,
-    live: false,
-    rollback: false,
-    gcpFenced: false,
-    mainSHA: input.mainSHA,
-    imageDigest: input.imageDigest,
-  }
+  return { ok: true, boot: true, deploy: false, live: false, rollback: false, gcpFenced: false, attestedDigests: attested }
 }
 
 function fail(message) {
@@ -173,29 +142,7 @@ function main() {
     console.log("cloudflare candidate lint ok")
     return 0
   }
-  if (!process.argv.includes("--bind")) {
-    return fail("use --lint or --bind")
-  }
-  if (!lint.ok) {
-    return fail(lint.errors.join("\n"))
-  }
-  const bound = bindCandidate({
-    approval: process.env.CANDIDATE_APPROVAL,
-    mainSHA: process.env.CANDIDATE_MAIN_SHA,
-    headSHA: process.env.CANDIDATE_HEAD_SHA,
-    originMainSHA: process.env.CANDIDATE_ORIGIN_MAIN_SHA,
-    imageDigest: process.env.CANDIDATE_IMAGE_DIGEST,
-    pinnedDigest: lint.pinnedDigest,
-    workflowDeploys: false,
-    buildSource: lint.buildSource,
-  })
-  if (!bound.ok) {
-    return fail(bound.errors.join("\n"))
-  }
-  console.log("candidate main_sha=" + bound.mainSHA)
-  console.log("candidate image_digest=" + bound.imageDigest)
-  console.log("deploy=false")
-  return 0
+  return fail("hand-filled SHA or JSON is not a build record")
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {

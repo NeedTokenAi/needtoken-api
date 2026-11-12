@@ -26,13 +26,17 @@ func TestValidateFailClosedDoesNotEchoSecrets(t *testing.T) {
 	}
 	base := map[string]string{
 		"CLOUDFLARE_PROFILE":       "1",
-		"SQL_DSN":                  "postgres://user:" + secret + "@isolated.example/needtoken",
+		"SQL_DSN":                  "postgres://user:" + secret + "@db.staging.internal/needtoken",
+		"LOG_SQL_DSN":              "postgres://user:" + secret + "@db.staging.internal/needtoken",
 		"SESSION_SECRET":           "session-" + secret,
 		"CRYPTO_SECRET":            "crypto-" + secret,
 		"NEEDTOKEN_LOG_SQL":        "main",
-		"REDIS_CONN_STRING":        "redis://:" + secret + "@redis.example:6379",
-		"NEEDTOKEN_RUNTIME":        RuntimeIsolatedCandidate,
-		"NEEDTOKEN_CONTAINER_BOOT": BootTestFixture,
+		"REDIS_CONN_STRING":        "redis://:" + secret + "@redis.staging.internal:6379",
+		"DATABASE_HOST":            "db.staging.internal",
+		"REDIS_HOST":               "redis.staging.internal",
+		"NEEDTOKEN_HOST_ALLOWLIST": "db.staging.internal,redis.staging.internal",
+		"NEEDTOKEN_WRITER_PERMIT":  "staging-writer",
+		"NEEDTOKEN_RUNTIME":        RuntimeStaging,
 	}
 
 	t.Run("profile off does nothing", func(t *testing.T) {
@@ -110,21 +114,27 @@ func TestValidateFailClosedDoesNotEchoSecrets(t *testing.T) {
 		require.NotContains(t, err.Error(), secret)
 	})
 
-	t.Run("sql stays closed without the isolated test switch", func(t *testing.T) {
-		values := cloneMap(base)
-		delete(values, "NEEDTOKEN_CONTAINER_BOOT")
-		err := Validate(getenv(values))
-		require.EqualError(t, err, "cloudflare profile refuses to open SQL without the isolated test switch")
-		require.NotContains(t, err.Error(), secret)
+	t.Run("a test permit does not open SQL", func(t *testing.T) {
+		for _, permit := range []string{"", "APPROVED", "test-fixture", "isolated.example"} {
+			values := cloneMap(base)
+			values["NEEDTOKEN_WRITER_PERMIT"] = permit
+			err := Validate(getenv(values))
+			require.Error(t, err)
+			require.NotContains(t, err.Error(), secret)
+		}
 	})
 
-	t.Run("production host is not isolated by the test switch", func(t *testing.T) {
-		values := cloneMap(base)
-		values["SQL_DSN"] = "postgres://user:" + secret + "@ep-prod.neon.tech/needtoken"
-		err := Validate(getenv(values))
-		require.EqualError(t, err, "cloudflare profile refuses a SQL host outside the isolated allowlist")
-		require.NotContains(t, err.Error(), secret)
-		require.NotContains(t, err.Error(), "neon")
+	t.Run("production host and a marker suffix stay outside the allowlist", func(t *testing.T) {
+		for _, host := range []string{"ep-prod.neon.tech", "ep-prod.neon.tech.isolated", "db.staging.internal.isolated"} {
+			values := cloneMap(base)
+			values["SQL_DSN"] = "postgres://user:" + secret + "@" + host + "/needtoken"
+			values["LOG_SQL_DSN"] = values["SQL_DSN"]
+			values["DATABASE_HOST"] = host
+			err := Validate(getenv(values))
+			require.EqualError(t, err, "cloudflare profile refuses a SQL host outside the isolated allowlist")
+			require.NotContains(t, err.Error(), secret)
+			require.NotContains(t, err.Error(), host)
+		}
 	})
 
 	t.Run("missing crypto is not a session alias", func(t *testing.T) {
@@ -143,15 +153,29 @@ func TestValidateFailClosedDoesNotEchoSecrets(t *testing.T) {
 		require.EqualError(t, err, "cloudflare profile refuses an implicit log database")
 
 		conflict := cloneMap(base)
-		conflict["LOG_SQL_DSN"] = "postgres://user:" + secret + "@isolated.example/logs"
+		conflict["LOG_SQL_DSN"] = "postgres://user:" + secret + "@logs.staging.internal/logs"
 		err = Validate(getenv(conflict))
-		require.EqualError(t, err, "cloudflare profile refuses LOG_SQL_DSN when logs stay on the main database")
+		require.EqualError(t, err, "cloudflare profile refuses LOG_SQL_DSN that is not the isolated main database")
 		require.NotContains(t, err.Error(), secret)
+
+		emptyMain := cloneMap(base)
+		emptyMain["LOG_SQL_DSN"] = ""
+		err = Validate(getenv(emptyMain))
+		require.EqualError(t, err, "cloudflare profile refuses LOG_SQL_DSN that is not the isolated main database")
 
 		separate := cloneMap(base)
 		separate["NEEDTOKEN_LOG_SQL"] = "separate"
+		separate["LOG_SQL_DSN"] = ""
 		err = Validate(getenv(separate))
 		require.EqualError(t, err, "cloudflare profile refuses a separate log database without LOG_SQL_DSN")
+
+		separateHost := cloneMap(base)
+		separateHost["NEEDTOKEN_LOG_SQL"] = "separate"
+		separateHost["LOG_SQL_DSN"] = "postgres://user:" + secret + "@logs.staging.internal/logs"
+		err = Validate(getenv(separateHost))
+		require.EqualError(t, err, "cloudflare profile refuses a SQL host outside the isolated allowlist")
+		separateHost["NEEDTOKEN_HOST_ALLOWLIST"] = "db.staging.internal,redis.staging.internal,logs.staging.internal"
+		require.NoError(t, Validate(getenv(separateHost)))
 	})
 
 	t.Run("bindings present", func(t *testing.T) {

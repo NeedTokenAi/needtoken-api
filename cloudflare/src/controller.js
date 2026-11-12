@@ -159,13 +159,8 @@ async function startContainer(container, storage, plan, state, options) {
   if (container.running) {
     return
   }
-  const allowed = plan.isolated === true && plan.start && (plan.authorizesBoot === true || options.unitTestStart === true)
-  if (!allowed) {
+  if (plan.authorizesBoot !== true || !plan.start) {
     state.lastBootRefusal = plan.reason || "boot is not authorized"
-    return
-  }
-  if (plan.authorizesBoot === true) {
-    state.lastBootRefusal = "phase-1 skeleton does not boot a container"
     return
   }
   try {
