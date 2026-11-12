@@ -6,6 +6,7 @@ import {
   INACTIVITY_TIMEOUT_MS,
   INSTANCE_NAME,
   PROBE_ATTEMPTS,
+  PROBE_TIMEOUT_MS,
   READY_DEADLINE_MS,
   RETRY_AFTER_SECONDS,
   awaitInstance,
@@ -88,6 +89,7 @@ test("a closed port is a retryable 503 and not an application 500", async () => 
   assert.equal(startupFailureResponse(containerNotReadyError()).status, 503);
   assert.equal(startupFailureResponse(new Error("application failed")), undefined);
   assert.equal(PROBE_ATTEMPTS, 1);
+  assert.equal(PROBE_TIMEOUT_MS, 5000);
   assert.ok(READY_DEADLINE_MS >= 3 * 60 * 1000);
   assert.ok(READY_DEADLINE_MS < 15 * 60 * 1000);
 });
@@ -141,6 +143,13 @@ test("only instance-0 is addressed and sleep is the 6 hour maximum", () => {
   assert.equal(forward.includes("instance-1"), false);
   assert.equal(forward.includes("getByName(\""), false);
   assert.equal((worker.match(/residentStub\(/g) || []).length, 2);
+  const fetchMethod = worker.slice(worker.indexOf("async fetch(request)"), worker.indexOf("async ensureStarted"));
+  const probeTimeout = worker.indexOf("AbortSignal.timeout(PROBE_TIMEOUT_MS)");
+  const forwarded = fetchMethod.indexOf("containerRequest(request)");
+  assert.ok(probeTimeout > 0);
+  assert.equal(worker.includes("AbortSignal.timeout(1000)"), false);
+  assert.ok(fetchMethod.indexOf("startupFailureResponse") < forwarded);
+  assert.equal(fetchMethod.slice(forwarded).includes("startupFailureResponse"), false);
 });
 
 test("cron retries the same instance and does not retry an application 500", async () => {
