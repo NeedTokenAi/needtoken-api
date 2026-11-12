@@ -12,7 +12,6 @@ test("forwards to port 8080 and copies env strings unchanged", () => {
     CRYPTO_SECRET: "existing-crypto",
     REDIS_CONN_STRING: "rediss://existing.upstash.io",
     REDIS_KEY_PREFIX: "",
-    PORT: "3000",
     NEEDTOKEN_API: { getByName() {} },
   });
   assert.deepEqual(env, {
@@ -21,15 +20,14 @@ test("forwards to port 8080 and copies env strings unchanged", () => {
     CRYPTO_SECRET: "existing-crypto",
     REDIS_CONN_STRING: "rediss://existing.upstash.io",
     REDIS_KEY_PREFIX: "",
-    PORT: "3000",
+    PORT: "8080",
   });
   assert.equal(Object.hasOwn(env, "OPS_WRITES_ENABLED"), false);
 });
 
-test("does not add a redis prefix or inspect the database host", () => {
-  const env = containerEnv({ SQL_DSN: "postgres://db.internal/app" });
-  assert.deepEqual(Object.keys(env), ["SQL_DSN"]);
-  assert.equal(env.SQL_DSN, "postgres://db.internal/app");
+test("sets PORT to 8080 and does not add a redis prefix", () => {
+  const env = containerEnv({ SQL_DSN: "postgres://db.internal/app", PORT: "3000" });
+  assert.deepEqual(env, { SQL_DSN: "postgres://db.internal/app", PORT: "8080" });
 });
 
 test("container request keeps the body and drops host", () => {
@@ -66,6 +64,7 @@ test("wrangler config is a digest placeholder with the production size", () => {
   const json = JSON.parse(text.replace(/^\s*\/\/.*$/gm, ""));
   assert.equal(json.name, "needtoken-api");
   assert.equal(json.workers_dev, true);
+  assert.equal(json.preview_urls, false);
   assert.equal(json.routes, undefined);
   assert.equal(json.route, undefined);
   assert.equal(text.includes("needtoken.ai"), false);
@@ -73,8 +72,7 @@ test("wrangler config is a digest placeholder with the production size", () => {
   assert.equal(text.includes("-staging"), false);
   const container = json.containers[0];
   assert.equal(container.max_instances, 2);
-  assert.equal(container.instance_type.vcpu, 1);
-  assert.equal(container.instance_type.memory_mib, 512);
+  assert.equal(container.instance_type, "lite");
   assert.match(container.image, /^registry\.cloudflare\.com\/ACCOUNT_ID\/IMAGE@sha256:0{64}$/);
   assert.equal(container.image.includes("needtoken-api"), false);
 });

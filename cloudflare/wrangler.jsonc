@@ -3,7 +3,8 @@
 // registry. It is not a path or tag built from this repository.
 // Replace ACCOUNT_ID and the digest before a real start. Do not commit secret values.
 // Secrets are Worker secrets (wrangler secret put) and are passed through at start.
-// disk_mb is the custom instance default. Requested size is 1 vCPU and 512 MiB.
+// Custom sizes on the default policy need at least 1 vCPU and 3 GiB of memory
+// per vCPU, so 512 MiB is not legal. lite is the smallest predefined type.
 // max_instances is set here because the durable_object policy rejects that field.
 {
   "name": "needtoken-api",
@@ -11,6 +12,7 @@
   "compatibility_date": "2026-11-12",
   "compatibility_flags": ["nodejs_compat"],
   "workers_dev": true,
+  "preview_urls": false,
   "observability": {
     "enabled": true,
     "logs": {
@@ -27,11 +29,7 @@
       "class_name": "NeedtokenApiContainer",
       "scheduling_policy": "default",
       "image": "registry.cloudflare.com/ACCOUNT_ID/IMAGE@sha256:0000000000000000000000000000000000000000000000000000000000000000",
-      "instance_type": {
-        "vcpu": 1,
-        "memory_mib": 512,
-        "disk_mb": 2000
-      },
+      "instance_type": "lite",
       "max_instances": 2
     }
   ],

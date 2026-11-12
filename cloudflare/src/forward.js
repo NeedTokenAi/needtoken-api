@@ -1,19 +1,20 @@
-// App port the Worker dials. Production PORT is passed through unchanged.
+// App port the Worker dials. The container is given the same port below.
 export const APP_PORT = 8080;
 
 // Copy Worker vars and secrets as strings. Bindings that are not strings are
-// omitted because container env values must be strings. Nothing is added,
-// removed, or rewritten, including an empty Redis prefix.
+// omitted because container env values must be strings. Other values are not
+// rewritten, including an empty Redis prefix. PORT is set to 8080 because
+// Cloud Run injects it and the production env does not include it.
 export function containerEnv(env) {
   const forwarded = {};
-  if (!env || typeof env !== "object") {
-    return forwarded;
-  }
-  for (const [key, value] of Object.entries(env)) {
-    if (typeof value === "string") {
-      forwarded[key] = value;
+  if (env && typeof env === "object") {
+    for (const [key, value] of Object.entries(env)) {
+      if (typeof value === "string") {
+        forwarded[key] = value;
+      }
     }
   }
+  forwarded.PORT = "8080";
   return forwarded;
 }
 
