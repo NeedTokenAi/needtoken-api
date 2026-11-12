@@ -78,8 +78,21 @@ export function lintRepo(repo = root) {
     errors.push("staging worker must not publish a route")
   }
   const imageWorkflowPath = path.join(repo, ".github/workflows/cloudflare-staging-image.yml")
-  if (existsSync(imageWorkflowPath)) {
-    errors.push("the image build workflow belongs on its own pull request")
+  if (!existsSync(imageWorkflowPath)) {
+    errors.push("image workflow is missing")
+  } else {
+    const imageWorkflow = readFileSync(imageWorkflowPath, "utf8")
+    if (!imageWorkflow.includes("workflow_dispatch") || /pull_request:/.test(imageWorkflow) || /^\s*push\s*:/m.test(imageWorkflow)) {
+      errors.push("image workflow must be workflow_dispatch only")
+    }
+    if (workflowDeploys(imageWorkflow) || !imageWorkflow.includes("containers build")) {
+      errors.push("image workflow must push the image without deploying")
+    }
+    for (const field of ["GITHUB_REPOSITORY", "GITHUB_SHA", "GITHUB_RUN_ID", "digest"]) {
+      if (!imageWorkflow.includes(field)) {
+        errors.push("image workflow does not output " + field)
+      }
+    }
   }
   const wranglerText = readFileSync(wranglerPath, "utf8") + readFileSync(path.join(repo, "cloudflare/wrangler.staging.jsonc"), "utf8")
   if (/postgres:\/\/|redis:\/\/|mysql:\/\/|BEGIN PRIVATE|AKIA/.test(wranglerText)) {
