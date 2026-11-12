@@ -5,9 +5,16 @@ import {
   APP_PORT,
   INACTIVITY_TIMEOUT_MS,
   INSTANCE_NAME,
+  PROBE_ATTEMPTS,
+  READY_DEADLINE_MS,
+  RETRY_AFTER_SECONDS,
+  awaitInstance,
   containerEnv,
+  containerNotReadyError,
   containerRequest,
+  notReadyResponse,
   residentStub,
+  startupFailureResponse,
   waitForPort,
 } from "./forward.js";
 
@@ -67,6 +74,24 @@ test("waitForPort accepts the first response and retries a closed port", async (
   assert.equal(calls, 2);
 });
 
+test("a closed port is a retryable 503 and not an application 500", async () => {
+  await assert.rejects(
+    () => waitForPort(async () => {
+      throw new Error("container did not become ready on port 8080");
+    }, async () => {}, PROBE_ATTEMPTS),
+    (error) => error.name === "ContainerNotReadyError",
+  );
+  const response = notReadyResponse();
+  assert.equal(response.status, 503);
+  assert.equal(response.headers.get("retry-after"), String(RETRY_AFTER_SECONDS));
+  assert.equal(await response.text(), "container did not become ready on port 8080");
+  assert.equal(startupFailureResponse(containerNotReadyError()).status, 503);
+  assert.equal(startupFailureResponse(new Error("application failed")), undefined);
+  assert.equal(PROBE_ATTEMPTS, 1);
+  assert.ok(READY_DEADLINE_MS >= 3 * 60 * 1000);
+  assert.ok(READY_DEADLINE_MS < 15 * 60 * 1000);
+});
+
 test("wrangler config builds the production Dockerfile in APAC", () => {
   const text = readFileSync(new URL("../wrangler.jsonc", import.meta.url), "utf8");
   const json = JSON.parse(text.replace(/^\s*\/\/.*$/gm, ""));
@@ -92,6 +117,9 @@ test("wrangler config builds the production Dockerfile in APAC", () => {
   assert.equal(container.image_build_context, "..");
   assert.equal(container.image_vars, undefined);
   assert.deepEqual(container.constraints.regions, ["APAC"]);
+  assert.equal(container.rollout_step_percentage, 100);
+  assert.equal(container.rollout_active_grace_period, 0);
+  assert.equal(json.migrations, undefined);
 });
 
 test("only instance-0 is addressed and sleep is the 6 hour maximum", () => {
@@ -106,4 +134,56 @@ test("only instance-0 is addressed and sleep is the 6 hour maximum", () => {
   assert.deepEqual(names, ["instance-0"]);
   assert.equal(stub.name, "instance-0");
   assert.equal(INACTIVITY_TIMEOUT_MS, 6 * 60 * 60 * 1000);
+  const worker = readFileSync(new URL("./index.js", import.meta.url), "utf8");
+  const forward = readFileSync(new URL("./forward.js", import.meta.url), "utf8");
+  assert.equal(worker.includes("instance-1"), false);
+  assert.equal(worker.includes("getByName"), false);
+  assert.equal(forward.includes("instance-1"), false);
+  assert.equal(forward.includes("getByName(\""), false);
+  assert.equal((worker.match(/residentStub\(/g) || []).length, 2);
+});
+
+test("cron retries the same instance and does not retry an application 500", async () => {
+  const names = [];
+  let calls = 0;
+  const ready = await awaitInstance(
+    async () => {
+      calls += 1;
+      names.push(INSTANCE_NAME);
+      return new Response(null, { status: calls < 3 ? 503 : 200 });
+    },
+    async () => {},
+    60_000,
+  );
+  assert.equal(ready.status, 200);
+  assert.deepEqual(names, ["instance-0", "instance-0", "instance-0"]);
+
+  let now = 0;
+  let failures = 0;
+  const exhausted = await awaitInstance(
+    async () => {
+      failures += 1;
+      return new Response(null, { status: 503 });
+    },
+    async (ms) => {
+      now += ms;
+    },
+    10_000,
+    () => now,
+  );
+  assert.equal(exhausted.status, 503);
+  assert.equal(failures, 3);
+
+  let applicationCalls = 0;
+  const application = await awaitInstance(
+    async () => {
+      applicationCalls += 1;
+      return new Response(null, { status: 500 });
+    },
+    async () => {
+      throw new Error("should not wait");
+    },
+  );
+  assert.equal(application.status, 500);
+  assert.equal(applicationCalls, 1);
 });

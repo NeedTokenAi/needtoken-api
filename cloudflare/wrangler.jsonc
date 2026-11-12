@@ -9,6 +9,11 @@
 // per vCPU, so 512 MiB is not legal. basic is the predefined type at 1 GiB,
 // above the current Cloud Run 512 MiB.
 // max_instances is set here because the durable_object policy rejects that field.
+// Wrangler 4 accepts rollout_step_percentage 100 and rollout_active_grace_period 0.
+// max_instances 2 would otherwise default to steps [10, 100]. One step replaces
+// the single routed instance. A grace period does not keep the old process
+// listening until the new one is ready: the platform stops it, then starts
+// the new image. There is no switch-after-ready setting. Grace stays 0.
 {
   "name": "needtoken-api",
   "main": "src/index.js",
@@ -38,6 +43,8 @@
       "image_build_context": "..",
       "instance_type": "basic",
       "max_instances": 2,
+      "rollout_step_percentage": 100,
+      "rollout_active_grace_period": 0,
       "constraints": {
         "regions": ["APAC"]
       }
