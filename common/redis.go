@@ -23,6 +23,9 @@ func RedisKeyCacheSeconds() int {
 // InitRedisClient This function is called after init()
 func InitRedisClient() (err error) {
 	if os.Getenv("REDIS_CONN_STRING") == "" {
+		if CloudflareProfileRequested() {
+			return errors.New("cloudflare profile refuses to start without REDIS_CONN_STRING")
+		}
 		RedisEnabled = false
 		SysLog(LogText("REDIS_CONN_STRING not set, Redis is not enabled"))
 		return nil

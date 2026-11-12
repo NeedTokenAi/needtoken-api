@@ -855,5 +855,22 @@
   "zhipu_image_get_b64_failed: %s": "智谱图片转 b64 失败: %s",
   "zhipu_image_missing_url": "智谱图片接口没有返回 URL",
   "¥%.6f quota": "¥%.6f 额度",
-  "＄%.6f quota": "＄%.6f 额度"
+  "＄%.6f quota": "＄%.6f 额度",
+  "cloudflare profile drain timed out; writer fence was not released": "Cloudflare 配置排空超时，未释放写入者围栏",
+  "cloudflare profile failed to release the writer fence: %s": "Cloudflare 配置释放写入者围栏失败: %s",
+  "cloudflare profile must be injected by the process environment": "Cloudflare 配置必须由进程环境注入",
+  "cloudflare profile refuses ENABLE_PPROF disk profiles": "Cloudflare 配置拒绝把 pprof 写到磁盘",
+  "cloudflare profile refuses SQLITE_PATH": "Cloudflare 配置拒绝 SQLITE_PATH",
+  "cloudflare profile refuses SQLite": "Cloudflare 配置拒绝使用 SQLite",
+  "cloudflare profile refuses bootstrap": "Cloudflare 配置拒绝初始化引导",
+  "cloudflare profile refuses generating a default token": "Cloudflare 配置拒绝生成默认令牌",
+  "cloudflare profile refuses the placeholder SESSION_SECRET": "Cloudflare 配置拒绝占位用的 SESSION_SECRET",
+  "cloudflare profile refuses to open SQL without the isolated test switch": "Cloudflare 配置拒绝在没有隔离测试开关时打开 SQL",
+  "cloudflare profile refuses to start a writer": "Cloudflare 配置拒绝作为写入者启动",
+  "cloudflare profile refuses to start without REDIS_CONN_STRING": "Cloudflare 配置拒绝在没有 REDIS_CONN_STRING 的情况下启动",
+  "cloudflare profile refuses to start without Redis": "Cloudflare 配置拒绝在没有 Redis 的情况下启动",
+  "cloudflare profile refuses to start: SQL_DSN binding is absent": "Cloudflare 配置拒绝启动：未提供 SQL_DSN",
+  "cloudflare profile refuses to start: SESSION_SECRET binding is absent": "Cloudflare 配置拒绝启动：未提供 SESSION_SECRET",
+  "cloudflare profile writer fence is held": "Cloudflare 配置的写入者围栏仍被持有",
+  "cloudflare profile writer fence was lost": "Cloudflare 配置已失去写入者围栏"
 }

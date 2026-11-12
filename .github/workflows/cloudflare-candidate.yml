@@ -1,0 +1,89 @@
+name: Cloudflare candidate
+
+on:
+  pull_request:
+    paths:
+      - "cloudflare/**"
+      - "cloudflareprofile/**"
+      - "common/cloudflare_profile.go"
+      - "common/init.go"
+      - "common/redis.go"
+      - "model/main.go"
+      - "main.go"
+      - "controller/setup.go"
+      - ".github/workflows/cloudflare-candidate.yml"
+  workflow_dispatch:
+    inputs:
+      main_sha:
+        description: "40-character origin/main SHA"
+        required: true
+        type: string
+      image_digest:
+        description: "sha256 digest pinned for that main SHA"
+        required: true
+        type: string
+      approval:
+        description: "Type approved to record the candidate. This does not deploy."
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cloudflare-candidate-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  tests:
+    name: Candidate skeleton tests
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Test the Cloudflare profile
+        run: go test ./cloudflareprofile -count=1
+
+      - name: Test the Worker skeleton
+        run: node --test cloudflare/test/*.test.js
+
+      - name: Lint the candidate workflow
+        run: node cloudflare/candidate/check.mjs --lint
+
+  bind:
+    name: Bind main SHA and image digest
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: cloudflare-candidate-approval
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ inputs.main_sha }}
+          fetch-depth: 0
+
+      - name: Resolve origin/main
+        id: git
+        run: |
+          git fetch origin main
+          echo "head=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "main=$(git rev-parse origin/main)" >> "$GITHUB_OUTPUT"
+
+      - name: Record the candidate without deploying
+        run: node cloudflare/candidate/check.mjs --bind
+        env:
+          CANDIDATE_APPROVAL: ${{ inputs.approval }}
+          CANDIDATE_MAIN_SHA: ${{ inputs.main_sha }}
+          CANDIDATE_HEAD_SHA: ${{ steps.git.outputs.head }}
+          CANDIDATE_ORIGIN_MAIN_SHA: ${{ steps.git.outputs.main }}
+          CANDIDATE_IMAGE_DIGEST: ${{ inputs.image_digest }}

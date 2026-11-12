@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"net/http"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -44,6 +45,10 @@ func GetSetup(c *gin.Context) {
 }
 
 func PostSetup(c *gin.Context) {
+	if common.CloudflareProfileRequested() {
+		c.AbortWithStatus(http.StatusForbidden)
+		return
+	}
 	// Check if setup is already completed
 	if constant.Setup {
 		common.ApiErrorT(c, "The system is already initialized")

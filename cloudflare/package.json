@@ -1,0 +1,8 @@
+{
+  "name": "needtoken-api-cloudflare-candidate",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test"
+  }
+}

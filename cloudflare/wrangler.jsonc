@@ -1,0 +1,39 @@
+// Phase-1 candidate only. This file does not deploy.
+// scheduling_policy is the public-beta durable_object policy.
+// It has no max_instances and must not be switched to the deprecated default.
+// Durable Object sqlite storage is the object's own metadata. It is not the
+// New API database and it is not mounted into the container.
+//
+// Secret bindings are names only. Values are not stored in this file:
+// SQL_DSN, SESSION_SECRET, REDIS_CONN_STRING, CRYPTO_SECRET, LOG_SQL_DSN
+{
+  "name": "needtoken-api-candidate",
+  "main": "src/index.js",
+  "compatibility_date": "2026-11-12",
+  "workers_dev": false,
+  "containers": [
+    {
+      "class_name": "NewAPIContainer",
+      "scheduling_policy": "durable_object",
+      "images": {
+        "newapi": {
+          "image": "registry.cloudflare.com/ACCOUNT_ID/needtoken-api@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      }
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "NEWAPI_CONTAINER",
+        "class_name": "NewAPIContainer"
+      }
+    ]
+  },
+  "exports": {
+    "NewAPIContainer": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    }
+  }
+}

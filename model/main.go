@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/QuantumNous/new-api/cloudflareprofile"
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 
@@ -139,6 +140,9 @@ func normalizeClickHouseDSN(dsn string) string {
 
 func chooseDB(envName string, isLog bool) (*gorm.DB, common.DatabaseType, error) {
 	dsn := os.Getenv(envName)
+	if cloudflareprofile.ForbidsSQLite(os.Getenv, dsn) {
+		return nil, "", fmt.Errorf("cloudflare profile refuses SQLite")
+	}
 	if dsn != "" {
 		if isClickHouseDSN(dsn) {
 			if !isLog {
@@ -226,9 +230,11 @@ func InitDB() (err error) {
 		common.SysLog(common.LogText("database migration started"))
 		err = migrateDB()
 		return err
-	} else {
-		common.FatalLog(err)
 	}
+	if cloudflareprofile.Enabled(os.Getenv) {
+		return err
+	}
+	common.FatalLog(err)
 	return err
 }
 
@@ -270,9 +276,11 @@ func InitLogDB() (err error) {
 		common.SysLog(common.LogText("database migration started"))
 		err = migrateLOGDB()
 		return err
-	} else {
-		common.FatalLog(err)
 	}
+	if cloudflareprofile.Enabled(os.Getenv) {
+		return err
+	}
+	common.FatalLog(err)
 	return err
 }
 

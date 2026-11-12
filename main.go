@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/QuantumNous/new-api/cloudflareprofile"
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/controller"
@@ -56,7 +57,8 @@ func main() {
 	})
 	kitutil.SetSystemErrorLogging(common.SysError)
 
-	err := InitResources()
+	profileLost := make(chan struct{}, 1)
+	profileRuntime, err := InitResources(profileLost)
 	if err != nil {
 		common.FatalLog(common.LogText("failed to initialize resources: %s", err.Error()))
 		return
@@ -189,6 +191,10 @@ func main() {
 	server.Use(middleware.Version())
 	server.Use(middleware.I18n())
 	middleware.SetUpLogger(server)
+	if profileRuntime != nil {
+		server.Use(profileRuntime.Gate())
+		cloudflareprofile.Mount(server, profileRuntime)
+	}
 	InjectUmamiAnalytics()
 	InjectGoogleAnalytics()
 
@@ -219,8 +225,16 @@ func main() {
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	sig := <-quit
+	var sig os.Signal
+	select {
+	case sig = <-quit:
+	case <-profileLost:
+		sig = syscall.SIGTERM
+	}
 	common.SysLog(common.LogText("received signal: %v, shutting down...", sig))
+	if profileRuntime != nil {
+		profileRuntime.BeginDrain()
+	}
 
 	// SSE streams may run for minutes; give them time to finish before forced exit
 	shutdownTimeout := time.Duration(common.GetEnvOrDefault("SHUTDOWN_TIMEOUT_SECONDS", 120)) * time.Second
@@ -228,6 +242,14 @@ func main() {
 	defer cancel()
 	if err := srv.Shutdown(ctx); err != nil {
 		common.SysError(common.LogText("server forced to shutdown: %v", err))
+	}
+	if profileRuntime != nil {
+		if err := profileRuntime.WaitIdle(ctx); err != nil {
+			common.SysError(common.LogText("cloudflare profile drain timed out; writer fence was not released"))
+			profileRuntime.StopRenewing()
+		} else if err := profileRuntime.StopAndRelease(context.Background()); err != nil {
+			common.SysError(common.LogText("cloudflare profile failed to release the writer fence: %s", err.Error()))
+		}
 	}
 	// 内存中的看板数据保存入库，避免重启丢失未落库数据 (issue #5679)
 	if common.DataExportEnabled {
@@ -279,13 +301,37 @@ func InjectGoogleAnalytics() {
 	indexPage = bytes.ReplaceAll(indexPage, placeholder, analyticsInject)
 }
 
-func InitResources() error {
+func InitResources(profileLost chan struct{}) (*cloudflareprofile.Runtime, error) {
 	// Initialize resources here if needed
 	// This is a placeholder function for future resource initialization
-	err := godotenv.Load(".env")
-	if err != nil {
-		if common.DebugEnabled {
-			common.SysLog(common.LogText("No .env file found, using default environment variables. If needed, please create a .env file and set the relevant variables."))
+	profileFromEnvironment := cloudflareprofile.Enabled(os.Getenv)
+	var profileRuntime *cloudflareprofile.Runtime
+	committed := false
+	defer func() {
+		if profileRuntime != nil && !committed {
+			profileRuntime.StopRenewing()
+		}
+		if recovered := recover(); recovered != nil {
+			panic(recovered)
+		}
+	}()
+	if !profileFromEnvironment {
+		err := godotenv.Load(".env")
+		if err != nil {
+			if common.DebugEnabled {
+				common.SysLog(common.LogText("No .env file found, using default environment variables. If needed, please create a .env file and set the relevant variables."))
+			}
+		}
+	}
+	if err := cloudflareprofile.RejectDiskProfile(profileFromEnvironment, cloudflareprofile.Enabled(os.Getenv)); err != nil {
+		return nil, err
+	}
+	if profileFromEnvironment {
+		if err := cloudflareprofile.Validate(os.Getenv); err != nil {
+			return nil, err
+		}
+		if err := cloudflareprofile.ScanDataDir(os.Getenv); err != nil {
+			return nil, err
 		}
 	}
 
@@ -299,24 +345,59 @@ func InitResources() error {
 
 	service.InitHttpClient()
 
+	var err error
+	if profileFromEnvironment {
+		if err = common.InitRedisClient(); err != nil {
+			return nil, err
+		}
+		profileRuntime, err = cloudflareprofile.Start(context.Background(), common.RDB)
+		if err != nil {
+			return nil, err
+		}
+		profileRuntime.SetOnLost(func() {
+			select {
+			case profileLost <- struct{}{}:
+			default:
+			}
+		})
+		if err = profileRuntime.Beat(context.Background()); err != nil {
+			return nil, err
+		}
+		go profileRuntime.Loop(context.Background())
+	}
+
 	// Initialize SQL Database
 	err = model.InitDB()
 	if err != nil {
+		if profileFromEnvironment {
+			return nil, err
+		}
 		common.FatalLog(common.LogText("failed to initialize database: %s", err.Error()))
-		return err
+		return nil, err
 	}
 	if err = authz.Init(model.DB); err != nil {
+		if profileFromEnvironment {
+			return nil, err
+		}
 		common.FatalLog(common.LogText("failed to initialize authorization: %s", err.Error()))
-		return err
+		return nil, err
 	}
 	if common.PasswordLoginEncryptionEnabled {
 		if err = model.InitPasswordEncryption(); err != nil {
+			if profileFromEnvironment {
+				return nil, err
+			}
 			common.FatalLog(common.LogText("failed to initialize password encryption: %s", err.Error()))
-			return err
+			return nil, err
 		}
 	}
 
 	model.CheckSetup()
+	if profileFromEnvironment {
+		if err = cloudflareprofile.RefuseBootstrap(constant.Setup); err != nil {
+			return nil, err
+		}
+	}
 
 	// Initialize options, should after model.InitDB()
 	if common.IsMasterNode {
@@ -332,13 +413,15 @@ func InitResources() error {
 	// Initialize SQL Database
 	err = model.InitLogDB()
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	// Initialize Redis
-	err = common.InitRedisClient()
-	if err != nil {
-		return err
+	// Initialize Redis. The Cloudflare profile already did this before opening SQL.
+	if !profileFromEnvironment {
+		err = common.InitRedisClient()
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	perfmetrics.Init()
@@ -366,5 +449,6 @@ func InitResources() error {
 
 	service.StartAuthArtifactCleanup()
 
-	return nil
+	committed = true
+	return profileRuntime, nil
 }
