@@ -5,6 +5,7 @@ on:
 
 permissions:
   contents: read
+  actions: write
 
 concurrency:
   group: cloudflare-staging-image
@@ -24,6 +25,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
+      # Tag the image with the source SHA only. Do not push :latest.
+      # Deploy uses the sha256 digest in the build record, not this tag.
+      # CLOUDFLARE_ACCOUNT_ID stays a secret and is not written to the record.
       - name: Build and push
         id: push
         env:
@@ -36,24 +40,44 @@ jobs:
             exit 1
           fi
           npm install --global wrangler@4.160.1
-          npx wrangler containers build -p -t needtoken-api-staging .
-          image="registry.cloudflare.com/${CLOUDFLARE_ACCOUNT_ID}/needtoken-api-staging"
-          digest="$(docker image inspect --format '{{join .RepoDigests "\n"}}' "${image}" 2>/dev/null | awk '/^registry\.cloudflare\.com\// { print; exit }' || true)"
+          tag="needtoken-api-staging:${GITHUB_SHA}"
+          npx wrangler containers build -p -t "${tag}" .
+          digest="$(docker image inspect --format '{{json .RepoDigests}}' "${tag}" 2>/dev/null | python3 -c '
+          import json, sys
+          raw = sys.stdin.read().strip()
+          if not raw:
+              sys.exit(0)
+          try:
+              digests = json.loads(raw)
+          except json.JSONDecodeError:
+              sys.exit(0)
+          for item in digests:
+              if isinstance(item, str) and "@sha256:" in item:
+                  print(item.rsplit("@", 1)[1])
+                  break
+          ' || true)"
           if [ -z "${digest}" ]; then
-            hash="$(docker manifest inspect -v "${image}:latest" | python3 -c 'import json,sys; print(json.load(sys.stdin)["Descriptor"]["digest"])')"
-            digest="${image}@${hash}"
+            remote="registry.cloudflare.com/${CLOUDFLARE_ACCOUNT_ID}/needtoken-api-staging:${GITHUB_SHA}"
+            digest="$(docker manifest inspect -v "${remote}" 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["Descriptor"]["digest"])' || true)"
           fi
-          case "${digest}" in
-            registry.cloudflare.com/*/needtoken-api-staging@sha256:*) ;;
-            *) echo "push did not return a registry digest"; exit 1 ;;
-          esac
-          {
-            echo "digest=${digest}"
-            echo "repository=${GITHUB_REPOSITORY}"
-            echo "sha=${GITHUB_SHA}"
-            echo "run_id=${GITHUB_RUN_ID}"
-          } >> "${GITHUB_OUTPUT}"
-          echo "repository=${GITHUB_REPOSITORY}"
-          echo "sha=${GITHUB_SHA}"
-          echo "run_id=${GITHUB_RUN_ID}"
-          echo "digest=${digest}"
+          if ! [[ "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "push did not return a sha256 digest"
+            exit 1
+          fi
+          record="$(printf 'repository=%s\ndigest=%s\nsha=%s\nrun_id=%s\n' "${GITHUB_REPOSITORY}" "${digest}" "${GITHUB_SHA}" "${GITHUB_RUN_ID}")"
+          if [[ "${record}" == *"${CLOUDFLARE_ACCOUNT_ID}"* ]]; then
+            echo "build record included the account id"
+            exit 1
+          fi
+          printf '%s\n' "${record}" >> "${GITHUB_OUTPUT}"
+          printf '%s\n' "${record}" >> "${GITHUB_STEP_SUMMARY}"
+          mkdir -p "${RUNNER_TEMP}/build-record"
+          printf '%s\n' "${record}" > "${RUNNER_TEMP}/build-record/build-record.txt"
+          printf '%s\n' "${record}"
+
+      - name: Upload build record
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: build-record
+          path: ${{ runner.temp }}/build-record/build-record.txt
+          if-no-files-found: error
