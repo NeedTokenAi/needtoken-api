@@ -9,7 +9,9 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/alicebob/miniredis/v2"
 	"github.com/gin-gonic/gin"
+	"github.com/go-redis/redis/v8"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -301,6 +303,24 @@ func TestStdoutLogsAndRedisRefusal(t *testing.T) {
 func TestStartRefusesNilRedis(t *testing.T) {
 	_, err := Start(context.Background(), nil)
 	require.EqualError(t, err, "cloudflare profile refuses to start without Redis")
+}
+
+func TestStagingWriterLeaseKeysDoNotMatchProduction(t *testing.T) {
+	require.Contains(t, writerLeaseKey, "staging")
+	require.Contains(t, writerEpochKey, "staging")
+	require.NotEqual(t, "needtoken-api:cloudflare:writer-lease", writerLeaseKey)
+	require.NotEqual(t, "needtoken-api:cloudflare:writer-epoch", writerEpochKey)
+
+	server := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = client.Close() })
+	epoch, err := newRedisLease(client).Acquire(context.Background(), "holder-a", time.Minute)
+	require.NoError(t, err)
+	require.Greater(t, epoch, int64(0))
+	require.True(t, server.Exists(writerLeaseKey))
+	require.True(t, server.Exists(writerEpochKey))
+	require.False(t, server.Exists("needtoken-api:cloudflare:writer-lease"))
+	require.False(t, server.Exists("needtoken-api:cloudflare:writer-epoch"))
 }
 
 func TestLeaseTextRoundTrip(t *testing.T) {

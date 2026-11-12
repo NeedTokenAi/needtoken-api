@@ -13,7 +13,6 @@ on:
       - "main.go"
       - "controller/setup.go"
       - ".github/workflows/cloudflare-candidate.yml"
-      - ".github/workflows/cloudflare-staging-image.yml"
 
 permissions:
   contents: read

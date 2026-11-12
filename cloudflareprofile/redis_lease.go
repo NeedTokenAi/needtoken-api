@@ -11,8 +11,8 @@ import (
 )
 
 const (
-	writerLeaseKey = "needtoken-api:cloudflare:writer-lease"
-	writerEpochKey = "needtoken-api:cloudflare:writer-epoch"
+	writerLeaseKey = "needtoken-api:cloudflare:staging:writer-lease"
+	writerEpochKey = "needtoken-api:cloudflare:staging:writer-epoch"
 )
 
 // acquireScript returns the lease value "epoch|holder" or an empty string
