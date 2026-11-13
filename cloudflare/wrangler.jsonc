@@ -4,6 +4,8 @@
 // Wrangler builds it on deploy. The build context is the repository root.
 // Do not set vars. A var with the same name replaces an existing secret.
 // SESSION_COOKIE_TRUSTED_URL, NEWAPI_BASE_URL, and GLUE_PUBLIC_URL stay unset here.
+// INTERNAL_POOL_HOST is a Worker secret. Do not put that name under vars, and
+// do not write its value or any hostname into this file.
 // Secrets are Worker secrets and are passed through at start.
 // Custom sizes on the default policy need at least 1 vCPU and 3 GiB of memory
 // per vCPU, so 512 MiB is not legal. basic is the predefined type at 1 GiB,
@@ -58,6 +60,12 @@
       }
     ]
   },
+  "services": [
+    {
+      "binding": "INTERNAL_POOL",
+      "service": "needtoken-pool"
+    }
+  ],
   "exports": {
     "NeedtokenApiContainer": {
       "type": "durable-object",
