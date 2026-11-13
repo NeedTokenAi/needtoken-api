@@ -190,6 +190,101 @@ test("413 from the binding is returned and global fetch stays unused", async () 
   assert.equal(await response.text(), "too large");
 });
 
+function unreadStream() {
+  let pulls = 0;
+  const body = new ReadableStream({
+    pull(controller) {
+      pulls += 1;
+      controller.close();
+    },
+  });
+  return { body, pulls: () => pulls };
+}
+
+test("a body above 100 MiB is streamed, and a 413 does not call public fetch", async () => {
+  const apiLimit = 128 * 1024 * 1024;
+  for (const size of [OUTBOUND_BODY_LIMIT_BYTES + 1, apiLimit, apiLimit + 1]) {
+    const unread = unreadStream();
+    let forwarded;
+    const response = await callRoute(
+      "https://pool.example/v1/chat/completions",
+      poolProps(),
+      bindingEnv(async () => new Response("platform", { status: 413 })),
+      async (binding, request, init) => {
+        forwarded = request;
+        assert.equal(unread.pulls(), 0, String(size));
+        assert.equal(request.bodyUsed, false, String(size));
+        assert.equal(request.headers.get("content-length"), String(size));
+        return binding.fetch(request, init);
+      },
+      {
+        method: "POST",
+        headers: { "content-length": String(size), "content-type": "application/json" },
+        body: unread.body,
+        duplex: "half",
+      },
+    );
+    assert.equal(response.status, 413, String(size));
+    assert.equal(await response.text(), "platform");
+    assert.equal(forwarded.bodyUsed, false, String(size));
+  }
+});
+
+test("exactly 100 MiB is streamed to the binding and the body is not read", async () => {
+  const unread = unreadStream();
+  let forwarded;
+  const response = await callRoute(
+    "https://pool.example/v1/chat/completions",
+    poolProps(),
+    bindingEnv(async () => new Response("ok")),
+    async (binding, request, init) => {
+      forwarded = request;
+      assert.equal(unread.pulls(), 0);
+      assert.equal(request.bodyUsed, false);
+      assert.equal(request.headers.get("content-length"), String(OUTBOUND_BODY_LIMIT_BYTES));
+      return binding.fetch(request, init);
+    },
+    {
+      method: "POST",
+      headers: {
+        "content-length": String(OUTBOUND_BODY_LIMIT_BYTES),
+        "content-type": "application/octet-stream",
+      },
+      body: unread.body,
+      duplex: "half",
+    },
+  );
+  assert.equal(response.status, 200);
+  assert.equal(await response.text(), "ok");
+  assert.equal(forwarded.bodyUsed, false);
+});
+
+test("a chunked body is not read and a binding 413 does not call public fetch", async () => {
+  const unread = unreadStream();
+  let forwarded;
+  const response = await callRoute(
+    "https://pool.example/v1/images/edits",
+    poolProps(),
+    bindingEnv(async () => new Response("platform", { status: 413 })),
+    async (binding, request, init) => {
+      forwarded = request;
+      assert.equal(unread.pulls(), 0);
+      assert.equal(request.bodyUsed, false);
+      assert.equal(request.headers.get("content-length"), null);
+      return binding.fetch(request, init);
+    },
+    {
+      method: "POST",
+      headers: { "content-type": "multipart/form-data; boundary=x" },
+      body: unread.body,
+      duplex: "half",
+    },
+  );
+  assert.equal(response.status, 413);
+  assert.equal(await response.text(), "platform");
+  assert.equal(forwarded.bodyUsed, false);
+});
+
 test("a stream body is not read and an aborted signal stays aborted", async () => {
   let pulled = false;
   const stream = new ReadableStream({
@@ -384,8 +479,9 @@ test("the intercept list is the one pool host and the source has no star interce
     async interceptOutboundHttp(host) {
       calls.push(host);
     },
-    async interceptOutboundHttps(host) {
-      calls.push(host);
+    async interceptOutboundHttps(...args) {
+      calls.push(args[0]);
+      assert.equal(args.length, 2);
     },
   }, {
     InternalDeny() {

@@ -5,8 +5,10 @@
 export const POOL_BINDING = "INTERNAL_POOL";
 export const POOL_HOST_SECRET = "INTERNAL_POOL_HOST";
 
-// Platform default from Containers limits, updated 2026-11-12. There is no
-// Worker, wrangler, or intercept argument that raises it. A 413 stays 413.
+// Platform default, Containers limits, updated 2026-11-12.
+// interceptOutboundHttps(addr, binding) takes those two arguments and no
+// body-size option. Wrangler container settings and the container start
+// options have none either. Streaming does not raise this. A 413 stays 413.
 export const OUTBOUND_BODY_LIMIT_BYTES = 100 * 1024 * 1024;
 
 const HOSTNAME = /^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$/;
@@ -134,14 +136,28 @@ export async function routeInternal(request, env, props, fetchBinding) {
   if (!binding || typeof binding.fetch !== "function") {
     return internalFailedResponse();
   }
+  // Pass the unread body through. Do not buffer it: a Worker isolate has
+  // 128 MB, and copying a body in (100 MiB, 128 MiB] would exhaust that.
+  // This does not raise the platform's 100 MiB outbound cap.
+  const headers = new Headers(request.headers);
+  headers.delete("Cloudflare-Workers-Version-Overrides");
+  const init = {
+    method: request.method,
+    headers,
+    signal: request.signal,
+  };
+  if (request.body != null) {
+    init.body = request.body;
+    init.duplex = "half";
+  }
   let forwarded;
   try {
-    forwarded = new Request(url, request);
+    forwarded = new Request(url, init);
   } catch {
     return denied();
   }
-  forwarded.headers.delete("Cloudflare-Workers-Version-Overrides");
   try {
+    // The binding status, including 413, is returned. Global fetch is not called.
     return await fetchBinding(binding, forwarded, { redirect: "manual" });
   } catch {
     return internalFailedResponse();
