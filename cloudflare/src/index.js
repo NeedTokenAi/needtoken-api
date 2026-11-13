@@ -1,4 +1,4 @@
-import { DurableObject } from "cloudflare:workers";
+import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 import {
   APP_PORT,
   INACTIVITY_TIMEOUT_MS,
@@ -11,6 +11,12 @@ import {
   startupFailureResponse,
   waitForPort,
 } from "./forward.js";
+import {
+  armPoolIntercept,
+  denyInternal,
+  internalUnavailableResponse,
+  routeInternal,
+} from "./internal.js";
 
 export class NeedtokenApiContainer extends DurableObject {
   constructor(ctx, env) {
@@ -29,6 +35,10 @@ export class NeedtokenApiContainer extends DurableObject {
       return await this.ctx.container.getTcpPort(APP_PORT).fetch(containerRequest(request));
     } catch (error) {
       this.portReady = false;
+      const unavailable = internalUnavailableResponse(error);
+      if (unavailable) {
+        return unavailable;
+      }
       const response = startupFailureResponse(error);
       if (response) {
         return response;
@@ -51,13 +61,18 @@ export class NeedtokenApiContainer extends DurableObject {
 
   async startContainer() {
     const container = this.ctx.container;
+    // A missing or illegal INTERNAL_POOL_HOST, or an intercept error, throws
+    // before start. The channel proxy host is not part of this registration.
+    const armed = await armPoolIntercept(container, this.env, this.ctx.exports);
     if (!container.running) {
       // Image and instance size come from wrangler.jsonc. enableInternet is
       // required when options are passed. This process calls Neon, Upstash,
-      // and upstream APIs.
+      // and upstream APIs. The entrypoint trusts the intercept CA as well as
+      // the image bundle, then execs /new-api.
       container.start({
         enableInternet: true,
         env: containerEnv(this.env),
+        entrypoint: armed.entrypoint,
       });
     }
     await container.setInactivityTimeout(INACTIVITY_TIMEOUT_MS);
@@ -69,6 +84,23 @@ export class NeedtokenApiContainer extends DurableObject {
       PROBE_ATTEMPTS,
     );
     this.portReady = true;
+  }
+}
+
+export class InternalDeny extends WorkerEntrypoint {
+  fetch() {
+    return denyInternal();
+  }
+}
+
+export class InternalHop extends WorkerEntrypoint {
+  fetch(request) {
+    return routeInternal(
+      request,
+      this.env,
+      this.ctx.props,
+      (binding, forwarded, init) => binding.fetch(forwarded, init),
+    );
   }
 }
 
