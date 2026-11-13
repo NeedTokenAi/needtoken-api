@@ -496,6 +496,32 @@ test("the published entrypoint fails closed when the intercept CA is not on this
   assert.notEqual(result.status, 0);
 });
 
+test("the entrypoint can be run twice without production files", () => {
+  const dir = mkdtempSync(join(tmpdir(), "needtoken-ca-twice-"));
+  try {
+    const primary = join(dir, "ca.crt");
+    const fallback = join(dir, "cert.pem");
+    const cloudflare = join(dir, "cf.crt");
+    const bundle = join(dir, "out.pem");
+    const command = join(dir, "cmd");
+    writeFileSync(primary, "image-ca\n");
+    writeFileSync(fallback, "fallback-ca\n");
+    writeFileSync(cloudflare, "intercept-ca\n");
+    writeFileSync(command, "#!/bin/sh\nprintf '%s' \"$SSL_CERT_FILE\"\n");
+    chmodSync(command, 0o755);
+    const script = trustScript({ primary, fallback, cloudflare, bundle, command });
+    const first = spawnSync("sh", ["-lc", script], { encoding: "utf8" });
+    const second = spawnSync("sh", ["-lc", script], { encoding: "utf8" });
+    assert.equal(first.status, 0);
+    assert.equal(second.status, 0);
+    assert.equal(first.stdout, bundle);
+    assert.equal(second.stdout, bundle);
+    assert.equal(readFileSync(bundle, "utf8"), "image-ca\nintercept-ca\n");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("wrangler binds only INTERNAL_POOL and does not store the host", () => {
   const text = readFileSync(new URL("../wrangler.jsonc", import.meta.url), "utf8");
   const json = JSON.parse(text.replace(/^\s*\/\/.*$/gm, ""));
@@ -523,7 +549,14 @@ test("the intercept limit is smaller than the relay body limit this process alre
   assert.equal(bodyDefault, 128);
   assert.equal(fileDefault, 64);
   assert.equal(OUTBOUND_BODY_LIMIT_BYTES, 100 * 1024 * 1024);
+  assert.equal(OUTBOUND_BODY_LIMIT_BYTES, 104857600);
   assert.ok(OUTBOUND_BODY_LIMIT_BYTES < apiBodyBytes);
+  const wrangler = JSON.parse(readFileSync(new URL("../wrangler.jsonc", import.meta.url), "utf8").replace(/^\s*\/\/.*$/gm, ""));
+  assert.equal(wrangler.limits, undefined);
+  assert.equal(wrangler.containers[0].outbound, undefined);
+  const internalSource = readFileSync(new URL("./internal.js", import.meta.url), "utf8");
+  assert.equal(internalSource.includes("interceptOutboundHttps(\n    host,\n    exportsApi.InternalHop"), true);
+  assert.equal(/interceptOutboundHttps\([^)]*limit/.test(internalSource), false);
 
   const endpoints = readFileSync(new URL("../../common/endpoint_type.go", import.meta.url), "utf8");
   const block = endpoints.slice(

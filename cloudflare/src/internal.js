@@ -5,8 +5,8 @@
 export const POOL_BINDING = "INTERNAL_POOL";
 export const POOL_HOST_SECRET = "INTERNAL_POOL_HOST";
 
-// Cloudflare's outbound intercept rejects bodies above this default with 413.
-// The handler must pass that status through. It is not a signal to use fetch.
+// Platform default from Containers limits, updated 2026-11-12. There is no
+// Worker, wrangler, or intercept argument that raises it. A 413 stays 413.
 export const OUTBOUND_BODY_LIMIT_BYTES = 100 * 1024 * 1024;
 
 const HOSTNAME = /^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$/;
