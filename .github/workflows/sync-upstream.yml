@@ -1,0 +1,57 @@
+# 每天 00:15 UTC（北京时间 08:15）把上游 QuantumNous/new-api 的固定稳定版提交开成 PR。
+# 注意：当前 fork 基线已在 v1.0.0-rc.47，因此默认 UPSTREAM_MIN_TAG=v1.0.0，
+# 会安全跳过历史 v0.13.x 稳定分支，待上游发布 >= v1.0.0 正式稳定 tag 后自动同步。
+# 没有 id-token，不接触生产云凭证。不要改成 pull_request_target。
+name: sync-upstream
+
+on:
+  schedule:
+    - cron: '15 0 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    name: Sync upstream
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      actions: write
+      contents: write
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Choose token
+        id: auth
+        env:
+          SYNC_GITHUB_TOKEN: ${{ secrets.SYNC_GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -n ${SYNC_GITHUB_TOKEN} ]]; then
+            echo "mode=pat" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=github_token" >> "$GITHUB_OUTPUT"
+            echo "::warning::SYNC_GITHUB_TOKEN 未配置。默认 GITHUB_TOKEN 开出的 PR 不会触发 pull_request CI，请在仓库 Secrets 中配置 SYNC_GITHUB_TOKEN。"
+          fi
+
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: true
+          token: ${{ steps.auth.outputs.mode == 'pat' && secrets.SYNC_GITHUB_TOKEN || github.token }}
+
+      - name: Open upstream sync PR
+        env:
+          GH_TOKEN: ${{ steps.auth.outputs.mode == 'pat' && secrets.SYNC_GITHUB_TOKEN || github.token }}
+          SYNC_AUTH_MODE: ${{ steps.auth.outputs.mode }}
+          UPSTREAM_CHANNEL: ${{ vars.UPSTREAM_CHANNEL || 'stable-tags' }}
+          UPSTREAM_MIN_TAG: ${{ vars.UPSTREAM_MIN_TAG || 'v1.0.0' }}
+          UPSTREAM_REPO: QuantumNous/new-api
+          UPSTREAM_AUTO_MERGE_MAX_FILES: ${{ vars.UPSTREAM_AUTO_MERGE_MAX_FILES || '300' }}
+          CI_SUMMARY_TEXT: CI（Backend vet, build, and test / Frontend typecheck and test）与命中的 NeedToken fulfillment
+        run: .github/scripts/sync-upstream.sh
