@@ -14,3 +14,4 @@ Rules:
 - After reading, follow every rule in `AGENTS.md` for the rest of the work.
 - If the task touches `web/`, also Read `web/AGENTS.md` before editing frontend files.
 - If the task touches billing as defined under **Billing rules (mandatory read gate)** in `AGENTS.md`, also Read `.agents/rules/billing.md` in full before planning or editing. Tasks outside that definition may skip it.
+- Also Read `.agents/rules/needtoken-fork.md` for NeedToken fork branching, upstream sync, and Cloudflare auto-build rules.
