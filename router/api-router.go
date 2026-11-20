@@ -148,6 +148,10 @@ func SetApiRouter(router *gin.Engine) {
 				// Custom OAuth bindings
 				selfRoute.GET("/oauth/bindings", controller.GetUserOAuthBindings)
 				selfRoute.DELETE("/oauth/bindings/:provider_id", controller.UnbindCustomOAuth)
+
+				// NeedToken storefront self-linking (browser session only)
+				selfRoute.POST("/account-link/preview", middleware.CriticalRateLimit(), middleware.UserCriticalRateLimit("account-security"), controller.PreviewAccountLinkChallenge)
+				selfRoute.POST("/account-link/approve", middleware.CriticalRateLimit(), middleware.UserCriticalRateLimit("account-security"), controller.ApproveAccountLinkChallenge)
 			}
 
 			adminRoute := userRoute.Group("/")
