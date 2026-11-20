@@ -35,6 +35,8 @@ for p in \
   "pkg/billingexpr/eval.go" \
   "controller/subscription.go" \
   "controller/auth.go" \
+  "controller/needtoken_account_link.go" \
+  "web/src/routes/_authenticated/account-link.tsx" \
   "scripts/init.sql"; do
   is_high_risk_path "$p" || fail "expected high-risk: $p"
 done

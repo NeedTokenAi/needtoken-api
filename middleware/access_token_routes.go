@@ -104,6 +104,8 @@ var accessTokenRouteRules = map[string]accessTokenRouteRule{
 	"POST /api/user/checkin":                       accessTokenScopeRule("wallet:write"),
 	"GET /api/user/oauth/bindings":                 accessTokenScopeRule("account_security:read"),
 	"DELETE /api/user/oauth/bindings/:provider_id": accessTokenScopeRule("account_security:write"),
+	"POST /api/user/account-link/preview":          accessTokenSessionRule,
+	"POST /api/user/account-link/approve":          accessTokenSessionRule,
 
 	// router/api-router.go: /api/user (admin)
 	"GET /api/user/":                                   accessTokenScopeRule("user:read"),
