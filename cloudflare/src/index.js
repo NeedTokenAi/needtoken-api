@@ -7,6 +7,7 @@ import {
   containerEnv,
   containerNotReadyError,
   containerRequest,
+  emitRedisShapeOnce,
   residentStub,
   startupFailureResponse,
   waitForPort,
@@ -17,6 +18,7 @@ export class NeedtokenApiContainer extends DurableObject {
     super(ctx, env);
     this.starting = undefined;
     this.portReady = false;
+    this.redisShapeState = { logged: false };
     const container = ctx.container;
     if (container?.running) {
       void ctx.blockConcurrencyWhile(() => container.setInactivityTimeout(INACTIVITY_TIMEOUT_MS));
@@ -51,24 +53,40 @@ export class NeedtokenApiContainer extends DurableObject {
 
   async startContainer() {
     const container = this.ctx.container;
-    if (!container.running) {
-      // Image and instance size come from wrangler.jsonc. enableInternet is
-      // required when options are passed. This process calls Neon, Upstash,
-      // and upstream APIs.
-      container.start({
-        enableInternet: true,
-        env: containerEnv(this.env),
-      });
+    const containerRunning = container?.running === true;
+    let startWithInternet = false;
+    try {
+      if (!containerRunning) {
+        // Image and instance size come from wrangler.jsonc. enableInternet is
+        // required when options are passed. This process calls Neon, Upstash,
+        // and upstream APIs.
+        startWithInternet = true;
+        container.start({
+          enableInternet: true,
+          env: containerEnv(this.env),
+        });
+      }
+      await container.setInactivityTimeout(INACTIVITY_TIMEOUT_MS);
+      await waitForPort(
+        () => container.getTcpPort(APP_PORT).fetch("http://container/", {
+          signal: AbortSignal.timeout(1000),
+        }),
+        (ms) => scheduler.wait(ms),
+        PROBE_ATTEMPTS,
+      );
+      this.portReady = true;
+    } finally {
+      // One record per Durable Object lifetime. This is the Worker binding,
+      // not the environment already given to a running container.
+      emitRedisShapeOnce(
+        this.redisShapeState,
+        (record) => {
+          console.log(JSON.stringify(record));
+        },
+        this.env?.REDIS_CONN_STRING,
+        { containerRunning, startWithInternet },
+      );
     }
-    await container.setInactivityTimeout(INACTIVITY_TIMEOUT_MS);
-    await waitForPort(
-      () => container.getTcpPort(APP_PORT).fetch("http://container/", {
-        signal: AbortSignal.timeout(1000),
-      }),
-      (ms) => scheduler.wait(ms),
-      PROBE_ATTEMPTS,
-    );
-    this.portReady = true;
   }
 }
 

@@ -39,6 +39,85 @@ export function containerEnv(env) {
   return forwarded;
 }
 
+// Non-secret hostname used only for an equality check. It contains no credential.
+// The check reads the Worker REDIS_CONN_STRING binding. It does not read the
+// environment of a container that is already running.
+export const EXPECTED_REDIS_HOST = "noble-sole-112190.upstash.io";
+
+function invalidRedisShape() {
+  return {
+    valid: false,
+    schemeRediss: false,
+    hostMatch: false,
+    port6379: false,
+    passwordPresent: false,
+  };
+}
+
+// Shape of the Worker binding only. An omitted port on redis: or rediss: is
+// 6379: WHATWG URL reports that port as "", and go-redis ParseURL uses 6379 for
+// both schemes. An explicit port matches only the decimal string "6379".
+// Any other URL, including a parser failure, is all false. The thrown parse
+// error is discarded and no part of the input is returned.
+export function redisBindingShape(value) {
+  if (typeof value !== "string" || value.length === 0 || value.length > 8192) {
+    return invalidRedisShape();
+  }
+  if (/[\u0000-\u001f\u007f]/.test(value)) {
+    return invalidRedisShape();
+  }
+  let parsed;
+  try {
+    parsed = new URL(value);
+  } catch {
+    return invalidRedisShape();
+  }
+  if (parsed.protocol !== "redis:" && parsed.protocol !== "rediss:") {
+    return invalidRedisShape();
+  }
+  if (parsed.hash !== "" || parsed.hostname === "") {
+    return invalidRedisShape();
+  }
+  const path = parsed.pathname;
+  if (!(path === "" || path === "/" || /^\/[0-9]+$/.test(path))) {
+    return invalidRedisShape();
+  }
+  const port6379 = parsed.port === "" || parsed.port === "6379";
+  return {
+    valid: true,
+    schemeRediss: parsed.protocol === "rediss:",
+    hostMatch: parsed.hostname === EXPECTED_REDIS_HOST,
+    port6379,
+    passwordPresent: parsed.password !== "",
+  };
+}
+
+export function emitRedisShapeOnce(state, emit, value, runtime) {
+  if (!state || state.logged === true) {
+    return false;
+  }
+  state.logged = true;
+  const shape = redisBindingShape(value);
+  const record = {
+    event: "redis_binding_shape",
+    source: "worker-binding",
+    containerEnvChecked: false,
+    valid: shape.valid === true,
+    schemeRediss: shape.schemeRediss === true,
+    hostMatch: shape.hostMatch === true,
+    port6379: shape.port6379 === true,
+    passwordPresent: shape.passwordPresent === true,
+    containerRunning: runtime?.containerRunning === true,
+    startWithInternet: runtime?.startWithInternet === true,
+  };
+  try {
+    emit(record);
+  } catch {
+    // Keep startup independent of logging. Do not read the thrown value.
+  }
+  return true;
+}
+
 // Rewrite the URL to http://container and copy the original Request so the
 // body stream, cancellation signal, and upgrade are kept.
 export function containerRequest(request) {
