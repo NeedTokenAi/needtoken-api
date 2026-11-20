@@ -12,7 +12,9 @@ import {
   containerEnv,
   containerNotReadyError,
   containerRequest,
+  emitRedisShapeOnce,
   notReadyResponse,
+  redisBindingShape,
   residentStub,
   startupFailureResponse,
   waitForPort,
@@ -186,4 +188,165 @@ test("cron retries the same instance and does not retry an application 500", asy
   );
   assert.equal(application.status, 500);
   assert.equal(applicationCalls, 1);
+});
+
+const CANARY_USER = "synthetic-canary-user";
+const CANARY_PASSWORD = "synthetic-canary-password";
+const EXPECTED_HOST = "noble-sole-112190.upstash.io";
+
+function redisUrl({ scheme = "rediss", user = CANARY_USER, password = CANARY_PASSWORD, host = EXPECTED_HOST, port = "6379", path = "", query = "", hash = "" } = {}) {
+  const userinfo = password === undefined ? user : `${user}:${password}`;
+  const portText = port === undefined ? "" : `:${port}`;
+  return `${scheme}://${userinfo}@${host}${portText}${path}${query}${hash}`;
+}
+
+function assertNoSecret(text) {
+  assert.equal(text.includes(CANARY_PASSWORD), false);
+  assert.equal(text.includes(CANARY_USER), false);
+  assert.equal(text.includes("rediss://"), false);
+  assert.equal(text.includes("redis://"), false);
+  assert.equal(text.includes(EXPECTED_HOST), false);
+  assert.equal(text.includes("%"), false);
+}
+
+test("redis binding shape accepts rediss and reports an omitted port as 6379", () => {
+  const explicit = redisBindingShape(redisUrl());
+  assert.deepEqual(explicit, {
+    valid: true,
+    schemeRediss: true,
+    hostMatch: true,
+    port6379: true,
+    passwordPresent: true,
+  });
+  const omitted = redisBindingShape(redisUrl({ port: undefined }));
+  assert.equal(omitted.valid, true);
+  assert.equal(omitted.port6379, true);
+  assert.equal(omitted.schemeRediss, true);
+  const plain = redisBindingShape(redisUrl({ scheme: "redis" }));
+  assert.equal(plain.valid, true);
+  assert.equal(plain.schemeRediss, false);
+  assert.equal(plain.hostMatch, true);
+  assert.equal(plain.port6379, true);
+  assert.equal(plain.passwordPresent, true);
+});
+
+test("redis binding shape rejects the wrong host, port, or a missing password", () => {
+  const wrongHost = redisBindingShape(redisUrl({ host: "evil.example" }));
+  assert.equal(wrongHost.valid, true);
+  assert.equal(wrongHost.hostMatch, false);
+  assert.equal(wrongHost.port6379, true);
+  const suffix = redisBindingShape(redisUrl({ host: `${EXPECTED_HOST}.evil.example` }));
+  assert.equal(suffix.hostMatch, false);
+  const wrongPort = redisBindingShape(redisUrl({ port: "6380" }));
+  assert.equal(wrongPort.valid, true);
+  assert.equal(wrongPort.port6379, false);
+  const noPassword = redisBindingShape(`rediss://${EXPECTED_HOST}:6379/0`);
+  assert.deepEqual(noPassword, {
+    valid: true,
+    schemeRediss: true,
+    hostMatch: true,
+    port6379: true,
+    passwordPresent: false,
+  });
+  const userOnly = redisBindingShape(`rediss://${CANARY_USER}@${EXPECTED_HOST}`);
+  assert.equal(userOnly.passwordPresent, false);
+  assert.equal(userOnly.port6379, true);
+  const userinfoHost = redisBindingShape(`rediss://${EXPECTED_HOST}:6379@evil.example`);
+  assert.equal(userinfoHost.valid, true);
+  assert.equal(userinfoHost.hostMatch, false);
+  assert.equal(JSON.stringify(userinfoHost).includes(EXPECTED_HOST), false);
+});
+
+test("redis binding shape keeps encoded credentials out of the result", () => {
+  const encoded = redisBindingShape(
+    `rediss://${encodeURIComponent(CANARY_USER)}:${encodeURIComponent(`${CANARY_PASSWORD}:extra`)}@${EXPECTED_HOST}:6379/0`,
+  );
+  assert.equal(encoded.valid, true);
+  assert.equal(encoded.hostMatch, true);
+  assert.equal(encoded.passwordPresent, true);
+  assert.equal(JSON.stringify(encoded).includes(CANARY_PASSWORD), false);
+  const encodedHost = redisBindingShape(
+    `rediss://${CANARY_USER}:${CANARY_PASSWORD}@${encodeURIComponent(EXPECTED_HOST)}:6379`,
+  );
+  assert.equal(encodedHost.valid, true);
+  assert.equal(encodedHost.hostMatch, true);
+  assertNoSecret(JSON.stringify(encodedHost));
+  const encodedSuffix = redisBindingShape(
+    `rediss://${encodeURIComponent(`${EXPECTED_HOST}.evil.example`)}:6379`,
+  );
+  assert.equal(encodedSuffix.hostMatch, false);
+  const encodedNull = redisBindingShape(`rediss://evil.example%00.${EXPECTED_HOST}:6379`);
+  assert.equal(encodedNull.hostMatch, false);
+  assert.equal(JSON.stringify(encodedNull).includes("%00"), false);
+});
+
+test("malicious redis URLs collapse to valid false without an error string", () => {
+  const samples = [
+    "",
+    "not a url",
+    "http://noble-sole-112190.upstash.io:6379",
+    `javascript:${CANARY_PASSWORD}`,
+    `rediss://${EXPECTED_HOST}:6379#${CANARY_PASSWORD}`,
+    `rediss://${EXPECTED_HOST}:6379/${CANARY_PASSWORD}`,
+    `rediss://${EXPECTED_HOST}:6379\n${CANARY_PASSWORD}`,
+    `rediss://${CANARY_USER}:${CANARY_PASSWORD}@${EXPECTED_HOST}:6379/${CANARY_PASSWORD}`,
+    null,
+    { href: `rediss://${CANARY_USER}:${CANARY_PASSWORD}@${EXPECTED_HOST}` },
+  ];
+  for (const sample of samples) {
+    assert.deepEqual(redisBindingShape(sample), {
+      valid: false,
+      schemeRediss: false,
+      hostMatch: false,
+      port6379: false,
+      passwordPresent: false,
+    });
+  }
+});
+
+test("a durable object lifetime logs the redis shape once and hides the canary", () => {
+  const state = { logged: false };
+  const lines = [];
+  const raw = redisUrl({ query: `?note=${encodeURIComponent(CANARY_PASSWORD)}` });
+  const first = emitRedisShapeOnce(state, (record) => lines.push(record), raw, {
+    containerRunning: false,
+    startWithInternet: true,
+  });
+  const second = emitRedisShapeOnce(
+    state,
+    (record) => lines.push(record),
+    `redis://${CANARY_USER}:${CANARY_PASSWORD}@evil.example:6380`,
+    { containerRunning: true, startWithInternet: false },
+  );
+  assert.equal(first, true);
+  assert.equal(second, false);
+  assert.equal(lines.length, 1);
+  assert.deepEqual(lines[0], {
+    event: "redis_binding_shape",
+    source: "worker-binding",
+    containerEnvChecked: false,
+    valid: true,
+    schemeRediss: true,
+    hostMatch: true,
+    port6379: true,
+    passwordPresent: true,
+    containerRunning: false,
+    startWithInternet: true,
+  });
+  const rendered = JSON.stringify(lines[0]);
+  assertNoSecret(rendered);
+  assert.equal(rendered.includes(raw), false);
+  const response = notReadyResponse();
+  assert.equal(response.status, 503);
+  assertNoSecret(response.headers.get("retry-after") + "container did not become ready on port 8080");
+});
+
+test("startup records the worker binding once and still does not destroy", () => {
+  const worker = readFileSync(new URL("./index.js", import.meta.url), "utf8");
+  assert.equal(worker.includes("emitRedisShapeOnce("), true);
+  assert.equal(worker.includes("enableInternet: true"), true);
+  assert.equal(worker.includes("destroy("), false);
+  assert.equal(worker.includes("console.log(JSON.stringify(record))"), true);
+  assert.equal(worker.includes("console.log(this.env"), false);
+  assert.equal((worker.match(/emitRedisShapeOnce\(/g) || []).length, 1);
 });
