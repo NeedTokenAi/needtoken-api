@@ -1,13 +1,20 @@
-# 每天 00:15 UTC（北京时间 08:15）把上游 QuantumNous/new-api 的固定稳定版提交开成 PR。
-# 注意：当前 fork 基线已在 v1.0.0-rc.47，因此默认 UPSTREAM_MIN_TAG=v1.0.0，
-# 会安全跳过历史 v0.13.x 稳定分支，待上游发布 >= v1.0.0 正式稳定 tag 后自动同步。
-# 没有 id-token，不接触生产云凭证。不要改成 pull_request_target。
+# 每天 00:15 UTC（北京时间 08:15）检测上游 QuantumNous/new-api 稳定版并开 PR（默认仅通知 Ops，不静默自动升级）。
+# 也支持通过 workflow_dispatch 手动指定 target_tag（如 v1.0.0-rc.51）或 skip_tags。
 name: sync-upstream
 
 on:
   schedule:
     - cron: '15 0 * * *'
   workflow_dispatch:
+    inputs:
+      target_tag:
+        description: "可选：手动指定同步的目标上游 tag（支持 v1.0.0 或 v1.0.0-rc.51）"
+        required: false
+        type: string
+      skip_tags:
+        description: "可选：逗号分隔的跳过版本名单（覆盖/追加 UPSTREAM_SKIP_TAGS）"
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -34,8 +41,13 @@ jobs:
             echo "mode=pat" >> "$GITHUB_OUTPUT"
           else
             echo "mode=github_token" >> "$GITHUB_OUTPUT"
-            echo "::warning::SYNC_GITHUB_TOKEN 未配置。默认 GITHUB_TOKEN 开出的 PR 不会触发 pull_request CI，请在仓库 Secrets 中配置 SYNC_GITHUB_TOKEN。"
+            echo "::warning::SYNC_GITHUB_TOKEN 未配置。默认 GITHUB_TOKEN 开出的 PR 不会触发 pull_request CI。"
           fi
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
 
       - name: Checkout main
         uses: actions/checkout@v4
@@ -45,13 +57,31 @@ jobs:
           persist-credentials: true
           token: ${{ steps.auth.outputs.mode == 'pat' && secrets.SYNC_GITHUB_TOKEN || github.token }}
 
-      - name: Open upstream sync PR
+      - name: Open upstream sync PR or emit conflict report
         env:
           GH_TOKEN: ${{ steps.auth.outputs.mode == 'pat' && secrets.SYNC_GITHUB_TOKEN || github.token }}
+          NEEDTOKEN_MODULE: newapi
           SYNC_AUTH_MODE: ${{ steps.auth.outputs.mode }}
           UPSTREAM_CHANNEL: ${{ vars.UPSTREAM_CHANNEL || 'stable-tags' }}
           UPSTREAM_MIN_TAG: ${{ vars.UPSTREAM_MIN_TAG || 'v1.0.0' }}
+          UPSTREAM_TARGET_TAG: ${{ inputs.target_tag }}
+          UPSTREAM_SKIP_TAGS: ${{ inputs.skip_tags || vars.UPSTREAM_SKIP_TAGS }}
           UPSTREAM_REPO: QuantumNous/new-api
           UPSTREAM_AUTO_MERGE_MAX_FILES: ${{ vars.UPSTREAM_AUTO_MERGE_MAX_FILES || '300' }}
-          CI_SUMMARY_TEXT: CI（Backend vet, build, and test / Frontend typecheck and test）与命中的 NeedToken fulfillment
+          CI_SUMMARY_TEXT: CI（Backend vet, build, and test / Frontend typecheck and test）、NeedToken fulfillment 与 ops-impact-check
+          AI_GATEWAY_URL: ${{ vars.AI_GATEWAY_URL || secrets.AI_GATEWAY_URL }}
+          AI_GATEWAY_API_KEY: ${{ secrets.AI_GATEWAY_API_KEY }}
+          CF_AIG_TOKEN: ${{ secrets.CF_AIG_TOKEN }}
+          AI_REVIEW_MODEL: ${{ vars.AI_REVIEW_MODEL || 'google-ai-studio/gemini-2.5-flash' }}
+          OPS_RELEASE_WEBHOOK_URL: ${{ vars.OPS_RELEASE_WEBHOOK_URL || secrets.OPS_RELEASE_WEBHOOK_URL }}
+          OPS_RELEASE_WEBHOOK_SECRET: ${{ secrets.OPS_RELEASE_WEBHOOK_SECRET }}
         run: .github/scripts/sync-upstream.sh
+
+      - name: Upload sync report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: upstream-sync-report
+          path: upstream-sync-report.json
+          if-no-files-found: ignore
+          retention-days: 14
