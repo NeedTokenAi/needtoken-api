@@ -1,3 +1,5 @@
+import { isEdgeOnlyEnvKey, stripEdgeGateHeaders } from "./admin_gate.js";
+
 // App port the Worker dials. The container is given the same port below.
 export const APP_PORT = 8080;
 
@@ -31,7 +33,7 @@ export function containerEnv(env) {
   const forwarded = {};
   if (env && typeof env === "object") {
     for (const [key, value] of Object.entries(env)) {
-      if (typeof value === "string") {
+      if (typeof value === "string" && !isEdgeOnlyEnvKey(key)) {
         forwarded[key] = value;
       }
     }
@@ -169,6 +171,7 @@ export function containerRequest(request) {
   url.host = "container";
   const forwarded = new Request(url, request);
   forwarded.headers.delete("host");
+  stripEdgeGateHeaders(forwarded.headers);
   return forwarded;
 }
 
