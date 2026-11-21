@@ -9,6 +9,8 @@ import {
   parseAiReviewJson,
   postOpsWebhook,
   renderPrCommentMarkdown,
+  resolveAiCandidateModels,
+  sanitizeAiErrorDetail,
   signWebhookPayload,
 } from "../ops-impact-review.mjs";
 
@@ -142,4 +144,115 @@ test("signs Ops release webhook with HMAC-SHA256 and renders PR markdown with ma
   });
   assert.equal(md.startsWith(COMMENT_MARKER), true);
   assert.equal(md.includes("Create a merge commit"), true);
+  assert.equal(md.includes("AI 诊断摘要"), false);
+});
+
+test("retries 429/5xx once per candidate and falls back to backup models with actual ai_model", async () => {
+  assert.deepEqual(resolveAiCandidateModels("google-ai-studio/gemini-4-neon", undefined), [
+    "google-ai-studio/gemini-4-neon",
+    "google-ai-studio/gemini-4-carbon",
+    "google-ai-studio/gemini-3.5-flash-lite",
+  ]);
+  assert.deepEqual(resolveAiCandidateModels("xai/grok-3-mini", "openai/gpt-4o-mini, anthropic/claude-haiku"), [
+    "xai/grok-3-mini",
+    "openai/gpt-4o-mini",
+    "anthropic/claude-haiku",
+  ]);
+
+  const fallback = buildStaticImpactAssessment({ moduleName: "newapi", files: ["README.md"] });
+  const calls = [];
+  const statuses = [429, 429, 404, 503, 200];
+
+  const res = await callAiGateway({
+    gatewayUrl: "https://gateway.ai.cloudflare.com/v1/acct/gw/compat/chat/completions",
+    cfAigToken: "cf-aig-token",
+    model: "google-ai-studio/gemini-4-neon",
+    fallbackModels: "",
+    promptContext: "diff",
+    fallback,
+    sleepMs: 0,
+    fetchImpl: async (_url, init) => {
+      const parsed = JSON.parse(init.body);
+      const status = statuses[calls.length];
+      calls.push({ model: parsed.model, status });
+      if (status !== 200) {
+        return new Response(`upstream ${status}`, { status });
+      }
+      return new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: {
+                content: JSON.stringify({
+                  verdict: "safe",
+                  summary_zh: "降级模型成功完成研判",
+                  ops_impact: "无影响",
+                  db_migration_risk: "none",
+                  db_migration_notes: "无迁移",
+                  attention_files: [],
+                  recommendation_zh: "可合并",
+                }),
+              },
+            },
+          ],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    },
+  });
+
+  // neon: 429 + retry 429; carbon: 404 (no retry, immediate fallback); flash-lite: 503 + retry 200
+  assert.deepEqual(
+    calls.map((c) => `${c.model}:${c.status}`),
+    [
+      "google-ai-studio/gemini-4-neon:429",
+      "google-ai-studio/gemini-4-neon:429",
+      "google-ai-studio/gemini-4-carbon:404",
+      "google-ai-studio/gemini-3.5-flash-lite:503",
+      "google-ai-studio/gemini-3.5-flash-lite:200",
+    ],
+  );
+  assert.equal(res.ai_status, "completed");
+  assert.equal(res.ai_model, "google-ai-studio/gemini-3.5-flash-lite");
+  assert.equal(res.summary_zh, "降级模型成功完成研判");
+});
+
+test("redacts secrets in ai_error_detail, logs error, and renders sanitized summary when all candidates fail", async () => {
+  const fallback = buildStaticImpactAssessment({ moduleName: "newapi", files: ["README.md"] });
+  const loggedErrors = [];
+  const rawLeak = `upstream quota exceeded for Bearer secret-jwt-token-123456, key=AIzaSyDummySecretKey987654321 and sk-liveSecretToken1234567890 ${"x".repeat(250)}`;
+
+  const sanitized = sanitizeAiErrorDetail(rawLeak);
+  assert.equal(sanitized.includes("secret-jwt-token"), false);
+  assert.equal(sanitized.includes("AIzaSyDummySecretKey"), false);
+  assert.equal(sanitized.includes("sk-liveSecretToken"), false);
+  assert.ok(sanitized.length <= 200);
+
+  const failed = await callAiGateway({
+    gatewayUrl: "https://gateway.ai.cloudflare.com/v1/acct/gw/compat/chat/completions",
+    cfAigToken: "cf-aig-token",
+    model: "google-ai-studio/gemini-4-neon",
+    fallbackModels: "google-ai-studio/gemini-4-carbon",
+    promptContext: "diff",
+    fallback,
+    sleepMs: 0,
+    logger: { error: (msg) => loggedErrors.push(msg) },
+    fetchImpl: async () => new Response(rawLeak, { status: 429 }),
+  });
+
+  assert.equal(failed.ai_status, "gateway_http_429");
+  assert.equal(failed.ai_model, "google-ai-studio/gemini-4-carbon");
+  assert.ok(failed.ai_error_detail.length > 0 && failed.ai_error_detail.length <= 200);
+  assert.equal(failed.ai_error_detail.includes("AIzaSyDummySecretKey"), false);
+  assert.equal(failed.ai_error_detail.includes("sk-liveSecretToken"), false);
+  assert.equal(loggedErrors.length, 1);
+  assert.equal(loggedErrors[0].includes("AIzaSyDummySecretKey"), false);
+
+  const md = renderPrCommentMarkdown({
+    module: "newapi",
+    contract_check_status: "passed",
+    ...failed,
+  });
+  assert.equal(md.includes("AI 诊断摘要"), true);
+  assert.equal(md.includes("AIzaSyDummySecretKey"), false);
 });

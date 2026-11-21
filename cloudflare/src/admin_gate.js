@@ -4,6 +4,7 @@ export const EDGE_ADMIN_HEADER = "x-needtoken-internal-admin-secret";
 export const EDGE_ADMIN_COOKIE = "__Host-nt-edge-admin";
 export const EDGE_CONTROL_PREFIX = "/__needtoken_edge";
 export const ADMIN_ENTRY_PATH = "/system-settings";
+export const CONSOLE_ENTRY_PATH = "/dashboard";
 export const MIN_SECRET_LENGTH = 32;
 export const TICKET_TTL_SECONDS = 60;
 export const MIN_SESSION_TTL_MINUTES = 5;
@@ -16,6 +17,7 @@ const EDGE_ONLY_ENV_KEYS = new Set([
   "EDGE_ADMIN_SECRET",
   "DISABLE_PUBLIC_ADMIN",
   "EDGE_ADMIN_ENFORCE_API",
+  "REDIRECT_ROOT_TO_CONSOLE",
 ]);
 
 const textEncoder = new TextEncoder();
@@ -115,6 +117,10 @@ function getConfiguredSecret(env) {
 
 export function isPublicAdminDisabled(env) {
   return env?.DISABLE_PUBLIC_ADMIN !== "0";
+}
+
+export function isRootRedirectToConsoleEnabled(env) {
+  return env?.REDIRECT_ROOT_TO_CONSOLE !== "0";
 }
 
 export function normalizeRequestPath(rawPathname) {
@@ -558,9 +564,30 @@ export async function handleEdgeAdminGate(request, env, storageSql, nowFn = Date
     return { response: notFoundResponse() };
   }
   const normalized = normalizeRequestPath(pathname);
-  const category = classifyNewApiRequest(request.method.toUpperCase(), normalized);
+  const upperMethod = request.method.toUpperCase();
+  const category = classifyNewApiRequest(upperMethod, normalized);
 
   if (category === "public") {
+    if (
+      (upperMethod === "GET" || upperMethod === "HEAD") &&
+      normalized.canonical === "/" &&
+      isRootRedirectToConsoleEnabled(env)
+    ) {
+      const nowMs = nowFn();
+      const store = new GateStore(storageSql);
+      const secret = getConfiguredSecret(env);
+      if (!(await hasValidBreakGlassCookie(request, secret, store, nowMs))) {
+        return {
+          response: new Response(null, {
+            status: 302,
+            headers: {
+              location: CONSOLE_ENTRY_PATH,
+              "cache-control": "no-store",
+            },
+          }),
+        };
+      }
+    }
     return { allow: true };
   }
   if (category === "invalid") {

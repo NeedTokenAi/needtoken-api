@@ -223,14 +223,77 @@ export function parseAiReviewJson(rawText, fallback) {
   };
 }
 
+const DEFAULT_AI_GATEWAY_TIMEOUT_MS = 120_000;
+const DEFAULT_GOOGLE_FALLBACK_MODELS = [
+  "google-ai-studio/gemini-4-carbon",
+  "google-ai-studio/gemini-3.5-flash-lite",
+];
+
+export function resolveAiCandidateModels(primaryModel, fallbackModelsEnv) {
+  const primary =
+    String(primaryModel || "google-ai-studio/gemini-2.5-flash").trim() ||
+    "google-ai-studio/gemini-2.5-flash";
+
+  const explicitList = Array.isArray(fallbackModelsEnv)
+    ? fallbackModelsEnv.map((m) => String(m).trim()).filter(Boolean)
+    : typeof fallbackModelsEnv === "string" && fallbackModelsEnv.trim()
+      ? fallbackModelsEnv
+          .split(",")
+          .map((m) => m.trim())
+          .filter(Boolean)
+      : null;
+
+  if (explicitList && explicitList.length > 0) {
+    return [...new Set([primary, ...explicitList])];
+  }
+
+  if (
+    primary.startsWith("google-ai-studio/") &&
+    !DEFAULT_GOOGLE_FALLBACK_MODELS.includes(primary)
+  ) {
+    return [primary, ...DEFAULT_GOOGLE_FALLBACK_MODELS];
+  }
+  if (primary === "google-ai-studio/gemini-4-carbon") {
+    return [primary, "google-ai-studio/gemini-3.5-flash-lite"];
+  }
+  return [primary];
+}
+
+export function sanitizeAiErrorDetail(rawText, maxLen = 200) {
+  if (typeof rawText !== "string" || !rawText.trim()) return "";
+  const redacted = rawText
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [REDACTED]")
+    .replace(/\bAIza[0-9A-Za-z_-]{8,}\b/g, "[REDACTED_KEY]")
+    .replace(/\b(?:sk|rk|pk|xai|cf|ghp|gho|github_pat)-[A-Za-z0-9_-]{6,}\b/gi, "[REDACTED_KEY]")
+    .replace(
+      /((?:api[_-]?key|token|secret|password|authorization)["'\s:=]+)[A-Za-z0-9._~+/=-]{8,}/gi,
+      "$1[REDACTED]",
+    )
+    .replace(/\s+/g, " ")
+    .trim();
+  return redacted.slice(0, maxLen);
+}
+
+function isRetryableGatewayStatus(status) {
+  return status === 429 || status === 502 || status === 503 || status === 504 || (status >= 500 && status <= 599);
+}
+
+function isFallbackEligibleStatus(status) {
+  return status === 429 || status === 404 || (status >= 500 && status <= 599);
+}
+
 export async function callAiGateway({
   gatewayUrl,
   apiKey = "",
   cfAigToken = "",
   model = "google-ai-studio/gemini-2.5-flash",
+  fallbackModels = process.env.AI_REVIEW_FALLBACK_MODELS,
   promptContext,
   fallback,
   fetchImpl = fetch,
+  sleepMs = 2_000,
+  timeoutMs = DEFAULT_AI_GATEWAY_TIMEOUT_MS,
+  logger = console,
 }) {
   // Support both Cloudflare AI Gateway BYOK/Stored Keys (cfAigToken only, omitting
   // Authorization so Cloudflare injects the stored provider key) and explicit provider keys.
@@ -254,9 +317,9 @@ export async function callAiGateway({
     headers["cf-aig-authorization"] = `Bearer ${cfAigToken}`;
   }
 
-  const send = async (withResponseFormat) => {
+  const send = async (candidateModel, withResponseFormat) => {
     const body = {
-      model,
+      model: candidateModel,
       temperature: 0.1,
       messages: [
         { role: "system", content: systemPrompt },
@@ -270,25 +333,80 @@ export async function callAiGateway({
       method: "POST",
       headers,
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(45_000),
+      signal: AbortSignal.timeout(timeoutMs),
     });
   };
 
-  try {
-    let response = await send(true);
-    if (response.status === 400) {
-      response = await send(false);
+  const candidates = resolveAiCandidateModels(model, fallbackModels);
+  let lastStatus = "gateway_error:unknown";
+  let lastModel = candidates[0];
+  let lastErrorDetail = "";
+
+  for (let i = 0; i < candidates.length; i += 1) {
+    const candidateModel = candidates[i];
+    lastModel = candidateModel;
+    let shouldAdvanceToNextModel = false;
+
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        let response = await send(candidateModel, true);
+        if (response.status === 400) {
+          response = await send(candidateModel, false);
+        }
+        if (response.ok) {
+          const data = await response.json();
+          const content = data?.choices?.[0]?.message?.content ?? "";
+          const merged = parseAiReviewJson(content, fallback);
+          return { ...merged, ai_model: candidateModel };
+        }
+
+        if (attempt === 0 && isRetryableGatewayStatus(response.status)) {
+          try {
+            await response.body?.cancel?.();
+          } catch {
+            // ignore cancel error before retry
+          }
+          if (sleepMs > 0) {
+            await new Promise((r) => setTimeout(r, sleepMs));
+          }
+          continue;
+        }
+
+        let rawErrText = "";
+        try {
+          rawErrText = await response.text();
+        } catch {
+          rawErrText = "";
+        }
+        lastStatus = `gateway_http_${response.status}`;
+        lastErrorDetail = sanitizeAiErrorDetail(rawErrText || `HTTP ${response.status}`);
+        shouldAdvanceToNextModel = i + 1 < candidates.length && isFallbackEligibleStatus(response.status);
+        break;
+      } catch (err) {
+        lastStatus = `gateway_error:${err?.name || "unknown"}`;
+        lastErrorDetail = sanitizeAiErrorDetail(err?.message || String(err || ""));
+        shouldAdvanceToNextModel = i + 1 < candidates.length;
+        break;
+      }
     }
-    if (!response.ok) {
-      return { ...fallback, ai_status: `gateway_http_${response.status}`, ai_model: model };
+
+    if (!shouldAdvanceToNextModel) {
+      break;
     }
-    const data = await response.json();
-    const content = data?.choices?.[0]?.message?.content ?? "";
-    const merged = parseAiReviewJson(content, fallback);
-    return { ...merged, ai_model: model };
-  } catch (err) {
-    return { ...fallback, ai_status: `gateway_error:${err?.name || "unknown"}`, ai_model: model };
   }
+
+  const sanitizedDetail = lastErrorDetail || sanitizeAiErrorDetail(lastStatus);
+  if (typeof logger?.error === "function") {
+    logger.error(
+      `[ops-impact-review] AI gateway failed (${lastStatus}, model=${lastModel}): ${sanitizedDetail}`,
+    );
+  }
+  return {
+    ...fallback,
+    ai_status: lastStatus,
+    ai_model: lastModel,
+    ...(sanitizedDetail ? { ai_error_detail: sanitizedDetail } : {}),
+  };
 }
 
 export function signWebhookPayload(secret, timestampSec, rawBody) {
@@ -349,6 +467,11 @@ export function renderPrCommentMarkdown(report) {
       ? report.attention_files.map((f) => `- \`${f}\``).join("\n")
       : "- （无重点高危文件）";
 
+  const errorDetailLine =
+    typeof report.ai_error_detail === "string" && report.ai_error_detail.trim()
+      ? `- **AI 诊断摘要**：\`${report.ai_error_detail.trim().replace(/`/g, "'")}\``
+      : "";
+
   return [
     COMMENT_MARKER,
     `### NeedToken Ops 影响评估与 AI 风险研判（${report.module}）`,
@@ -357,6 +480,7 @@ export function renderPrCommentMarkdown(report) {
     `- **数据库迁移风险**：${dbBadge}`,
     `- **契约/门禁检查**：\`${report.contract_check_status || "unknown"}\``,
     `- **AI 研判引擎**：\`${report.ai_status}\`${report.ai_model ? `（\`${report.ai_model}\`）` : ""}`,
+    ...(errorDetailLine ? [errorDetailLine] : []),
     "",
     `#### 中文结论`,
     report.summary_zh,
@@ -376,6 +500,8 @@ export function renderPrCommentMarkdown(report) {
     `> 合并上游同步 PR 时请务必在 Ops 或 GitHub 使用 **Create a merge commit**，严禁 Squash 或 Rebase。`,
   ].join("\n");
 }
+
+export const renderMarkdownComment = renderPrCommentMarkdown;
 
 function parseArgs(argv) {
   const out = {};
@@ -508,6 +634,7 @@ async function runCli() {
           apiKey: (process.env.AI_GATEWAY_API_KEY || "").trim(),
           cfAigToken: (process.env.CF_AIG_TOKEN || "").trim(),
           model: (process.env.AI_REVIEW_MODEL || "google-ai-studio/gemini-2.5-flash").trim(),
+          fallbackModels: process.env.AI_REVIEW_FALLBACK_MODELS,
           promptContext,
           fallback: staticAssessment,
         });
