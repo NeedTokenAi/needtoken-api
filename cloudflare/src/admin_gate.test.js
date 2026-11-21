@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   ADMIN_ENTRY_PATH,
+  CONSOLE_ENTRY_PATH,
   EDGE_ADMIN_COOKIE,
   EDGE_ADMIN_HEADER,
   handleEdgeAdminGate,
@@ -81,6 +82,7 @@ test("new-api preserves C-side endpoints while blocking admin UI and admin APIs 
     new Request("https://api.example/api/models"),
     new Request("https://api.example/api/user/self"),
     new Request("https://api.example/api/user/login", { method: "POST" }),
+    new Request("https://api.example/api/user/needtoken-sso", { method: "POST" }),
     new Request("https://api.example/api/user/topup", { method: "POST" }),
     new Request("https://api.example/api/user/topup/self"),
     new Request("https://api.example/api/user/account-link/approve", { method: "POST" }),
@@ -95,6 +97,7 @@ test("new-api preserves C-side endpoints while blocking admin UI and admin APIs 
     new Request("https://api.example/api/subscription/plans"),
     new Request("https://api.example/api/subscription/self"),
     new Request("https://api.example/dashboard"),
+    new Request("https://api.example/oauth"),
     new Request("https://api.example/wallet"),
     new Request("https://api.example/account-link"),
   ];
@@ -129,6 +132,7 @@ test("new-api preserves C-side endpoints while blocking admin UI and admin APIs 
     new Request("https://api.example/api/group/"),
     new Request("https://api.example/api/redemption/"),
     new Request("https://api.example/api/subscription/admin/plans"),
+    new Request("https://api.example/api/subscription/admin/needtoken-member", { method: "POST" }),
     new Request("https://api.example/API/CHANNEL/"),
     new Request("https://api.example//api/channel/"),
     new Request("https://api.example/api/v1/../channel/"),
@@ -146,6 +150,7 @@ test("internal secret unlocks exact glue/ops admin APIs only and never pure admi
 
   for (const allowedInternal of [
     "https://api.example/api/subscription/admin/fulfillment",
+    "https://api.example/api/subscription/admin/needtoken-member",
     "https://api.example/api/redemption/fulfillment",
     "https://api.example/api/channel/",
     "https://api.example/api/channel/test/7",
@@ -224,13 +229,78 @@ test("zero-downtime rollout allows whitelisted internal APIs only when secret is
 });
 
 test("edge secrets are filtered from container env and stripped before forwarding", () => {
-  const env = containerEnv({ SQL_DSN: "postgres://db/api", EDGE_ADMIN_SECRET: TEST_SECRET, DISABLE_PUBLIC_ADMIN: "1" });
+  const env = containerEnv({
+    SQL_DSN: "postgres://db/api",
+    EDGE_ADMIN_SECRET: TEST_SECRET,
+    DISABLE_PUBLIC_ADMIN: "1",
+    REDIRECT_ROOT_TO_CONSOLE: "1",
+  });
   assert.equal(Object.hasOwn(env, "EDGE_ADMIN_SECRET"), false);
   assert.equal(Object.hasOwn(env, "DISABLE_PUBLIC_ADMIN"), false);
+  assert.equal(Object.hasOwn(env, "REDIRECT_ROOT_TO_CONSOLE"), false);
 
   const fwd = containerRequest(new Request("https://api.example/api/channel/", {
     headers: { [EDGE_ADMIN_HEADER]: TEST_SECRET, authorization: "Bearer nap_x" },
   }));
   assert.equal(fwd.headers.get(EDGE_ADMIN_HEADER), null);
   assert.equal(fwd.headers.get("authorization"), "Bearer nap_x");
+});
+
+test("public root GET and HEAD redirect 302 to /dashboard unless disabled or break-glass unlocked", async () => {
+  const sql = createMockSql();
+  const env = { EDGE_ADMIN_SECRET: TEST_SECRET };
+
+  for (const req of [
+    new Request("https://api.example/"),
+    new Request("https://api.example/", { method: "HEAD" }),
+    new Request("https://api.example/?utm_source=storefront"),
+  ]) {
+    const res = await handleEdgeAdminGate(req, env, sql);
+    assert.equal(res.response?.status, 302, `expected 302 for ${req.method} ${req.url}`);
+    assert.equal(res.response.headers.get("location"), CONSOLE_ENTRY_PATH);
+    assert.equal(res.response.headers.get("cache-control"), "no-store");
+  }
+
+  // Non-root routes stay unaffected.
+  for (const req of [
+    new Request("https://api.example/dashboard"),
+    new Request("https://api.example/v1/models"),
+    new Request("https://api.example/api/status"),
+    new Request("https://api.example/oauth?redirect=/dashboard"),
+  ]) {
+    const res = await handleEdgeAdminGate(req, env, sql);
+    assert.equal(res.allow, true, `expected allow for ${req.url}`);
+  }
+
+  // Opt-out via REDIRECT_ROOT_TO_CONSOLE="0" allows root through.
+  const disabledRes = await handleEdgeAdminGate(
+    new Request("https://api.example/"),
+    { ...env, REDIRECT_ROOT_TO_CONSOLE: "0" },
+    sql,
+  );
+  assert.equal(disabledRes.allow, true);
+
+  // Valid break-glass cookie bypasses root redirect for emergency inspection.
+  const now = 1_700_000_000_000;
+  const issue = await handleEdgeAdminGate(
+    new Request("https://api.example/__needtoken_edge/admin-gate/ticket", {
+      method: "POST",
+      headers: { "content-type": "application/json", [EDGE_ADMIN_HEADER]: TEST_SECRET },
+      body: JSON.stringify({ actor: "owner-1", reason: "inspect root", ttl_minutes: 30 }),
+    }),
+    env,
+    sql,
+    () => now,
+  );
+  const { unlock_path: unlockPath } = await issue.response.json();
+  const unlock = await handleEdgeAdminGate(new Request(`https://api.example${unlockPath}`), env, sql, () => now);
+  const cookiePair = unlock.response.headers.get("set-cookie").split(";")[0];
+
+  const breakGlassRoot = await handleEdgeAdminGate(
+    new Request("https://api.example/", { headers: { cookie: cookiePair } }),
+    env,
+    sql,
+    () => now,
+  );
+  assert.equal(breakGlassRoot.allow, true);
 });

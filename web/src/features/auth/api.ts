@@ -229,6 +229,18 @@ export async function wechatLoginByCode(code: string): Promise<ApiResponse> {
   return res.data
 }
 
+// NeedToken console single-use SSO ticket exchange
+export async function exchangeNeedTokenSSO(
+  ticket: string
+): Promise<LoginResponse> {
+  const res = await api.post<LoginResponse>(
+    '/api/user/needtoken-sso',
+    { ticket },
+    { skipAuthRefresh: true }
+  )
+  return res.data
+}
+
 export async function telegramLogin(
   authorization: TelegramAuthorization
 ): Promise<ApiResponse> {

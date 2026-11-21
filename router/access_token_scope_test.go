@@ -4,6 +4,8 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -31,6 +33,8 @@ var accessTokenExemptRoutes = []string{
 	"GET /api/privacy-policy",
 	"GET /api/about",
 	"GET /api/home_page_content",
+	"OPTIONS /api/pricing",
+	"OPTIONS /api/perf-metrics/summary",
 	"GET /api/ratio_config",
 	"GET /api/user/groups",
 
@@ -41,6 +45,7 @@ var accessTokenExemptRoutes = []string{
 	"POST /api/user/register",
 	"GET /api/user/login/encryption-key",
 	"POST /api/user/login",
+	"POST /api/user/needtoken-sso",
 	"POST /api/user/login/2fa",
 	"POST /api/user/login/verify",
 	"POST /api/user/login/passkey/begin",
@@ -66,6 +71,7 @@ var accessTokenExemptRoutes = []string{
 	"POST /api/subscription/epay/notify",
 	"GET /api/subscription/epay/return",
 	"POST /api/subscription/epay/return",
+	"POST /api/subscription/admin/needtoken-member",
 
 	// API key authentication (TokenAuthReadOnly).
 	"GET /api/usage/token/",
@@ -198,5 +204,18 @@ func TestAccessTokenVerificationScopesAreAllListed(t *testing.T) {
 	for _, scope := range scopes {
 		_, listed := service.AccessTokenVerificationScope(scope)
 		assert.True(t, listed, "verification scope %s has no access token rule", scope)
+	}
+}
+
+func TestPublicPricingRoutesExposeCORSHeaders(t *testing.T) {
+	engine := newAccessTokenScopeTestEngine(t)
+	for _, path := range []string{"/api/pricing", "/api/perf-metrics/summary"} {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodOptions, path, nil)
+		req.Header.Set("Origin", "https://needtoken.ai")
+		req.Header.Set("Access-Control-Request-Method", http.MethodGet)
+		engine.ServeHTTP(rec, req)
+		assert.Equal(t, http.StatusNoContent, rec.Code, path)
+		assert.Equal(t, "*", rec.Header().Get("Access-Control-Allow-Origin"), path)
 	}
 }

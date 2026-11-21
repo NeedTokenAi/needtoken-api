@@ -38,8 +38,9 @@ is_high_risk_path() {
       return 0
       ;;
     # NeedToken 二开保护区
-    controller/needtoken_* | controller/external_grant* | \
-      web/src/routes/_authenticated/account-link.tsx)
+    VERSION | controller/needtoken_* | controller/external_grant* | \
+      web/src/routes/_authenticated/account-link.tsx | \
+      "web/src/routes/(auth)/oauth.tsx")
       return 0
       ;;
     *)
