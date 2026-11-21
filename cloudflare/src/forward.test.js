@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import {
   APP_PORT,
+  ENV_FINGERPRINT_KEY,
   INACTIVITY_TIMEOUT_MS,
   INSTANCE_NAME,
   PROBE_ATTEMPTS,
@@ -10,9 +11,11 @@ import {
   RETRY_AFTER_SECONDS,
   awaitInstance,
   containerEnv,
+  containerEnvFingerprint,
   containerNotReadyError,
   containerRequest,
   emitRedisShapeOnce,
+  ensureContainerStarted,
   notReadyResponse,
   redisBindingShape,
   residentStub,
@@ -341,12 +344,67 @@ test("a durable object lifetime logs the redis shape once and hides the canary",
   assertNoSecret(response.headers.get("retry-after") + "container did not become ready on port 8080");
 });
 
-test("startup records the worker binding once and still does not destroy", () => {
+test("startup records the worker binding once and delegates env-change reload to ensureContainerStarted", () => {
   const worker = readFileSync(new URL("./index.js", import.meta.url), "utf8");
   assert.equal(worker.includes("emitRedisShapeOnce("), true);
   assert.equal(worker.includes("enableInternet: true"), true);
+  assert.equal(worker.includes("ensureContainerStarted("), true);
   assert.equal(worker.includes("destroy("), false);
   assert.equal(worker.includes("console.log(JSON.stringify(record))"), true);
   assert.equal(worker.includes("console.log(this.env"), false);
   assert.equal((worker.match(/emitRedisShapeOnce\(/g) || []).length, 1);
+});
+
+test("containerEnvFingerprint is stable across key order and hashes without plaintext", async () => {
+  const a = await containerEnvFingerprint({ NEEDTOKEN_LINKING_SECRET: CANARY_PASSWORD, SQL_DSN: "postgres://db/a", NEEDTOKEN_API: { getByName() {} } });
+  const b = await containerEnvFingerprint({ SQL_DSN: "postgres://db/a", NEEDTOKEN_LINKING_SECRET: CANARY_PASSWORD });
+  const c = await containerEnvFingerprint({ SQL_DSN: "postgres://db/a", NEEDTOKEN_LINKING_SECRET: "rotated-secret" });
+  assert.equal(a, b);
+  assert.notEqual(a, c);
+  assert.match(a, /^[0-9a-f]{64}$/);
+  assertNoSecret(a);
+});
+
+test("ensureContainerStarted destroys and restarts a running container only when env changes", async () => {
+  const store = new Map();
+  const storage = {
+    async get(k) { return store.get(k); },
+    async put(k, v) { store.set(k, v); },
+  };
+  const events = [];
+  const container = {
+    running: false,
+    async destroy(reason) {
+      events.push(["destroy", reason]);
+      this.running = false;
+    },
+  };
+  const startFn = (env) => {
+    events.push(["start", env.NEEDTOKEN_LINKING_SECRET]);
+    container.running = true;
+  };
+
+  const first = await ensureContainerStarted(container, storage, { NEEDTOKEN_LINKING_SECRET: "s1" }, startFn);
+  assert.equal(first.started, true);
+  assert.equal(first.restarted, false);
+  assert.deepEqual(events, [["start", "s1"]]);
+  assert.match(store.get(ENV_FINGERPRINT_KEY), /^[0-9a-f]{64}$/);
+  assert.equal(store.get(ENV_FINGERPRINT_KEY).includes("s1"), false);
+
+  // Same env after DO isolate reload: stays running without destroy.
+  const steady = await ensureContainerStarted(container, storage, { NEEDTOKEN_LINKING_SECRET: "s1" }, startFn);
+  assert.equal(steady.started, false);
+  assert.equal(steady.restarted, false);
+  assert.deepEqual(events, [["start", "s1"]]);
+
+  // Updated secret while container is running: destroys once and restarts with new env.
+  const rotated = await ensureContainerStarted(container, storage, { NEEDTOKEN_LINKING_SECRET: "s2" }, startFn, first.fingerprint);
+  assert.equal(rotated.started, true);
+  assert.equal(rotated.restarted, true);
+  assert.equal(store.get(ENV_FINGERPRINT_KEY), rotated.fingerprint);
+  assert.deepEqual(events, [
+    ["start", "s1"],
+    ["destroy", "env_changed"],
+    ["start", "s2"],
+  ]);
 });

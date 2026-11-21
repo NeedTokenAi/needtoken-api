@@ -4,10 +4,10 @@ import {
   INACTIVITY_TIMEOUT_MS,
   PROBE_ATTEMPTS,
   awaitInstance,
-  containerEnv,
   containerNotReadyError,
   containerRequest,
   emitRedisShapeOnce,
+  ensureContainerStarted,
   residentStub,
   startupFailureResponse,
   waitForPort,
@@ -18,6 +18,7 @@ export class NeedtokenApiContainer extends DurableObject {
     super(ctx, env);
     this.starting = undefined;
     this.portReady = false;
+    this.loadedEnvFingerprint = undefined;
     this.redisShapeState = { logged: false };
     const container = ctx.container;
     if (container?.running) {
@@ -41,7 +42,7 @@ export class NeedtokenApiContainer extends DurableObject {
 
   async ensureStarted() {
     const container = this.ctx.container;
-    if (this.portReady && container.running) {
+    if (this.portReady && container.running && this.loadedEnvFingerprint) {
       await container.setInactivityTimeout(INACTIVITY_TIMEOUT_MS);
       return;
     }
@@ -56,16 +57,24 @@ export class NeedtokenApiContainer extends DurableObject {
     const containerRunning = container?.running === true;
     let startWithInternet = false;
     try {
-      if (!containerRunning) {
-        // Image and instance size come from wrangler.jsonc. enableInternet is
-        // required when options are passed. This process calls Neon, Upstash,
-        // and upstream APIs.
-        startWithInternet = true;
-        container.start({
-          enableInternet: true,
-          env: containerEnv(this.env),
-        });
-      }
+      const outcome = await ensureContainerStarted(
+        container,
+        this.ctx.storage,
+        this.env,
+        (env) => {
+          // Image and instance size come from wrangler.jsonc. enableInternet is
+          // required when options are passed. This process calls Neon, Upstash,
+          // and upstream APIs.
+          startWithInternet = true;
+          this.portReady = false;
+          container.start({
+            enableInternet: true,
+            env,
+          });
+        },
+        this.loadedEnvFingerprint,
+      );
+      this.loadedEnvFingerprint = outcome.fingerprint;
       await container.setInactivityTimeout(INACTIVITY_TIMEOUT_MS);
       await waitForPort(
         () => container.getTcpPort(APP_PORT).fetch("http://container/", {
