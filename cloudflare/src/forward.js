@@ -14,6 +14,7 @@ export const INACTIVITY_TIMEOUT_MS = 6 * 60 * 60 * 1000;
 export const PROBE_ATTEMPTS = 1;
 export const RETRY_AFTER_SECONDS = 5;
 export const READY_DEADLINE_MS = 4 * 60 * 1000;
+export const ENV_FINGERPRINT_KEY = "container_env_sha256";
 
 export function residentStub(namespace) {
   if (!namespace || typeof namespace.getByName !== "function") {
@@ -37,6 +38,48 @@ export function containerEnv(env) {
   }
   forwarded.PORT = "8080";
   return forwarded;
+}
+
+// One-way SHA-256 fingerprint of normalized container env strings. Stored in
+// Durable Object storage to detect Secret updates without storing plaintext.
+export async function containerEnvFingerprint(env) {
+  const passed = containerEnv(env);
+  const entries = Object.keys(passed).sort().map((key) => [key, passed[key]]);
+  const encoded = new TextEncoder().encode(JSON.stringify(entries));
+  const digest = await crypto.subtle.digest("SHA-256", encoded);
+  return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+// Start the container if stopped, or destroy and restart it when the Worker
+// Secret/var fingerprint changed while the resident container stayed up.
+export async function ensureContainerStarted(container, storage, env, startContainer, loadedFingerprint) {
+  const passed = containerEnv(env);
+  const fingerprint = await containerEnvFingerprint(passed);
+  const running = container?.running === true;
+  if (running) {
+    if (loadedFingerprint === fingerprint) {
+      return { started: false, restarted: false, fingerprint };
+    }
+    const stored = storage && typeof storage.get === "function"
+      ? await storage.get(ENV_FINGERPRINT_KEY)
+      : undefined;
+    if (stored === fingerprint) {
+      return { started: false, restarted: false, fingerprint };
+    }
+    if (typeof container.destroy === "function") {
+      await container.destroy("env_changed");
+    }
+    startContainer(passed);
+    if (storage && typeof storage.put === "function") {
+      await storage.put(ENV_FINGERPRINT_KEY, fingerprint);
+    }
+    return { started: true, restarted: true, fingerprint };
+  }
+  startContainer(passed);
+  if (storage && typeof storage.put === "function") {
+    await storage.put(ENV_FINGERPRINT_KEY, fingerprint);
+  }
+  return { started: true, restarted: false, fingerprint };
 }
 
 // Non-secret hostname used only for an equality check. It contains no credential.
