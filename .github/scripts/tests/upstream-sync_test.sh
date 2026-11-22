@@ -36,11 +36,16 @@ for p in \
   "controller/subscription.go" \
   "controller/auth.go" \
   "controller/needtoken_account_link.go" \
+  "controller/needtoken_admin_tokens.go" \
   "controller/needtoken_sso.go" \
   "controller/needtoken_sso_test.go" \
   "VERSION" \
   "web/src/routes/_authenticated/account-link.tsx" \
   "web/src/routes/(auth)/oauth.tsx" \
+  "web/src/routes/index.tsx" \
+  "web/src/components/layout/components/system-brand.tsx" \
+  "web/src/components/layout/components/public-header.tsx" \
+  "web/src/hooks/use-top-nav-links.ts" \
   "scripts/init.sql"; do
   is_high_risk_path "$p" || fail "expected high-risk: $p"
 done

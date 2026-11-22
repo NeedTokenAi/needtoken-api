@@ -16,10 +16,31 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { createFileRoute } from '@tanstack/react-router'
+import { createFileRoute, redirect } from '@tanstack/react-router'
 
 import { Home } from '@/features/home'
+import { resolveAuthentication } from '@/lib/auth-session'
+import { parseHeaderNavModulesFromStatus } from '@/lib/nav-modules'
+import { readCachedStatus, statusQueryOptions } from '@/lib/status-query'
+import { useAuthStore } from '@/stores/auth-store'
 
 export const Route = createFileRoute('/')({
+  beforeLoad: async ({ context }) => {
+    let status: Record<string, unknown> | null = null
+    try {
+      status = await context.queryClient.fetchQuery(statusQueryOptions)
+    } catch {
+      status = readCachedStatus()
+    }
+    const modules = parseHeaderNavModulesFromStatus(status)
+    if (modules.home === false) {
+      await resolveAuthentication()
+      const { auth } = useAuthStore.getState()
+      if (auth.user && auth.accessToken) {
+        throw redirect({ to: '/dashboard', replace: true })
+      }
+      throw redirect({ to: '/sign-in', replace: true })
+    }
+  },
   component: Home,
 })

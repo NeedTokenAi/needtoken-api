@@ -186,6 +186,7 @@ export const STATIC_I18N_KEYS = [
   'Model Square',
   'Rankings',
   'Docs',
+  'API Docs',
   'About',
 
   // Sidebar views (drill-in workspaces)
@@ -269,6 +270,7 @@ export const STATIC_I18N_KEYS = [
   'Successfully created {{count}} API Key(s)',
   'Successfully deleted {{count}} API key(s)',
   'Enter API key for this channel',
+  'Token does not exist',
 
   // Users
   'Root',

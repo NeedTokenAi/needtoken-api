@@ -26,7 +26,9 @@ import {
 } from '@/components/ui/sidebar'
 import { useStatus } from '@/hooks/use-status'
 import { useSystemConfig } from '@/hooks/use-system-config'
+import { parseHeaderNavModulesFromStatus } from '@/lib/nav-modules'
 import { cn } from '@/lib/utils'
+import { useAuthStore } from '@/stores/auth-store'
 
 type SystemBrandProps = {
   defaultName?: string
@@ -49,17 +51,27 @@ export function SystemBrand(props: SystemBrandProps) {
   const { t } = useTranslation()
   const { status } = useStatus()
   const { logo } = useSystemConfig()
+  const isAuthenticated = useAuthStore((s) => Boolean(s.auth.user))
 
   const variant = props.variant ?? 'sidebar'
   const name = status?.system_name || props.defaultName || 'New API'
   const version =
     status?.version || props.defaultVersion || t('Unknown version')
+  const modules = parseHeaderNavModulesFromStatus(
+    status as Record<string, unknown> | null
+  )
+  let brandTarget: '/' | '/dashboard' | '/sign-in' = '/'
+  let brandAriaLabel = t('Go to home')
+  if (modules.home === false) {
+    brandTarget = isAuthenticated ? '/dashboard' : '/sign-in'
+    brandAriaLabel = isAuthenticated ? t('Go to Dashboard') : t('Sign in')
+  }
 
   if (variant === 'inline') {
     return (
       <Link
-        to='/'
-        aria-label={t('Go to home')}
+        to={brandTarget}
+        aria-label={brandAriaLabel}
         className={cn(
           'text-foreground inline-flex h-7 min-w-0 items-center gap-1.5 rounded-md px-1.5 text-sm font-medium transition-colors outline-none select-none',
           'hover:bg-accent focus-visible:ring-ring/40 focus-visible:ring-2'

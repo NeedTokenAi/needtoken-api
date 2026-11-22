@@ -40,7 +40,11 @@ is_high_risk_path() {
     # NeedToken 二开保护区
     VERSION | controller/needtoken_* | controller/external_grant* | \
       web/src/routes/_authenticated/account-link.tsx | \
-      "web/src/routes/(auth)/oauth.tsx")
+      "web/src/routes/(auth)/oauth.tsx" | \
+      web/src/routes/index.tsx | \
+      web/src/components/layout/components/system-brand.tsx | \
+      web/src/components/layout/components/public-header.tsx | \
+      web/src/hooks/use-top-nav-links.ts)
       return 0
       ;;
     *)
