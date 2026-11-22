@@ -222,8 +222,9 @@ func SetApiRouter(router *gin.Engine) {
 			subscriptionAdminRoute.DELETE("/user_subscriptions/:id", controller.AdminDeleteUserSubscription)
 		}
 
-		// HMAC-authenticated NeedToken member provisioning (edge-gated under /api/subscription/admin, outside AdminAuth PAT scope)
+		// HMAC-authenticated NeedToken member provisioning & SLO revocation (edge-gated under /api/subscription/admin, outside AdminAuth PAT scope)
 		apiRouter.POST("/subscription/admin/needtoken-member", middleware.CriticalRateLimit(), middleware.DisableCache(), controller.ProvisionNeedTokenMember)
+		apiRouter.POST("/subscription/admin/needtoken-slo-revoke", middleware.CriticalRateLimit(), middleware.DisableCache(), controller.RevokeNeedTokenSessions)
 
 		// Subscription payment callbacks (no auth)
 		apiRouter.POST("/subscription/epay/notify", anonymousRequestBodyLimit, controller.SubscriptionEpayNotify)

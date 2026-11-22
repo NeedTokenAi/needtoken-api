@@ -72,6 +72,7 @@ var accessTokenExemptRoutes = []string{
 	"GET /api/subscription/epay/return",
 	"POST /api/subscription/epay/return",
 	"POST /api/subscription/admin/needtoken-member",
+	"POST /api/subscription/admin/needtoken-slo-revoke",
 
 	// API key authentication (TokenAuthReadOnly).
 	"GET /api/usage/token/",
