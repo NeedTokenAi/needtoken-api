@@ -25,29 +25,32 @@ type PricingPluginVariant struct {
 }
 
 type Pricing struct {
-	BillingPluginVariants  []PricingPluginVariant               `json:"billing_plugin_variants,omitempty"`
-	ModelName              string                               `json:"model_name"`
-	Description            string                               `json:"description,omitempty"`
-	Icon                   string                               `json:"icon,omitempty"`
-	Tags                   string                               `json:"tags,omitempty"`
-	VendorID               int                                  `json:"vendor_id,omitempty"`
-	QuotaType              int                                  `json:"quota_type"`
-	ModelRatio             float64                              `json:"model_ratio"`
-	ModelPrice             float64                              `json:"model_price"`
-	OwnerBy                string                               `json:"owner_by"`
-	CompletionRatio        float64                              `json:"completion_ratio"`
-	CacheRatio             *float64                             `json:"cache_ratio,omitempty"`
-	CreateCacheRatio       *float64                             `json:"create_cache_ratio,omitempty"`
-	ImageRatio             *float64                             `json:"image_ratio,omitempty"`
-	AudioRatio             *float64                             `json:"audio_ratio,omitempty"`
-	AudioCompletionRatio   *float64                             `json:"audio_completion_ratio,omitempty"`
-	EnableGroup            []string                             `json:"enable_groups"`
-	SupportedEndpointTypes []constant.EndpointType              `json:"supported_endpoint_types"`
-	BillingMode            string                               `json:"billing_mode,omitempty"`
-	BillingExpr            string                               `json:"billing_expr,omitempty"`
-	BillingUsageSchema     map[string]jsplugin.UsageFieldSchema `json:"billing_usage_schema,omitempty"`
-	BillingUsageExamples   []jsplugin.UsageExample              `json:"billing_usage_examples,omitempty"`
-	PricingVersion         string                               `json:"pricing_version,omitempty"`
+	BillingPluginVariants   []PricingPluginVariant               `json:"billing_plugin_variants,omitempty"`
+	ModelName               string                               `json:"model_name"`
+	Description             string                               `json:"description,omitempty"`
+	Icon                    string                               `json:"icon,omitempty"`
+	Tags                    string                               `json:"tags,omitempty"`
+	VendorID                int                                  `json:"vendor_id,omitempty"`
+	QuotaType               int                                  `json:"quota_type"`
+	ModelRatio              float64                              `json:"model_ratio"`
+	ModelPrice              float64                              `json:"model_price"`
+	OfficialModelRatio      *float64                             `json:"official_model_ratio,omitempty"`
+	OfficialCompletionRatio *float64                             `json:"official_completion_ratio,omitempty"`
+	OfficialModelPrice      *float64                             `json:"official_model_price,omitempty"`
+	OwnerBy                 string                               `json:"owner_by"`
+	CompletionRatio         float64                              `json:"completion_ratio"`
+	CacheRatio              *float64                             `json:"cache_ratio,omitempty"`
+	CreateCacheRatio        *float64                             `json:"create_cache_ratio,omitempty"`
+	ImageRatio              *float64                             `json:"image_ratio,omitempty"`
+	AudioRatio              *float64                             `json:"audio_ratio,omitempty"`
+	AudioCompletionRatio    *float64                             `json:"audio_completion_ratio,omitempty"`
+	EnableGroup             []string                             `json:"enable_groups"`
+	SupportedEndpointTypes  []constant.EndpointType              `json:"supported_endpoint_types"`
+	BillingMode             string                               `json:"billing_mode,omitempty"`
+	BillingExpr             string                               `json:"billing_expr,omitempty"`
+	BillingUsageSchema      map[string]jsplugin.UsageFieldSchema `json:"billing_usage_schema,omitempty"`
+	BillingUsageExamples    []jsplugin.UsageExample              `json:"billing_usage_examples,omitempty"`
+	PricingVersion          string                               `json:"pricing_version,omitempty"`
 }
 
 type PricingVendor struct {
@@ -325,6 +328,10 @@ func updatePricing() {
 
 	pricingMap = make([]Pricing, 0)
 	pluginGeneration := jsplugin.DefaultRegistry.Generation()
+	defaultPricingMaps := ratio_setting.GetDefaultPricingMaps()
+	defaultModelPrices := defaultPricingMaps["ModelPrice"]
+	defaultModelRatios := defaultPricingMaps["ModelRatio"]
+	defaultCompletionRatios := defaultPricingMaps["CompletionRatio"]
 	for model, groups := range modelGroupsMap {
 		pricing := Pricing{
 			ModelName:              model,
@@ -352,6 +359,21 @@ func updatePricing() {
 			pricing.ModelRatio = modelRatio
 			pricing.CompletionRatio = ratio_setting.GetCompletionRatio(model)
 			pricing.QuotaType = 0
+		}
+		alias := ratio_setting.FormatMatchingModelName(model)
+		if officialPrice, ok := defaultModelPrices[alias]; ok && officialPrice > 0 {
+			p := officialPrice
+			pricing.OfficialModelPrice = &p
+		} else if officialRatio, ok := defaultModelRatios[alias]; ok && officialRatio > 0 && officialRatio != 37.5 {
+			r := officialRatio
+			pricing.OfficialModelRatio = &r
+			var configuredComp *float64
+			if c, ok := defaultCompletionRatios[alias]; ok && c >= 0 {
+				v := c
+				configuredComp = &v
+			}
+			resolvedComp := ratio_setting.ResolveCompletionRatio(model, configuredComp).Ratio
+			pricing.OfficialCompletionRatio = &resolvedComp
 		}
 		if cacheRatio, ok := ratio_setting.GetCacheRatio(model); ok {
 			pricing.CacheRatio = &cacheRatio

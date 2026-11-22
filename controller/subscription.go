@@ -211,6 +211,19 @@ func AdminCreateSubscriptionPlan(c *gin.Context) {
 			return
 		}
 	}
+	req.Plan.AllowedGroups = model.NormalizeAllowedGroups(req.Plan.AllowedGroups)
+	if req.Plan.AllowedGroups != "" {
+		groupRatios := ratio_setting.GetGroupRatioCopy()
+		for grp := range strings.SplitSeq(req.Plan.AllowedGroups, ",") {
+			if grp == "*" || grp == "all" {
+				continue
+			}
+			if _, ok := groupRatios[grp]; !ok {
+				common.ApiErrorT(c, "Allowed group does not exist")
+				return
+			}
+		}
+	}
 	req.Plan.QuotaResetPeriod = model.NormalizeResetPeriod(req.Plan.QuotaResetPeriod)
 	if req.Plan.QuotaResetPeriod == model.SubscriptionResetCustom && req.Plan.QuotaResetCustomSeconds <= 0 {
 		common.ApiErrorT(c, "Custom reset cycle must be greater than 0 seconds")
@@ -285,6 +298,19 @@ func AdminUpdateSubscriptionPlan(c *gin.Context) {
 			return
 		}
 	}
+	req.Plan.AllowedGroups = model.NormalizeAllowedGroups(req.Plan.AllowedGroups)
+	if req.Plan.AllowedGroups != "" {
+		groupRatios := ratio_setting.GetGroupRatioCopy()
+		for grp := range strings.SplitSeq(req.Plan.AllowedGroups, ",") {
+			if grp == "*" || grp == "all" {
+				continue
+			}
+			if _, ok := groupRatios[grp]; !ok {
+				common.ApiErrorT(c, "Allowed group does not exist")
+				return
+			}
+		}
+	}
 	req.Plan.QuotaResetPeriod = model.NormalizeResetPeriod(req.Plan.QuotaResetPeriod)
 	if req.Plan.QuotaResetPeriod == model.SubscriptionResetCustom && req.Plan.QuotaResetCustomSeconds <= 0 {
 		common.ApiErrorT(c, "Custom reset cycle must be greater than 0 seconds")
@@ -310,6 +336,7 @@ func AdminUpdateSubscriptionPlan(c *gin.Context) {
 			"total_amount":               req.Plan.TotalAmount,
 			"upgrade_group":              req.Plan.UpgradeGroup,
 			"downgrade_group":            req.Plan.DowngradeGroup,
+			"allowed_groups":             req.Plan.AllowedGroups,
 			"quota_reset_period":         req.Plan.QuotaResetPeriod,
 			"quota_reset_custom_seconds": req.Plan.QuotaResetCustomSeconds,
 			"updated_at":                 common.GetTimestamp(),

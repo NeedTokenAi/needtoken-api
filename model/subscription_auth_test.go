@@ -149,3 +149,116 @@ func TestSubscriptionGroupCacheRefreshFailureDoesNotChangeCommittedResult(t *tes
 	require.NoError(t, DB.Where("user_id = ?", user.Id).First(&subscription).Error)
 	assert.Equal(t, "active", subscription.Status)
 }
+
+func TestSubscriptionAllowedGroupsIsolationAndPriority(t *testing.T) {
+	previousDB, previousLogDB := DB, LOG_DB
+	previousMainDatabaseType, previousLogDatabaseType := common.MainDatabaseType(), common.LogDatabaseType()
+	common.SetDatabaseTypes(common.DatabaseTypeSQLite, common.DatabaseTypeSQLite)
+	dsn := fmt.Sprintf("file:%s?mode=memory&cache=shared", strings.ReplaceAll(t.Name(), "/", "_"))
+	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
+	require.NoError(t, err)
+	DB, LOG_DB = db, db
+	require.NoError(t, db.AutoMigrate(&User{}, &SubscriptionPlan{}, &UserSubscription{}, &SubscriptionPreConsumeRecord{}))
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(4)
+	t.Cleanup(func() {
+		DB, LOG_DB = previousDB, previousLogDB
+		common.SetDatabaseTypes(previousMainDatabaseType, previousLogDatabaseType)
+		_ = sqlDB.Close()
+	})
+
+	user := User{
+		Username:    "multi-plan-user",
+		Password:    "unused-password-hash",
+		Role:        common.RoleCommonUser,
+		Status:      common.UserStatusEnabled,
+		Group:       "default",
+		AuthVersion: 1,
+	}
+	require.NoError(t, DB.Create(&user).Error)
+
+	allowTrue := true
+	allowFalse := false
+	claudePlan := &SubscriptionPlan{
+		Title:               "Claude Dedicated x2",
+		DurationUnit:        SubscriptionDurationMonth,
+		DurationValue:       1,
+		TotalAmount:         100,
+		AllowedGroups:       " claude-pool , claude-pool ",
+		AllowWalletOverflow: &allowFalse,
+		Enabled:             true,
+	}
+	openaiPlan := &SubscriptionPlan{
+		Title:               "OpenAI Dedicated x2",
+		DurationUnit:        SubscriptionDurationMonth,
+		DurationValue:       1,
+		TotalAmount:         80,
+		AllowedGroups:       "openai-pool",
+		AllowWalletOverflow: &allowTrue,
+		Enabled:             true,
+	}
+	mixedPlan := &SubscriptionPlan{
+		Title:               "Mixed All Models x2",
+		DurationUnit:        SubscriptionDurationMonth,
+		DurationValue:       1,
+		TotalAmount:         200,
+		AllowedGroups:       "",
+		AllowWalletOverflow: &allowTrue,
+		Enabled:             true,
+	}
+	require.NoError(t, DB.Create(claudePlan).Error)
+	require.NoError(t, DB.Create(openaiPlan).Error)
+	require.NoError(t, DB.Create(mixedPlan).Error)
+
+	claudeSub, err := CreateUserSubscriptionFromPlanTx(DB, user.Id, claudePlan, "test")
+	require.NoError(t, err)
+	assert.Equal(t, "claude-pool", claudeSub.AllowedGroups)
+
+	openaiSub, err := CreateUserSubscriptionFromPlanTx(DB, user.Id, openaiPlan, "test")
+	require.NoError(t, err)
+	assert.Equal(t, "openai-pool", openaiSub.AllowedGroups)
+
+	hasGemini, err := HasActiveUserSubscriptionForGroup(user.Id, "gemini-pool")
+	require.NoError(t, err)
+	assert.False(t, hasGemini)
+	geminiOverflow, err := UserActiveSubscriptionsAllowWalletOverflowForGroup(user.Id, "gemini-pool")
+	require.NoError(t, err)
+	assert.True(t, geminiOverflow)
+
+	claudeOverflow, err := UserActiveSubscriptionsAllowWalletOverflowForGroup(user.Id, "claude-pool")
+	require.NoError(t, err)
+	assert.False(t, claudeOverflow)
+
+	openaiOverflow, err := UserActiveSubscriptionsAllowWalletOverflowForGroup(user.Id, "openai-pool")
+	require.NoError(t, err)
+	assert.True(t, openaiOverflow)
+
+	mixedSub, err := CreateUserSubscriptionFromPlanTx(DB, user.Id, mixedPlan, "test")
+	require.NoError(t, err)
+	require.NoError(t, DB.Model(&UserSubscription{}).Where("id = ?", mixedSub.Id).Update("end_time", openaiSub.EndTime-3600).Error)
+
+	res1, err := PreConsumeUserSubscriptionForGroup("req-openai-1", user.Id, "gpt-5.4", "openai-pool", 0, 50)
+	require.NoError(t, err)
+	assert.Equal(t, openaiSub.Id, res1.UserSubscriptionId)
+
+	res2, err := PreConsumeUserSubscriptionForGroup("req-openai-2", user.Id, "gpt-5.4", "openai-pool", 0, 60)
+	require.NoError(t, err)
+	assert.Equal(t, mixedSub.Id, res2.UserSubscriptionId)
+
+	res3, err := PreConsumeUserSubscriptionForGroup("req-claude-1", user.Id, "claude-opus-4-6", "claude-pool", 0, 40)
+	require.NoError(t, err)
+	assert.Equal(t, claudeSub.Id, res3.UserSubscriptionId)
+
+	res4, err := PreConsumeUserSubscriptionForGroup("req-gemini-1", user.Id, "gemini-2.5-pro", "gemini-pool", 0, 30)
+	require.NoError(t, err)
+	assert.Equal(t, mixedSub.Id, res4.UserSubscriptionId)
+
+	var gotClaude, gotOpenAI, gotMixed UserSubscription
+	require.NoError(t, DB.First(&gotClaude, claudeSub.Id).Error)
+	require.NoError(t, DB.First(&gotOpenAI, openaiSub.Id).Error)
+	require.NoError(t, DB.First(&gotMixed, mixedSub.Id).Error)
+	assert.EqualValues(t, 40, gotClaude.AmountUsed)
+	assert.EqualValues(t, 50, gotOpenAI.AmountUsed)
+	assert.EqualValues(t, 90, gotMixed.AmountUsed)
+}
