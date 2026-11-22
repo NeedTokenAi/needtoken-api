@@ -229,6 +229,13 @@ func SetApiRouter(router *gin.Engine) {
 		apiRouter.PUT("/subscription/admin/needtoken-users/:id", middleware.CriticalRateLimit(), middleware.DisableCache(), controller.OpsUpdateNeedTokenUser)
 		apiRouter.DELETE("/subscription/admin/needtoken-users/:id", middleware.CriticalRateLimit(), middleware.DisableCache(), controller.OpsDeleteNeedTokenUser)
 		apiRouter.DELETE("/subscription/admin/needtoken-users/:id/2fa", middleware.CriticalRateLimit(), middleware.DisableCache(), controller.OpsDisableNeedTokenUser2FA)
+		// HMAC-authenticated NeedToken member console endpoints for storefront member center
+		apiRouter.GET("/subscription/admin/needtoken-console/users/:id/tokens", middleware.DisableCache(), controller.MemberConsoleListTokens)
+		apiRouter.POST("/subscription/admin/needtoken-console/users/:id/tokens", middleware.CriticalRateLimit(), middleware.DisableCache(), controller.MemberConsoleCreateToken)
+		apiRouter.PUT("/subscription/admin/needtoken-console/users/:id/tokens/:token_id", middleware.CriticalRateLimit(), middleware.DisableCache(), controller.MemberConsoleUpdateToken)
+		apiRouter.DELETE("/subscription/admin/needtoken-console/users/:id/tokens/:token_id", middleware.CriticalRateLimit(), middleware.DisableCache(), controller.MemberConsoleDeleteToken)
+		apiRouter.GET("/subscription/admin/needtoken-console/users/:id/logs", middleware.DisableCache(), controller.MemberConsoleListLogs)
+		apiRouter.GET("/subscription/admin/needtoken-console/users/:id/usage", middleware.DisableCache(), controller.MemberConsoleUsage)
 
 		// Subscription payment callbacks (no auth)
 		apiRouter.POST("/subscription/epay/notify", anonymousRequestBodyLimit, controller.SubscriptionEpayNotify)

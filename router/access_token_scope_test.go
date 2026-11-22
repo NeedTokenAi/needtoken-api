@@ -77,6 +77,12 @@ var accessTokenExemptRoutes = []string{
 	"PUT /api/subscription/admin/needtoken-users/:id",
 	"DELETE /api/subscription/admin/needtoken-users/:id",
 	"DELETE /api/subscription/admin/needtoken-users/:id/2fa",
+	"GET /api/subscription/admin/needtoken-console/users/:id/tokens",
+	"POST /api/subscription/admin/needtoken-console/users/:id/tokens",
+	"PUT /api/subscription/admin/needtoken-console/users/:id/tokens/:token_id",
+	"DELETE /api/subscription/admin/needtoken-console/users/:id/tokens/:token_id",
+	"GET /api/subscription/admin/needtoken-console/users/:id/logs",
+	"GET /api/subscription/admin/needtoken-console/users/:id/usage",
 
 	// API key authentication (TokenAuthReadOnly).
 	"GET /api/usage/token/",
