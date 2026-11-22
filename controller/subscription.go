@@ -155,7 +155,11 @@ func AdminCreateSubscriptionPlan(c *gin.Context) {
 		return
 	}
 
-	var req AdminUpsertSubscriptionPlanRequest
+	req := AdminUpsertSubscriptionPlanRequest{
+		Plan: model.SubscriptionPlan{
+			Enabled: true,
+		},
+	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		common.ApiErrorT(c, "Invalid parameters")
 		return
@@ -229,7 +233,21 @@ func AdminCreateSubscriptionPlan(c *gin.Context) {
 		common.ApiErrorT(c, "Custom reset cycle must be greater than 0 seconds")
 		return
 	}
-	err := model.DB.Create(&req.Plan).Error
+	wantDisabled := !req.Plan.Enabled
+	err := model.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(&req.Plan).Error; err != nil {
+			return err
+		}
+		// GORM omits Go zero-value bool (false) and writes back default:true onto the struct,
+		// so persist an explicit disabled state inside the same transaction.
+		if wantDisabled {
+			if err := tx.Model(&req.Plan).Update("enabled", false).Error; err != nil {
+				return err
+			}
+			req.Plan.Enabled = false
+		}
+		return nil
+	})
 	if err != nil {
 		common.ApiError(c, err)
 		return
