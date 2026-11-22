@@ -178,6 +178,12 @@ func SetApiRouter(router *gin.Engine) {
 				// Admin 2FA routes
 				adminRoute.GET("/2fa/stats", controller.Admin2FAStats)
 				adminRoute.DELETE("/:id/2fa", controller.AdminDisable2FA)
+
+				// NeedToken admin user token management
+				adminRoute.GET("/:id/tokens", middleware.DisableCache(), controller.AdminGetUserTokens)
+				adminRoute.POST("/:id/tokens", middleware.DisableCache(), controller.AdminCreateUserToken)
+				adminRoute.PUT("/:id/tokens/:token_id", middleware.DisableCache(), controller.AdminUpdateUserToken)
+				adminRoute.DELETE("/:id/tokens/:token_id", middleware.DisableCache(), controller.AdminDeleteUserToken)
 			}
 		}
 

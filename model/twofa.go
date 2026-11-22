@@ -62,6 +62,44 @@ func IsTwoFAEnabled(userId int) (bool, error) {
 	return twoFA != nil && twoFA.IsEnabled, nil
 }
 
+// GetTwoFAEnabledUserIDs 批量查询指定用户集合中已启用 2FA 的用户 ID，仅查询 user_id 列。
+func GetTwoFAEnabledUserIDs(userIDs []int) (map[int]bool, error) {
+	result := make(map[int]bool)
+	if len(userIDs) == 0 {
+		return result, nil
+	}
+	uniqueIDs := make([]int, 0, len(userIDs))
+	seen := make(map[int]struct{}, len(userIDs))
+	for _, id := range userIDs {
+		if id <= 0 {
+			continue
+		}
+		if _, exists := seen[id]; exists {
+			continue
+		}
+		seen[id] = struct{}{}
+		uniqueIDs = append(uniqueIDs, id)
+	}
+	if len(uniqueIDs) == 0 {
+		return result, nil
+	}
+
+	const batchSize = 500
+	for start := 0; start < len(uniqueIDs); start += batchSize {
+		end := min(start+batchSize, len(uniqueIDs))
+		var enabledIDs []int
+		if err := DB.Model(&TwoFA{}).
+			Where("user_id IN ? AND is_enabled = ?", uniqueIDs[start:end], true).
+			Pluck("user_id", &enabledIDs).Error; err != nil {
+			return nil, err
+		}
+		for _, id := range enabledIDs {
+			result[id] = true
+		}
+	}
+	return result, nil
+}
+
 func (t *TwoFA) updateUsageState() error {
 	if t.Id == 0 {
 		return errors.New("2FA record ID is empty")
