@@ -116,12 +116,15 @@ test("new-api preserves C-side endpoints while blocking admin UI and admin APIs 
     new Request("https://api.example/setup"),
     new Request("https://api.example/usage-logs/audit"),
     new Request("https://api.example/api/option/"),
+    new Request("https://api.example/api/option/", { method: "PUT" }),
+    new Request("https://api.example/api/option/payment_compliance", { method: "POST" }),
     new Request("https://api.example/api/performance/stats"),
     new Request("https://api.example/api/models/"),
     new Request("https://api.example/api/models/search"),
     new Request("https://api.example/api/models", { method: "POST" }),
     new Request("https://api.example/api/log/"),
     new Request("https://api.example/api/data/"),
+    new Request("https://api.example/api/data/users"),
     new Request("https://api.example/api/audit"),
     new Request("https://api.example/api/task"),
     new Request("https://api.example/api/user/topup"),
@@ -149,27 +152,36 @@ test("internal secret unlocks exact glue/ops admin APIs only and never pure admi
   const headers = { [EDGE_ADMIN_HEADER]: TEST_SECRET };
 
   for (const allowedInternal of [
-    "https://api.example/api/subscription/admin/fulfillment",
-    "https://api.example/api/subscription/admin/needtoken-member",
-    "https://api.example/api/redemption/fulfillment",
-    "https://api.example/api/channel/",
-    "https://api.example/api/channel/test/7",
-    "https://api.example/api/group/",
-    "https://api.example/api/user/?p=0&page_size=50",
-    "https://api.example/api/user/search?keyword=test",
+    new Request("https://api.example/api/subscription/admin/fulfillment", { headers }),
+    new Request("https://api.example/api/subscription/admin/needtoken-member", { headers }),
+    new Request("https://api.example/api/redemption/fulfillment", { headers }),
+    new Request("https://api.example/api/channel/", { headers }),
+    new Request("https://api.example/api/channel/test/7", { headers }),
+    new Request("https://api.example/api/group/", { headers }),
+    new Request("https://api.example/api/user/?p=0&page_size=50", { headers }),
+    new Request("https://api.example/api/user/search?keyword=test", { headers }),
+    new Request("https://api.example/api/option/", { method: "GET", headers }),
+    new Request("https://api.example/api/option/", { method: "PUT", headers }),
+    new Request("https://api.example/api/data/users?start_timestamp=1&end_timestamp=2", { method: "GET", headers }),
   ]) {
-    const res = await handleEdgeAdminGate(new Request(allowedInternal, { headers }), env, sql);
-    assert.equal(res.allow, true, `expected internal allow for ${allowedInternal}`);
+    const res = await handleEdgeAdminGate(allowedInternal, env, sql);
+    assert.equal(res.allow, true, `expected internal allow for ${allowedInternal.method} ${allowedInternal.url}`);
   }
 
-  // Even with internal secret, pure root/UI endpoints stay closed unless a break-glass cookie is issued.
+  // Even with internal secret, pure root/UI endpoints and option/data sub-paths stay closed unless a break-glass cookie is issued.
   for (const stillBlocked of [
-    "https://api.example/system-settings",
-    "https://api.example/api/option/",
-    "https://api.example/api/performance/stats",
+    new Request("https://api.example/system-settings", { headers }),
+    new Request("https://api.example/api/option/", { method: "POST", headers }),
+    new Request("https://api.example/api/option/", { method: "DELETE", headers }),
+    new Request("https://api.example/api/option/payment_compliance", { method: "POST", headers }),
+    new Request("https://api.example/api/option/model_pricing", { method: "GET", headers }),
+    new Request("https://api.example/api/data/", { method: "GET", headers }),
+    new Request("https://api.example/api/data/users", { method: "POST", headers }),
+    new Request("https://api.example/api/data/flow", { method: "GET", headers }),
+    new Request("https://api.example/api/performance/stats", { headers }),
   ]) {
-    const res = await handleEdgeAdminGate(new Request(stillBlocked, { headers }), env, sql);
-    assert.equal(res.response?.status, 404, `expected 404 for ${stillBlocked}`);
+    const res = await handleEdgeAdminGate(stillBlocked, env, sql);
+    assert.equal(res.response?.status, 404, `expected 404 for ${stillBlocked.method} ${stillBlocked.url}`);
   }
 
   // Break-glass ticket unlocks admin UI and root APIs for that browser only, and revokes cleanly.
@@ -192,7 +204,7 @@ test("internal secret unlocks exact glue/ops admin APIs only and never pure admi
   assert.equal(cookiePair.startsWith(`${EDGE_ADMIN_COOKIE}=`), true);
 
   const adminPage = await handleEdgeAdminGate(
-    new Request("https://api.example/api/option/", { headers: { cookie: cookiePair } }),
+    new Request("https://api.example/api/option/payment_compliance", { method: "POST", headers: { cookie: cookiePair } }),
     env,
     sql,
     () => now,
@@ -206,7 +218,7 @@ test("internal secret unlocks exact glue/ops admin APIs only and never pure admi
     () => now,
   );
   const afterRevoke = await handleEdgeAdminGate(
-    new Request("https://api.example/api/option/", { headers: { cookie: cookiePair } }),
+    new Request("https://api.example/api/option/payment_compliance", { method: "POST", headers: { cookie: cookiePair } }),
     env,
     sql,
     () => now,
@@ -216,9 +228,11 @@ test("internal secret unlocks exact glue/ops admin APIs only and never pure admi
 
 test("zero-downtime rollout allows whitelisted internal APIs only when secret is unset unless enforced", async () => {
   const sql = createMockSql();
-  // Secret unset: pure admin UI & root APIs are already 404, internal whitelist passes to avoid outage.
+  // Secret unset: pure admin UI, root APIs, and strict internal ops APIs are ALWAYS 404 (fail-closed).
   assert.equal((await handleEdgeAdminGate(new Request("https://api.example/system-settings"), {}, sql)).response?.status, 404);
   assert.equal((await handleEdgeAdminGate(new Request("https://api.example/api/option/"), {}, sql)).response?.status, 404);
+  assert.equal((await handleEdgeAdminGate(new Request("https://api.example/api/option/", { method: "PUT" }), {}, sql)).response?.status, 404);
+  assert.equal((await handleEdgeAdminGate(new Request("https://api.example/api/data/users"), {}, sql)).response?.status, 404);
   assert.equal((await handleEdgeAdminGate(new Request("https://api.example/api/channel/"), {}, sql)).allow, true);
 
   // When EDGE_ADMIN_ENFORCE_API=1 without secret, fail closed.
