@@ -225,6 +225,10 @@ func SetApiRouter(router *gin.Engine) {
 		// HMAC-authenticated NeedToken member provisioning & SLO revocation (edge-gated under /api/subscription/admin, outside AdminAuth PAT scope)
 		apiRouter.POST("/subscription/admin/needtoken-member", middleware.CriticalRateLimit(), middleware.DisableCache(), controller.ProvisionNeedTokenMember)
 		apiRouter.POST("/subscription/admin/needtoken-slo-revoke", middleware.CriticalRateLimit(), middleware.DisableCache(), controller.RevokeNeedTokenSessions)
+		apiRouter.POST("/subscription/admin/needtoken-users", middleware.CriticalRateLimit(), middleware.DisableCache(), controller.OpsCreateNeedTokenUser)
+		apiRouter.PUT("/subscription/admin/needtoken-users/:id", middleware.CriticalRateLimit(), middleware.DisableCache(), controller.OpsUpdateNeedTokenUser)
+		apiRouter.DELETE("/subscription/admin/needtoken-users/:id", middleware.CriticalRateLimit(), middleware.DisableCache(), controller.OpsDeleteNeedTokenUser)
+		apiRouter.DELETE("/subscription/admin/needtoken-users/:id/2fa", middleware.CriticalRateLimit(), middleware.DisableCache(), controller.OpsDisableNeedTokenUser2FA)
 
 		// Subscription payment callbacks (no auth)
 		apiRouter.POST("/subscription/epay/notify", anonymousRequestBodyLimit, controller.SubscriptionEpayNotify)
