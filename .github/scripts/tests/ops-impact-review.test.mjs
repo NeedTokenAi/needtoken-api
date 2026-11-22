@@ -3,11 +3,14 @@ import test from "node:test";
 
 import {
   COMMENT_MARKER,
+  buildPrClosedPayload,
   buildStaticImpactAssessment,
   callAiGateway,
   classifyDbMigrationRisk,
   classifyReleasePRKind,
+  normalizeReleaseTag,
   parseAiReviewJson,
+  parseArgs,
   postOpsWebhook,
   renderPrCommentMarkdown,
   resolveAiCandidateModels,
@@ -259,13 +262,35 @@ test("redacts secrets in ai_error_detail, logs error, and renders sanitized summ
   assert.equal(md.includes("AIzaSyDummySecretKey"), false);
 });
 
-test("only dispatches Ops release governance webhook for upstream sync and rollback PRs", () => {
+test("parses empty --tag safely without turning into 'true' and tracks dual-track PR lifecycle", () => {
+  const parsed = parseArgs(["--mode", "pr", "--tag", "", "--head-ref", "feat/sso-ticket", "--flag-only"]);
+  assert.equal(parsed.tag, "");
+  assert.equal(parsed["head-ref"], "feat/sso-ticket");
+  assert.equal(parsed["flag-only"], "true");
+
+  assert.equal(normalizeReleaseTag(""), "");
+  assert.equal(normalizeReleaseTag("true"), "");
+  assert.equal(normalizeReleaseTag("v1.0.0"), "v1.0.0");
+
   assert.equal(classifyReleasePRKind("sync/upstream/abcdef", "pr"), "upstream_sync");
   assert.equal(classifyReleasePRKind("rollback/bad-merge", "pr"), "rollback");
-  assert.equal(classifyReleasePRKind("feat/custom-work", "pr"), "internal");
+  assert.equal(classifyReleasePRKind("feat/custom-work", "pr"), "custom_dev");
   assert.equal(classifyReleasePRKind("feat/custom-work", "conflict"), "upstream_sync");
+
   assert.equal(shouldNotifyOpsWebhook({ mode: "pr", headRef: "sync/upstream/1234" }), true);
-  assert.equal(shouldNotifyOpsWebhook({ mode: "pr", headRef: "rollback/1234" }), true);
-  assert.equal(shouldNotifyOpsWebhook({ mode: "pr", headRef: "feat/local-feature" }), false);
+  assert.equal(shouldNotifyOpsWebhook({ mode: "pr", headRef: "feat/local-feature" }), true);
+  assert.equal(shouldNotifyOpsWebhook({ mode: "closed", headRef: "feat/local-feature" }), true);
   assert.equal(shouldNotifyOpsWebhook({ mode: "pr", headRef: "sync/upstream/1234", skipWebhook: true }), false);
+
+  const closed = buildPrClosedPayload({
+    moduleName: "newapi",
+    repo: "NeedTokenAi/needtoken-api",
+    prNumber: 18,
+    prMerged: true,
+    mergeSha: "15319d62a00112233445566778899aabbccddeeff".slice(0, 40),
+    headRef: "feat/sso-ticket",
+  });
+  assert.equal(closed.event, "pr_closed");
+  assert.equal(closed.pr_kind, "custom_dev");
+  assert.equal(closed.pr_state, "merged");
 });
