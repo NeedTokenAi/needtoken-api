@@ -6,11 +6,13 @@ import {
   buildStaticImpactAssessment,
   callAiGateway,
   classifyDbMigrationRisk,
+  classifyReleasePRKind,
   parseAiReviewJson,
   postOpsWebhook,
   renderPrCommentMarkdown,
   resolveAiCandidateModels,
   sanitizeAiErrorDetail,
+  shouldNotifyOpsWebhook,
   signWebhookPayload,
 } from "../ops-impact-review.mjs";
 
@@ -255,4 +257,15 @@ test("redacts secrets in ai_error_detail, logs error, and renders sanitized summ
   });
   assert.equal(md.includes("AI 诊断摘要"), true);
   assert.equal(md.includes("AIzaSyDummySecretKey"), false);
+});
+
+test("only dispatches Ops release governance webhook for upstream sync and rollback PRs", () => {
+  assert.equal(classifyReleasePRKind("sync/upstream/abcdef", "pr"), "upstream_sync");
+  assert.equal(classifyReleasePRKind("rollback/bad-merge", "pr"), "rollback");
+  assert.equal(classifyReleasePRKind("feat/custom-work", "pr"), "internal");
+  assert.equal(classifyReleasePRKind("feat/custom-work", "conflict"), "upstream_sync");
+  assert.equal(shouldNotifyOpsWebhook({ mode: "pr", headRef: "sync/upstream/1234" }), true);
+  assert.equal(shouldNotifyOpsWebhook({ mode: "pr", headRef: "rollback/1234" }), true);
+  assert.equal(shouldNotifyOpsWebhook({ mode: "pr", headRef: "feat/local-feature" }), false);
+  assert.equal(shouldNotifyOpsWebhook({ mode: "pr", headRef: "sync/upstream/1234", skipWebhook: true }), false);
 });
