@@ -218,6 +218,15 @@ export function classifyNewApiRequest(method, normalized) {
     return "internal_admin_api";
   }
 
+  // 1b. Strict internal Admin APIs used by needtoken ops (brand/groups options & user rankings).
+  // Never fall back to open access when EDGE_ADMIN_SECRET is unset; sub-paths remain admin_only.
+  if (
+    (path === "/api/option" && (upperMethod === "GET" || upperMethod === "PUT")) ||
+    (path === "/api/data/users" && upperMethod === "GET")
+  ) {
+    return "strict_internal_admin_api";
+  }
+
   // 2. Pure admin SPA pages (never required by C-side or glue/ops)
   for (const prefix of ADMIN_UI_PREFIXES) {
     if (matchesPrefix(path, prefix)) return "admin_only";
@@ -608,6 +617,13 @@ export async function handleEdgeAdminGate(request, env, storageSql, nowFn = Date
   const secret = getConfiguredSecret(env);
   if (await hasValidBreakGlassCookie(request, secret, store, nowMs)) {
     return { allow: true };
+  }
+
+  if (category === "strict_internal_admin_api") {
+    if (secret && (await hasValidInternalSecret(request, secret))) {
+      return { allow: true };
+    }
+    return { response: notFoundResponse() };
   }
 
   if (category === "internal_admin_api") {
