@@ -74,7 +74,7 @@ test("new-api preserves C-side endpoints while blocking admin UI and admin APIs 
   const sql = createMockSql();
   const env = { EDGE_ADMIN_SECRET: TEST_SECRET };
 
-  // Public C-side pages, relay, and user self APIs remain open.
+  // Public C-side APIs, relay, and linking callbacks remain open; legacy UI pages require DISABLE_PUBLIC_CONSOLE="0".
   const publicRequests = [
     new Request("https://api.example/v1/chat/completions", { method: "POST" }),
     new Request("https://api.example/api/status"),
@@ -96,9 +96,7 @@ test("new-api preserves C-side endpoints while blocking admin UI and admin APIs 
     new Request("https://api.example/api/task/task_123/artifacts"),
     new Request("https://api.example/api/subscription/plans"),
     new Request("https://api.example/api/subscription/self"),
-    new Request("https://api.example/dashboard"),
     new Request("https://api.example/oauth"),
-    new Request("https://api.example/wallet"),
     new Request("https://api.example/account-link"),
   ];
   for (const req of publicRequests) {
@@ -248,10 +246,14 @@ test("edge secrets are filtered from container env and stripped before forwardin
     EDGE_ADMIN_SECRET: TEST_SECRET,
     DISABLE_PUBLIC_ADMIN: "1",
     REDIRECT_ROOT_TO_CONSOLE: "1",
+    DISABLE_PUBLIC_CONSOLE: "1",
+    STOREFRONT_CONSOLE_ORIGIN: "https://needtoken.ai",
   });
   assert.equal(Object.hasOwn(env, "EDGE_ADMIN_SECRET"), false);
   assert.equal(Object.hasOwn(env, "DISABLE_PUBLIC_ADMIN"), false);
   assert.equal(Object.hasOwn(env, "REDIRECT_ROOT_TO_CONSOLE"), false);
+  assert.equal(Object.hasOwn(env, "DISABLE_PUBLIC_CONSOLE"), false);
+  assert.equal(Object.hasOwn(env, "STOREFRONT_CONSOLE_ORIGIN"), false);
 
   const fwd = containerRequest(new Request("https://api.example/api/channel/", {
     headers: { [EDGE_ADMIN_HEADER]: TEST_SECRET, authorization: "Bearer nap_x" },
@@ -260,41 +262,68 @@ test("edge secrets are filtered from container env and stripped before forwardin
   assert.equal(fwd.headers.get("authorization"), "Bearer nap_x");
 });
 
-test("public root GET and HEAD redirect 302 to /dashboard unless disabled or break-glass unlocked", async () => {
+test("public console web routes redirect 302 to storefront member center unless opted out or break-glass unlocked", async () => {
   const sql = createMockSql();
   const env = { EDGE_ADMIN_SECRET: TEST_SECRET };
 
-  for (const req of [
-    new Request("https://api.example/"),
-    new Request("https://api.example/", { method: "HEAD" }),
-    new Request("https://api.example/?utm_source=storefront"),
-  ]) {
-    const res = await handleEdgeAdminGate(req, env, sql);
-    assert.equal(res.response?.status, 302, `expected 302 for ${req.method} ${req.url}`);
-    assert.equal(res.response.headers.get("location"), CONSOLE_ENTRY_PATH);
+  const redirectCases = [
+    ["https://api.example/", "https://needtoken.ai/me"],
+    ["https://api.example/dashboard", "https://needtoken.ai/me"],
+    ["https://api.example/sign-in", "https://needtoken.ai/auth/login?redirect=%2Fme"],
+    ["https://api.example/login", "https://needtoken.ai/auth/login?redirect=%2Fme"],
+    ["https://api.example/keys", "https://needtoken.ai/me/keys"],
+    ["https://api.example/logs", "https://needtoken.ai/me/usage"],
+    ["https://api.example/usage", "https://needtoken.ai/me/usage"],
+    ["https://api.example/topup", "https://needtoken.ai/me/assets"],
+    ["https://api.example/subscription", "https://needtoken.ai/plans"],
+    ["https://api.example/pricing", "https://needtoken.ai/models"],
+  ];
+  for (const [url, expectedLocation] of redirectCases) {
+    const res = await handleEdgeAdminGate(new Request(url), env, sql);
+    assert.equal(res.response?.status, 302, `expected 302 for ${url}`);
+    assert.equal(res.response.headers.get("location"), expectedLocation);
     assert.equal(res.response.headers.get("cache-control"), "no-store");
   }
 
-  // Non-root routes stay unaffected.
+  // AI protocol, public API, internal console API, and static assets stay unaffected.
   for (const req of [
-    new Request("https://api.example/dashboard"),
     new Request("https://api.example/v1/models"),
+    new Request("https://api.example/v1/chat/completions", { method: "POST" }),
     new Request("https://api.example/api/status"),
-    new Request("https://api.example/oauth?redirect=/dashboard"),
+    new Request("https://api.example/api/pricing"),
+    new Request("https://api.example/assets/index.js"),
+    new Request("https://api.example/api/subscription/admin/needtoken-console/users/7/tokens", {
+      headers: { [EDGE_ADMIN_HEADER]: TEST_SECRET },
+    }),
   ]) {
     const res = await handleEdgeAdminGate(req, env, sql);
-    assert.equal(res.allow, true, `expected allow for ${req.url}`);
+    assert.equal(res.allow, true, `expected allow for ${req.method} ${req.url}`);
   }
 
-  // Opt-out via REDIRECT_ROOT_TO_CONSOLE="0" allows root through.
-  const disabledRes = await handleEdgeAdminGate(
+  // Opt-out via DISABLE_PUBLIC_CONSOLE="0" restores legacy console behavior (root -> /dashboard, /dashboard allowed).
+  const legacyRoot = await handleEdgeAdminGate(
     new Request("https://api.example/"),
-    { ...env, REDIRECT_ROOT_TO_CONSOLE: "0" },
+    { ...env, DISABLE_PUBLIC_CONSOLE: "0" },
     sql,
   );
-  assert.equal(disabledRes.allow, true);
+  assert.equal(legacyRoot.response?.status, 302);
+  assert.equal(legacyRoot.response.headers.get("location"), CONSOLE_ENTRY_PATH);
 
-  // Valid break-glass cookie bypasses root redirect for emergency inspection.
+  const legacyDash = await handleEdgeAdminGate(
+    new Request("https://api.example/dashboard"),
+    { ...env, DISABLE_PUBLIC_CONSOLE: "0" },
+    sql,
+  );
+  assert.equal(legacyDash.allow, true);
+
+  const legacyNoRootRedirect = await handleEdgeAdminGate(
+    new Request("https://api.example/"),
+    { ...env, DISABLE_PUBLIC_CONSOLE: "0", REDIRECT_ROOT_TO_CONSOLE: "0" },
+    sql,
+  );
+  assert.equal(legacyNoRootRedirect.allow, true);
+
+  // Valid break-glass cookie bypasses public console redirect for emergency admin access.
   const now = 1_700_000_000_000;
   const issue = await handleEdgeAdminGate(
     new Request("https://api.example/__needtoken_edge/admin-gate/ticket", {
@@ -310,11 +339,13 @@ test("public root GET and HEAD redirect 302 to /dashboard unless disabled or bre
   const unlock = await handleEdgeAdminGate(new Request(`https://api.example${unlockPath}`), env, sql, () => now);
   const cookiePair = unlock.response.headers.get("set-cookie").split(";")[0];
 
-  const breakGlassRoot = await handleEdgeAdminGate(
-    new Request("https://api.example/", { headers: { cookie: cookiePair } }),
-    env,
-    sql,
-    () => now,
-  );
-  assert.equal(breakGlassRoot.allow, true);
+  for (const url of ["https://api.example/", "https://api.example/sign-in", "https://api.example/dashboard"]) {
+    const breakGlass = await handleEdgeAdminGate(
+      new Request(url, { headers: { cookie: cookiePair } }),
+      env,
+      sql,
+      () => now,
+    );
+    assert.equal(breakGlass.allow, true, `expected break-glass allow for ${url}`);
+  }
 });

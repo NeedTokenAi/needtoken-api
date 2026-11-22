@@ -5,6 +5,7 @@ export const EDGE_ADMIN_COOKIE = "__Host-nt-edge-admin";
 export const EDGE_CONTROL_PREFIX = "/__needtoken_edge";
 export const ADMIN_ENTRY_PATH = "/system-settings";
 export const CONSOLE_ENTRY_PATH = "/dashboard";
+export const DEFAULT_STOREFRONT_CONSOLE_ORIGIN = "https://needtoken.ai";
 export const MIN_SECRET_LENGTH = 32;
 export const TICKET_TTL_SECONDS = 60;
 export const MIN_SESSION_TTL_MINUTES = 5;
@@ -18,6 +19,8 @@ const EDGE_ONLY_ENV_KEYS = new Set([
   "DISABLE_PUBLIC_ADMIN",
   "EDGE_ADMIN_ENFORCE_API",
   "REDIRECT_ROOT_TO_CONSOLE",
+  "DISABLE_PUBLIC_CONSOLE",
+  "STOREFRONT_CONSOLE_ORIGIN",
 ]);
 
 const textEncoder = new TextEncoder();
@@ -121,6 +124,95 @@ export function isPublicAdminDisabled(env) {
 
 export function isRootRedirectToConsoleEnabled(env) {
   return env?.REDIRECT_ROOT_TO_CONSOLE !== "0";
+}
+
+export function isPublicConsoleDisabled(env) {
+  return env?.DISABLE_PUBLIC_CONSOLE !== "0";
+}
+
+function getStorefrontConsoleOrigin(env) {
+  const raw = typeof env?.STOREFRONT_CONSOLE_ORIGIN === "string" ? env.STOREFRONT_CONSOLE_ORIGIN.trim() : "";
+  if (raw) {
+    try {
+      const parsed = new URL(raw);
+      if (parsed.protocol === "https:" || parsed.protocol === "http:") {
+        return parsed.origin;
+      }
+    } catch {
+      // Fallback to default origin below.
+    }
+  }
+  return DEFAULT_STOREFRONT_CONSOLE_ORIGIN;
+}
+
+const PUBLIC_CONSOLE_UI_PREFIXES = [
+  "/sign-in",
+  "/login",
+  "/register",
+  "/sign-up",
+  "/forgot-password",
+  "/reset",
+  "/otp",
+  "/dashboard",
+  "/console",
+  "/keys",
+  "/token",
+  "/logs",
+  "/usage",
+  "/usage-logs",
+  "/topup",
+  "/billing",
+  "/wallet",
+  "/subscription",
+  "/plans",
+  "/pricing",
+  "/detail",
+  "/playground",
+  "/chat",
+  "/midjourney",
+  "/task",
+  "/setting",
+  "/personal",
+  "/about",
+];
+
+export function resolvePublicConsoleRedirectTarget(lowerPath, env) {
+  const origin = getStorefrontConsoleOrigin(env);
+  if (
+    matchesPrefix(lowerPath, "/sign-in") ||
+    matchesPrefix(lowerPath, "/login") ||
+    matchesPrefix(lowerPath, "/register") ||
+    matchesPrefix(lowerPath, "/sign-up") ||
+    matchesPrefix(lowerPath, "/forgot-password") ||
+    matchesPrefix(lowerPath, "/reset") ||
+    matchesPrefix(lowerPath, "/otp")
+  ) {
+    return `${origin}/auth/login?redirect=%2Fme`;
+  }
+  if (matchesPrefix(lowerPath, "/keys") || matchesPrefix(lowerPath, "/token")) {
+    return `${origin}/me/keys`;
+  }
+  if (matchesPrefix(lowerPath, "/logs") || matchesPrefix(lowerPath, "/usage")) {
+    return `${origin}/me/usage`;
+  }
+  if (matchesPrefix(lowerPath, "/topup") || matchesPrefix(lowerPath, "/billing") || matchesPrefix(lowerPath, "/wallet")) {
+    return `${origin}/me/assets`;
+  }
+  if (matchesPrefix(lowerPath, "/subscription") || matchesPrefix(lowerPath, "/plans")) {
+    return `${origin}/plans`;
+  }
+  if (matchesPrefix(lowerPath, "/pricing")) {
+    return `${origin}/models`;
+  }
+  if (lowerPath === "/") {
+    return `${origin}/me`;
+  }
+  for (const prefix of PUBLIC_CONSOLE_UI_PREFIXES) {
+    if (matchesPrefix(lowerPath, prefix)) {
+      return `${origin}/me`;
+    }
+  }
+  return "";
 }
 
 export function normalizeRequestPath(rawPathname) {
@@ -577,24 +669,40 @@ export async function handleEdgeAdminGate(request, env, storageSql, nowFn = Date
   const category = classifyNewApiRequest(upperMethod, normalized);
 
   if (category === "public") {
-    if (
-      (upperMethod === "GET" || upperMethod === "HEAD") &&
-      normalized.canonical === "/" &&
-      isRootRedirectToConsoleEnabled(env)
-    ) {
-      const nowMs = nowFn();
-      const store = new GateStore(storageSql);
-      const secret = getConfiguredSecret(env);
-      if (!(await hasValidBreakGlassCookie(request, secret, store, nowMs))) {
-        return {
-          response: new Response(null, {
-            status: 302,
-            headers: {
-              location: CONSOLE_ENTRY_PATH,
-              "cache-control": "no-store",
-            },
-          }),
-        };
+    if (upperMethod === "GET" || upperMethod === "HEAD") {
+      if (isPublicConsoleDisabled(env)) {
+        const redirectTarget = resolvePublicConsoleRedirectTarget(normalized.lower, env);
+        if (redirectTarget) {
+          const nowMs = nowFn();
+          const store = new GateStore(storageSql);
+          const secret = getConfiguredSecret(env);
+          if (!(await hasValidBreakGlassCookie(request, secret, store, nowMs))) {
+            return {
+              response: new Response(null, {
+                status: 302,
+                headers: {
+                  location: redirectTarget,
+                  "cache-control": "no-store",
+                },
+              }),
+            };
+          }
+        }
+      } else if (normalized.canonical === "/" && isRootRedirectToConsoleEnabled(env)) {
+        const nowMs = nowFn();
+        const store = new GateStore(storageSql);
+        const secret = getConfiguredSecret(env);
+        if (!(await hasValidBreakGlassCookie(request, secret, store, nowMs))) {
+          return {
+            response: new Response(null, {
+              status: 302,
+              headers: {
+                location: CONSOLE_ENTRY_PATH,
+                "cache-control": "no-store",
+              },
+            }),
+          };
+        }
       }
     }
     return { allow: true };
