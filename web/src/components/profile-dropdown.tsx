@@ -17,7 +17,16 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { useNavigate } from '@tanstack/react-router'
-import { User, Wallet, LogOut, Settings, ShieldCheck } from 'lucide-react'
+import {
+  User,
+  Wallet,
+  LogOut,
+  Settings,
+  ShieldCheck,
+  Store,
+  ReceiptText,
+  Layers,
+} from 'lucide-react'
 import { useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
 
@@ -33,6 +42,7 @@ import {
 } from '@/components/ui/dropdown-menu'
 import useDialogState from '@/hooks/use-dialog'
 import { useIsSidebarModuleVisible } from '@/hooks/use-sidebar-config'
+import { useStatus } from '@/hooks/use-status'
 import { useUserDisplay } from '@/hooks/use-user-display'
 import { getUserAvatarFallback, getUserAvatarStyle } from '@/lib/avatar'
 import { ROLE } from '@/lib/roles'
@@ -40,15 +50,38 @@ import { useAuthStore } from '@/stores/auth-store'
 
 const avatarFallbackClassName = 'font-semibold text-white'
 
+function resolveStorefrontOrigin(docsLink?: unknown): string {
+  const raw = typeof docsLink === 'string' ? docsLink.trim() : ''
+  if (!raw) return ''
+  try {
+    const parsed = new URL(raw)
+    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return ''
+    if (
+      typeof window !== 'undefined' &&
+      parsed.origin === window.location.origin
+    ) {
+      return ''
+    }
+    return parsed.origin
+  } catch {
+    return ''
+  }
+}
+
 export function ProfileDropdown() {
   const { t } = useTranslation()
   const navigate = useNavigate()
   const [open, setOpen] = useDialogState()
+  const { status } = useStatus()
   const user = useAuthStore((state) => state.auth.user)
   const { displayName, roleLabel } = useUserDisplay(user)
   const isSuperAdmin = user?.role === ROLE.SUPER_ADMIN
   const isWalletVisible = useIsSidebarModuleVisible('/wallet')
   const isSecurityVisible = useIsSidebarModuleVisible('/security')
+  const storefrontOrigin = useMemo(
+    () => resolveStorefrontOrigin(status?.docs_link),
+    [status?.docs_link]
+  )
   const avatarName = user?.username || displayName
   const avatarFallback = getUserAvatarFallback(avatarName)
   const avatarFallbackStyle = useMemo(
@@ -134,6 +167,45 @@ export function ProfileDropdown() {
               <Settings className='size-4' />
               {t('System Settings')}
             </DropdownMenuItem>
+          )}
+
+          {storefrontOrigin && (
+            <>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem
+                render={
+                  <a
+                    href={storefrontOrigin}
+                    rel='noopener noreferrer'
+                  />
+                }
+              >
+                <Store className='size-4' />
+                {t('Storefront')}
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                render={
+                  <a
+                    href={`${storefrontOrigin}/api-services`}
+                    rel='noopener noreferrer'
+                  />
+                }
+              >
+                <Layers className='size-4' />
+                {t('Gateway Plans')}
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                render={
+                  <a
+                    href={`${storefrontOrigin}/me/orders`}
+                    rel='noopener noreferrer'
+                  />
+                }
+              >
+                <ReceiptText className='size-4' />
+                {t('My Orders')}
+              </DropdownMenuItem>
+            </>
           )}
 
           <DropdownMenuSeparator />

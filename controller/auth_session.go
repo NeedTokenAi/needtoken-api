@@ -73,6 +73,7 @@ func AuthLogout(c *gin.Context) {
 				service.ClearRefreshCookie(c)
 				cookieCleared = true
 			}
+			notifyNeedTokenLogoutAsync(identity.UserID)
 			c.JSON(http.StatusOK, gin.H{
 				"success": true,
 				"message": "",
@@ -86,11 +87,18 @@ func AuthLogout(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"success": true, "message": ""})
 		return
 	}
+	var revokedUserID int
+	if hasCookieSID && cookieSID != "" {
+		if session, err := model.GetUserSessionBySID(cookieSID); err == nil && session != nil {
+			revokedUserID = session.UserID
+		}
+	}
 	if err := service.RevokeByRefreshToken(rawRefreshToken, expectedSID, "logout"); err != nil {
 		writeAuthSessionError(c, err)
 		return
 	}
 	service.ClearRefreshCookie(c)
+	notifyNeedTokenLogoutAsync(revokedUserID)
 	c.JSON(http.StatusOK, gin.H{"success": true, "message": ""})
 }
 
