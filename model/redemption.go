@@ -185,6 +185,31 @@ func Redeem(key string, userId int) (quota int, err error) {
 	return redemption.Quota, nil
 }
 
+// CreditUniversalGiftCardTopUp credits a user's wallet quota after an external
+// NeedToken Glue universal gift card has been atomically claimed.
+func CreditUniversalGiftCardTopUp(userId int, quota int, cardCode string) error {
+	if userId <= 0 {
+		return errors.New("invalid user id")
+	}
+	if quota <= 0 {
+		return errors.New("redemption quota must be positive")
+	}
+	if err := common.ValidateWalletQuota(quota); err != nil {
+		return err
+	}
+	if err := DB.Transaction(func(tx *gorm.DB) error {
+		return creditTopUpQuota(tx, userId, quota, nil)
+	}); err != nil {
+		return err
+	}
+	syncCreditUserQuotaCache(userId, quota, common.LogText("universal_gift_card"))
+	RecordLog(userId, LogTypeTopup, common.NewMessage("Topped up {{quota}} with a NeedToken universal gift card ({{code}})", map[string]any{
+		"quota": logger.FormatQuota(quota),
+		"code":  cardCode,
+	}))
+	return nil
+}
+
 func (redemption *Redemption) Insert() error {
 	if redemption.Quota <= 0 {
 		return errors.New("redemption quota must be positive")

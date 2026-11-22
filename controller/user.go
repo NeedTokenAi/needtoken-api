@@ -1315,6 +1315,11 @@ func TopUp(c *gin.Context) {
 	}
 	quota, err := model.Redeem(req.Key, id)
 	if err != nil {
+		if handled, uQuota, uErr := tryRedeemUniversalGiftCard(c.Request.Context(), req.Key, id); handled {
+			quota, err = uQuota, uErr
+		}
+	}
+	if err != nil {
 		// 不向用户暴露兑换失败的细分原因，避免攻击者根据错误类型判断兑换码状态。
 		common.ApiErrorT(c, "Redemption failed, please try again later")
 		logger.LogError(c, common.LogText("failed to redeem key %s for user %d: %s", req.Key, id, err.Error()))
