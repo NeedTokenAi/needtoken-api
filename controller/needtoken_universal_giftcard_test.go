@@ -6,9 +6,11 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -132,4 +134,17 @@ func TestTryRedeemUniversalGiftCard_SuccessAndRollbackRelease(t *testing.T) {
 	assert.Equal(t, 0, q)
 	assert.Equal(t, []string{needTokenUniversalGiftCardClaimPath, needTokenUniversalGiftCardReleasePath}, calls)
 	assert.Equal(t, "quota_conversion_overflow", lastReleaseReason)
+}
+
+func TestAddRedemptionDisabledReturns410Gone(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/api/redemption/", strings.NewReader(`{"name":"legacy","count":1,"quota":500000}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	AddRedemption(c)
+
+	require.Equal(t, http.StatusGone, w.Code)
+	assert.Contains(t, w.Body.String(), "single_side_redemption_generation_disabled")
 }
