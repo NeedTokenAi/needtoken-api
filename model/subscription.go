@@ -935,8 +935,8 @@ func HasActiveUserSubscription(userId int) (bool, error) {
 // HasActiveUserSubscriptionForGroup returns whether the user has at least one
 // active subscription eligible to pay for requests routed to usingGroup.
 func HasActiveUserSubscriptionForGroup(userId int, usingGroup string) (bool, error) {
-	if userId <= 0 {
-		return false, errors.New("invalid userId")
+	if DB == nil || userId <= 0 {
+		return false, nil
 	}
 	now := common.GetTimestamp()
 	var subs []UserSubscription
@@ -951,6 +951,73 @@ func HasActiveUserSubscriptionForGroup(userId int, usingGroup string) (bool, err
 		}
 	}
 	return false, nil
+}
+
+// HasExplicitActiveSubscriptionForGroup returns whether the user holds an active
+// subscription whose allowed_groups explicitly grants access to usingGroup.
+// Wildcard or empty allowed_groups (all-group billing plans) never unlock
+// restricted exclusive groups on their own.
+func HasExplicitActiveSubscriptionForGroup(userId int, usingGroup string) (bool, error) {
+	if DB == nil || userId <= 0 {
+		return false, nil
+	}
+	target := strings.TrimSpace(usingGroup)
+	if target == "" || target == "auto" || target == "*" || target == "all" {
+		return false, nil
+	}
+	now := common.GetTimestamp()
+	var subs []UserSubscription
+	if err := DB.Select("id", "allowed_groups").
+		Where("user_id = ? AND status = ? AND end_time > ?", userId, "active", now).
+		Find(&subs).Error; err != nil {
+		return false, err
+	}
+	for i := range subs {
+		normalized := NormalizeAllowedGroups(subs[i].AllowedGroups)
+		if normalized == "" {
+			continue
+		}
+		for grp := range strings.SplitSeq(normalized, ",") {
+			if grp == target {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
+// GetActiveSubscriptionAllowedGroups returns deduplicated concrete group names
+// explicitly listed in the user's currently active subscriptions.
+func GetActiveSubscriptionAllowedGroups(userId int) ([]string, error) {
+	if DB == nil || userId <= 0 {
+		return nil, nil
+	}
+	now := common.GetTimestamp()
+	var subs []UserSubscription
+	if err := DB.Select("id", "allowed_groups").
+		Where("user_id = ? AND status = ? AND end_time > ?", userId, "active", now).
+		Find(&subs).Error; err != nil {
+		return nil, err
+	}
+	seen := make(map[string]struct{})
+	groups := make([]string, 0)
+	for i := range subs {
+		normalized := NormalizeAllowedGroups(subs[i].AllowedGroups)
+		if normalized == "" {
+			continue
+		}
+		for grp := range strings.SplitSeq(normalized, ",") {
+			if grp == "" || grp == "*" || grp == "all" || grp == "auto" {
+				continue
+			}
+			if _, ok := seen[grp]; ok {
+				continue
+			}
+			seen[grp] = struct{}{}
+			groups = append(groups, grp)
+		}
+	}
+	return groups, nil
 }
 
 // UserActiveSubscriptionsAllowWalletOverflow returns whether wallet balance may be used

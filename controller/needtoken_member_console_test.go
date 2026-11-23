@@ -10,6 +10,9 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
@@ -257,4 +260,138 @@ func TestMemberConsoleLifecycleAndSecurity(t *testing.T) {
 	// 8. Delete token.
 	delRec := doSigned(http.MethodDelete, "/api/subscription/admin/needtoken-console/users/"+strconv.Itoa(member.Id)+"/tokens/"+strconv.Itoa(tokenID), "", fixedNow.Unix(), "")
 	require.Equal(t, http.StatusOK, delRec.Code)
+}
+
+func TestMemberConsoleGroupIsolationAndSubscriptionUnlock(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	const secret = "fedcba9876543210fedcba9876543210fedcba9876543210"
+	t.Setenv("NEEDTOKEN_LINKING_SECRET", secret)
+
+	origDB := model.DB
+	origNow := accountLinkNow
+	origUsable := setting.UserUsableGroups2JSONString()
+	origRatios := ratio_setting.GroupRatio2JSONString()
+	origAutoGroups := setting.GetAutoGroups()
+	origDefaultAuto := setting.DefaultUseAutoGroup
+
+	db, err := gorm.Open(sqlite.Open("file:member_group_isolation_test?mode=memory&cache=shared"), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.UserSubscription{}))
+	model.DB = db
+	fixedNow := time.Now().UTC().Truncate(time.Second)
+	accountLinkNow = func() time.Time { return fixedNow }
+
+	require.NoError(t, setting.UpdateUserUsableGroupsByJSONString(`{"default":"Default group"}`))
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"default":1,"vip":0.8,"openai-exclusive-1":0.5}`))
+	setting.DefaultUseAutoGroup = false
+	require.NoError(t, setting.UpdateAutoGroupsByJsonString(`["openai-exclusive-1","default"]`))
+
+	t.Cleanup(func() {
+		model.DB = origDB
+		accountLinkNow = origNow
+		_ = setting.UpdateUserUsableGroupsByJSONString(origUsable)
+		_ = ratio_setting.UpdateGroupRatioByJSONString(origRatios)
+		setting.DefaultUseAutoGroup = origDefaultAuto
+		rawAuto, _ := common.Marshal(origAutoGroups)
+		_ = setting.UpdateAutoGroupsByJsonString(string(rawAuto))
+	})
+
+	member := &model.User{Username: "std_member", DisplayName: "Std", Role: common.RoleCommonUser, Status: common.UserStatusEnabled, Group: "default", AffCode: "aff_std"}
+	require.NoError(t, db.Create(member).Error)
+
+	r := gin.New()
+	grp := r.Group("/api/subscription/admin/needtoken-console")
+	grp.GET("/users/:id/tokens", MemberConsoleListTokens)
+	grp.POST("/users/:id/tokens", MemberConsoleCreateToken)
+	grp.GET("/users/:id/models", MemberConsoleModels)
+
+	doSigned := func(method, target, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, target, bytes.NewBufferString(body))
+		if body != "" {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		tsStr := strconv.FormatInt(fixedNow.Unix(), 10)
+		sig := computeMemberConsoleSignature([]byte(secret), method, req.URL.Path, req.URL.RawQuery, tsStr, []byte(body))
+		req.Header.Set("X-NeedToken-Timestamp", tsStr)
+		req.Header.Set("X-NeedToken-Signature", sig)
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// 1. Standard default user sees only default; vip, auto, and exclusive groups are blocked.
+	listRec := doSigned(http.MethodGet, "/api/subscription/admin/needtoken-console/users/"+strconv.Itoa(member.Id)+"/tokens", "")
+	require.Equal(t, http.StatusOK, listRec.Code)
+	var listResp struct {
+		Success bool `json:"success"`
+		Data    struct {
+			UsableGroups map[string]string `json:"usable_groups"`
+		} `json:"data"`
+	}
+	require.NoError(t, common.Unmarshal(listRec.Body.Bytes(), &listResp))
+	assert.Contains(t, listResp.Data.UsableGroups, "default")
+	assert.NotContains(t, listResp.Data.UsableGroups, "vip")
+	assert.NotContains(t, listResp.Data.UsableGroups, "openai-exclusive-1")
+	assert.NotContains(t, listResp.Data.UsableGroups, "auto")
+
+	for _, forbiddenGroup := range []string{"vip", "openai-exclusive-1", "auto"} {
+		rec := doSigned(http.MethodPost, "/api/subscription/admin/needtoken-console/users/"+strconv.Itoa(member.Id)+"/tokens", `{"name":"Try","group":"`+forbiddenGroup+`"}`)
+		var resp struct {
+			Success bool `json:"success"`
+		}
+		require.NoError(t, common.Unmarshal(rec.Body.Bytes(), &resp))
+		assert.False(t, resp.Success, "group %s must be rejected", forbiddenGroup)
+		assert.False(t, service.UserCanUseGroup(member.Id, member.Group, forbiddenGroup))
+	}
+
+	// 2. Wildcard/all-group subscription (empty allowed_groups) must NOT unlock restricted exclusive groups.
+	wildcardSub := &model.UserSubscription{
+		UserId:        member.Id,
+		PlanId:        1,
+		Status:        "active",
+		StartTime:     fixedNow.Unix() - 60,
+		EndTime:       fixedNow.Unix() + 3600,
+		AmountTotal:   1000000,
+		AllowedGroups: "",
+	}
+	require.NoError(t, db.Create(wildcardSub).Error)
+	assert.False(t, service.UserCanUseGroup(member.Id, member.Group, "openai-exclusive-1"))
+
+	// 3. Explicit exclusive-group subscription unlocks group for token creation, models, auth, and auto routing.
+	exclSub := &model.UserSubscription{
+		UserId:        member.Id,
+		PlanId:        2,
+		Status:        "active",
+		StartTime:     fixedNow.Unix() - 60,
+		EndTime:       fixedNow.Unix() + 3600,
+		AmountTotal:   2000000,
+		AllowedGroups: "openai-exclusive-1",
+	}
+	require.NoError(t, db.Create(exclSub).Error)
+
+	assert.True(t, service.UserCanUseGroup(member.Id, member.Group, "openai-exclusive-1"))
+	assert.False(t, service.UserCanUseGroup(member.Id, member.Group, "vip"))
+	assert.Equal(t, []string{"openai-exclusive-1", "default"}, service.GetUserEffectiveAutoGroup(member.Id, member.Group))
+
+	createExcl := doSigned(http.MethodPost, "/api/subscription/admin/needtoken-console/users/"+strconv.Itoa(member.Id)+"/tokens", `{"name":"Exclusive Key","group":"openai-exclusive-1"}`)
+	require.Equal(t, http.StatusOK, createExcl.Code)
+	var createExclResp struct {
+		Success bool `json:"success"`
+	}
+	require.NoError(t, common.Unmarshal(createExcl.Body.Bytes(), &createExclResp))
+	assert.True(t, createExclResp.Success)
+
+	// Enabling DefaultUseAutoGroup exposes "auto" based on backend setting.
+	setting.DefaultUseAutoGroup = true
+	assert.True(t, service.UserCanUseGroup(member.Id, member.Group, "auto"))
+	listWithAuto := doSigned(http.MethodGet, "/api/subscription/admin/needtoken-console/users/"+strconv.Itoa(member.Id)+"/tokens", "")
+	require.NoError(t, common.Unmarshal(listWithAuto.Body.Bytes(), &listResp))
+	assert.Contains(t, listResp.Data.UsableGroups, "openai-exclusive-1")
+	assert.Contains(t, listResp.Data.UsableGroups, "auto")
+	assert.NotContains(t, listResp.Data.UsableGroups, "vip")
+
+	// 4. Expiring the exclusive subscription revokes access automatically.
+	require.NoError(t, db.Model(exclSub).Update("end_time", fixedNow.Unix()-10).Error)
+	assert.False(t, service.UserCanUseGroup(member.Id, member.Group, "openai-exclusive-1"))
 }

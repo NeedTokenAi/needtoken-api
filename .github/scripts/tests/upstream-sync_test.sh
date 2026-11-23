@@ -195,6 +195,7 @@ grep -q "POST repos/NeedTokenAi/needtoken-api/issues/15/comments" "$tmp/gh.log" 
 source "$root/lib/high-risk-paths.sh"
 is_high_risk_path "web/src/components/profile-dropdown.tsx" || fail "profile-dropdown.tsx must be high-risk"
 is_high_risk_path "service/billing_session.go" || fail "service/billing_session.go must be high-risk"
+is_high_risk_path "service/group.go" || fail "service/group.go must be high-risk"
 is_high_risk_path "controller/needtoken_slo.go" || fail "controller/needtoken_slo.go must be high-risk"
 
 echo "needtoken-api upstream-sync ok"

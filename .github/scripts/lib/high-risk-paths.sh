@@ -39,7 +39,7 @@ is_high_risk_path() {
       ;;
     # NeedToken 二开保护区
     VERSION | controller/needtoken_* | controller/external_grant* | \
-      service/billing_session.go | service/funding_source.go | \
+      service/billing_session.go | service/funding_source.go | service/group.go | \
       web/src/routes/_authenticated/account-link.tsx | \
       "web/src/routes/(auth)/oauth.tsx" | \
       web/src/routes/index.tsx | \

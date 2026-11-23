@@ -53,6 +53,94 @@ func IsUserSelectableGroup(userGroup, groupName string) bool {
 	return GroupInUserUsableGroups(userGroup, groupName) && ratio_setting.ContainsGroupRatio(groupName)
 }
 
+// GetUserEffectiveUsableGroups returns groups usable by the specific user:
+// their static usable groups (respecting admin UserUsableGroups / special rules
+// and user.Group) plus any concrete groups explicitly granted by their active
+// subscriptions. The "auto" pseudo-group is included only when admin settings
+// enable it (UserUsableGroups or DefaultUseAutoGroup with at least one valid
+// routable auto group).
+func GetUserEffectiveUsableGroups(userId int, userGroup string) map[string]string {
+	groups := GetUserUsableGroups(userGroup)
+	if userId > 0 {
+		if subGroups, err := model.GetActiveSubscriptionAllowedGroups(userId); err == nil {
+			for _, g := range subGroups {
+				if !ratio_setting.ContainsGroupRatio(g) {
+					continue
+				}
+				if _, exists := groups[g]; !exists {
+					groups[g] = setting.GetUsableGroupDescription(g)
+				}
+			}
+		}
+	}
+	if setting.DefaultUseAutoGroup {
+		if _, exists := groups["auto"]; !exists && len(resolveEffectiveAutoGroups(groups)) > 0 {
+			groups["auto"] = "Auto group"
+		}
+	}
+	return groups
+}
+
+// UserCanUseGroup checks whether the user is authorized to route requests
+// through groupName either via static usable groups, admin-enabled auto group,
+// or an active subscription whose allowed_groups explicitly grants groupName.
+func UserCanUseGroup(userId int, userGroup, groupName string) bool {
+	trimmed := strings.TrimSpace(groupName)
+	if trimmed == "" {
+		return false
+	}
+	if GroupInUserUsableGroups(userGroup, trimmed) {
+		return true
+	}
+	if trimmed == "auto" {
+		if !setting.DefaultUseAutoGroup {
+			return false
+		}
+		return len(GetUserEffectiveAutoGroup(userId, userGroup)) > 0
+	}
+	if !ratio_setting.ContainsGroupRatio(trimmed) {
+		return false
+	}
+	ok, err := model.HasExplicitActiveSubscriptionForGroup(userId, trimmed)
+	return err == nil && ok
+}
+
+func resolveEffectiveAutoGroups(effectiveUsable map[string]string) []string {
+	autoGroups := make([]string, 0)
+	seen := make(map[string]struct{})
+	for _, group := range setting.GetAutoGroups() {
+		if group == "" || group == "auto" {
+			continue
+		}
+		if _, ok := effectiveUsable[group]; !ok || !ratio_setting.ContainsGroupRatio(group) {
+			continue
+		}
+		if _, ok := seen[group]; ok {
+			continue
+		}
+		seen[group] = struct{}{}
+		autoGroups = append(autoGroups, group)
+	}
+	return autoGroups
+}
+
+// GetUserEffectiveAutoGroup resolves the ordered Auto groups available to a
+// user, including any group explicitly unlocked by an active subscription.
+func GetUserEffectiveAutoGroup(userId int, userGroup string) []string {
+	if userId <= 0 {
+		return GetUserAutoGroup(userGroup)
+	}
+	usable := GetUserUsableGroups(userGroup)
+	if subGroups, err := model.GetActiveSubscriptionAllowedGroups(userId); err == nil {
+		for _, g := range subGroups {
+			if ratio_setting.ContainsGroupRatio(g) {
+				usable[g] = setting.GetUsableGroupDescription(g)
+			}
+		}
+	}
+	return resolveEffectiveAutoGroups(usable)
+}
+
 // GetUserAutoGroup 根据用户分组获取自动分组设置
 func GetUserAutoGroup(userGroup string) []string {
 	autoGroups := make([]string, 0)
@@ -73,11 +161,24 @@ func GetUserAutoGroup(userGroup string) []string {
 // FilterUserTokenAutoGroups applies current permissions before the current
 // per-token limit. It intentionally does not fall back to the global Auto list.
 func FilterUserTokenAutoGroups(userGroup string, groups []string) []string {
+	return filterUserTokenAutoGroupsWithUser(0, userGroup, groups)
+}
+
+func filterUserTokenAutoGroupsWithUser(userId int, userGroup string, groups []string) []string {
 	maxCount := setting.GetMaxTokenAutoGroups()
 	filtered := make([]string, 0, min(len(groups), maxCount))
 	seen := make(map[string]struct{})
 	for _, group := range groups {
-		if !IsUserSelectableGroup(userGroup, group) {
+		if group == "" || group == "auto" || !ratio_setting.ContainsGroupRatio(group) {
+			continue
+		}
+		allowed := IsUserSelectableGroup(userGroup, group)
+		if !allowed && userId > 0 {
+			if ok, err := model.HasExplicitActiveSubscriptionForGroup(userId, group); err == nil && ok {
+				allowed = true
+			}
+		}
+		if !allowed {
 			continue
 		}
 		if _, ok := seen[group]; ok {
@@ -96,15 +197,19 @@ func FilterUserTokenAutoGroups(userGroup string, groups []string) []string {
 // The absence of the context value means that the token inherits the complete
 // global Auto list; a present (even empty) value is an explicit token snapshot.
 func GetRequestAutoGroups(c *gin.Context, userGroup string) []string {
+	userId := 0
+	if c != nil {
+		userId = c.GetInt("id")
+	}
 	value, ok := common.GetContextKey(c, constant.ContextKeyTokenAutoGroups)
 	if !ok {
-		return GetUserAutoGroup(userGroup)
+		return GetUserEffectiveAutoGroup(userId, userGroup)
 	}
 	groups, ok := value.([]string)
 	if !ok {
 		return []string{}
 	}
-	return FilterUserTokenAutoGroups(userGroup, groups)
+	return filterUserTokenAutoGroupsWithUser(userId, userGroup, groups)
 }
 
 // GetGroupsEnabledModels 按 groups 顺序获取各分组启用的模型并去重
