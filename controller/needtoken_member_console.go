@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"io"
-	"maps"
 	"net/http"
 	"slices"
 	"strconv"
@@ -181,35 +180,31 @@ func buildMemberConsoleTokenDTO(tok *model.Token) memberConsoleTokenDTO {
 }
 
 func memberConsoleUsableGroups(user *model.User) map[string]string {
-	out := make(map[string]string)
-	maps.Copy(out, setting.GetUserUsableGroupsCopy())
-	if user != nil && strings.TrimSpace(user.Group) != "" {
-		if _, exists := out[user.Group]; !exists {
-			out[user.Group] = setting.GetUsableGroupDescription(user.Group)
+	userId := 0
+	userGroup := "default"
+	if user != nil {
+		userId = user.Id
+		if trimmed := strings.TrimSpace(user.Group); trimmed != "" {
+			userGroup = trimmed
 		}
 	}
+	out := service.GetUserEffectiveUsableGroups(userId, userGroup)
 	if len(out) == 0 {
-		out["default"] = "Default group"
-	}
-	if setting.DefaultUseAutoGroup || len(setting.GetAutoGroups()) > 0 {
-		out["auto"] = "Auto group"
+		out = map[string]string{userGroup: setting.GetUsableGroupDescription(userGroup)}
 	}
 	return out
 }
 
 func validateMemberTokenGroup(user *model.User, group string) bool {
 	trimmed := strings.TrimSpace(group)
-	if trimmed == "" || trimmed == "auto" {
+	if trimmed == "" {
 		return true
 	}
 	if user != nil && trimmed == strings.TrimSpace(user.Group) {
 		return true
 	}
 	usable := memberConsoleUsableGroups(user)
-	if _, ok := usable[trimmed]; ok {
-		return true
-	}
-	_, ok := ratio_setting.GetGroupRatioCopy()[trimmed]
+	_, ok := usable[trimmed]
 	return ok
 }
 
@@ -690,10 +685,8 @@ func MemberConsoleModels(c *gin.Context) {
 	}
 
 	group := strings.TrimSpace(user.Group)
-	usableGroup := service.GetUserUsableGroups(group)
-	if len(usableGroup) == 0 {
-		usableGroup = memberConsoleUsableGroups(user)
-	}
+	usableGroup := memberConsoleUsableGroups(user)
+	delete(usableGroup, "auto")
 	groupRatio := make(map[string]float64)
 	allRatios := ratio_setting.GetGroupRatioCopy()
 	for g, baseRatio := range allRatios {
@@ -715,7 +708,7 @@ func MemberConsoleModels(c *gin.Context) {
 		"group_ratio":        groupRatio,
 		"default_group":      group,
 		"supported_endpoint": model.GetSupportedEndpointMap(),
-		"auto_groups":        service.GetUserAutoGroup(group),
+		"auto_groups":        service.GetUserEffectiveAutoGroup(user.Id, group),
 		"quota_per_unit":     common.QuotaPerUnit,
 	})
 }
