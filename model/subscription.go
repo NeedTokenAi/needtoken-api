@@ -935,8 +935,8 @@ func HasActiveUserSubscription(userId int) (bool, error) {
 // HasActiveUserSubscriptionForGroup returns whether the user has at least one
 // active subscription eligible to pay for requests routed to usingGroup.
 func HasActiveUserSubscriptionForGroup(userId int, usingGroup string) (bool, error) {
-	if DB == nil || userId <= 0 {
-		return false, nil
+	if userId <= 0 {
+		return false, errors.New("invalid userId")
 	}
 	now := common.GetTimestamp()
 	var subs []UserSubscription
