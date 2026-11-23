@@ -14,10 +14,13 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
+	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 )
@@ -662,5 +665,173 @@ func MemberConsoleUsage(c *gin.Context) {
 		"quota_per_unit": common.QuotaPerUnit,
 		"daily":          daily,
 		"models":         models,
+	})
+}
+
+type memberConsoleDrawingDTO struct {
+	Id         int    `json:"id"`
+	MjId       string `json:"mj_id"`
+	Action     string `json:"action"`
+	Status     string `json:"status"`
+	Progress   string `json:"progress"`
+	Prompt     string `json:"prompt"`
+	PromptEn   string `json:"prompt_en"`
+	FailReason string `json:"fail_reason"`
+	ImageUrl   string `json:"image_url"`
+	Quota      int    `json:"quota"`
+	SubmitTime int64  `json:"submit_time"`
+	FinishTime int64  `json:"finish_time"`
+}
+
+func MemberConsoleModels(c *gin.Context) {
+	user, _, ok := verifyMemberConsoleRequest(c)
+	if !ok {
+		return
+	}
+
+	group := strings.TrimSpace(user.Group)
+	usableGroup := service.GetUserUsableGroups(group)
+	if len(usableGroup) == 0 {
+		usableGroup = memberConsoleUsableGroups(user)
+	}
+	groupRatio := make(map[string]float64)
+	allRatios := ratio_setting.GetGroupRatioCopy()
+	for g, baseRatio := range allRatios {
+		if _, allowed := usableGroup[g]; !allowed {
+			continue
+		}
+		if override, exists := ratio_setting.GetGroupGroupRatio(group, g); exists {
+			groupRatio[g] = override
+		} else {
+			groupRatio[g] = baseRatio
+		}
+	}
+
+	pricing := filterPricingByUsableGroups(model.GetPricing(), usableGroup)
+	common.ApiSuccess(c, gin.H{
+		"models":             pricing,
+		"vendors":            model.GetVendors(),
+		"usable_groups":      usableGroup,
+		"group_ratio":        groupRatio,
+		"default_group":      group,
+		"supported_endpoint": model.GetSupportedEndpointMap(),
+		"auto_groups":        service.GetUserAutoGroup(group),
+		"quota_per_unit":     common.QuotaPerUnit,
+	})
+}
+
+func MemberConsoleListTasks(c *gin.Context) {
+	user, _, ok := verifyMemberConsoleRequest(c)
+	if !ok {
+		return
+	}
+
+	page, _ := strconv.Atoi(c.DefaultQuery("p", "1"))
+	page = max(page, 1)
+	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
+	if pageSize <= 0 {
+		pageSize = 20
+	}
+	pageSize = min(pageSize, 100)
+
+	startTS, _ := strconv.ParseInt(strings.TrimSpace(c.Query("start_timestamp")), 10, 64)
+	endTS, _ := strconv.ParseInt(strings.TrimSpace(c.Query("end_timestamp")), 10, 64)
+	queryParams := model.SyncTaskQueryParams{
+		Platform:       constant.TaskPlatform(strings.TrimSpace(c.Query("platform"))),
+		TaskID:         strings.TrimSpace(c.Query("task_id")),
+		Status:         strings.TrimSpace(c.Query("status")),
+		Action:         strings.TrimSpace(c.Query("action")),
+		StartTimestamp: startTS,
+		EndTimestamp:   endTS,
+	}
+
+	items := model.TaskGetAllUserTask(user.Id, (page-1)*pageSize, pageSize, queryParams)
+	total := model.TaskCountAllUserTask(user.Id, queryParams)
+	common.ApiSuccess(c, gin.H{
+		"items":          tasksToDto(items, false, common.RoleCommonUser),
+		"total":          total,
+		"page":           page,
+		"page_size":      pageSize,
+		"quota_per_unit": common.QuotaPerUnit,
+	})
+}
+
+func MemberConsoleListDrawings(c *gin.Context) {
+	user, _, ok := verifyMemberConsoleRequest(c)
+	if !ok {
+		return
+	}
+
+	page, _ := strconv.Atoi(c.DefaultQuery("p", "1"))
+	page = max(page, 1)
+	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
+	if pageSize <= 0 {
+		pageSize = 20
+	}
+	pageSize = min(pageSize, 100)
+
+	queryParams := model.TaskQueryParams{
+		MjID:           strings.TrimSpace(c.Query("mj_id")),
+		StartTimestamp: strings.TrimSpace(c.Query("start_timestamp")),
+		EndTimestamp:   strings.TrimSpace(c.Query("end_timestamp")),
+	}
+	rawItems := model.GetAllUserTask(user.Id, (page-1)*pageSize, pageSize, queryParams)
+	total := model.CountAllUserTask(user.Id, queryParams)
+
+	items := make([]memberConsoleDrawingDTO, 0, len(rawItems))
+	for _, row := range rawItems {
+		if row == nil {
+			continue
+		}
+		imgURL := row.ImageUrl
+		if setting.MjForwardUrlEnabled && row.MjId != "" {
+			imgURL = system_setting.ServerAddress + "/mj/image/" + row.MjId
+		}
+		items = append(items, memberConsoleDrawingDTO{
+			Id:         row.Id,
+			MjId:       row.MjId,
+			Action:     row.Action,
+			Status:     row.Status,
+			Progress:   row.Progress,
+			Prompt:     row.Prompt,
+			PromptEn:   row.PromptEn,
+			FailReason: row.FailReason,
+			ImageUrl:   imgURL,
+			Quota:      row.Quota,
+			SubmitTime: row.SubmitTime,
+			FinishTime: row.FinishTime,
+		})
+	}
+
+	common.ApiSuccess(c, gin.H{
+		"items":          items,
+		"total":          total,
+		"page":           page,
+		"page_size":      pageSize,
+		"quota_per_unit": common.QuotaPerUnit,
+	})
+}
+
+func MemberConsoleSubscriptions(c *gin.Context) {
+	user, _, ok := verifyMemberConsoleRequest(c)
+	if !ok {
+		return
+	}
+
+	activeSubs, err := model.GetAllActiveUserSubscriptions(user.Id)
+	if err != nil {
+		activeSubs = []model.SubscriptionSummary{}
+	}
+	allSubs, err := model.GetAllUserSubscriptions(user.Id)
+	if err != nil {
+		allSubs = []model.SubscriptionSummary{}
+	}
+
+	common.ApiSuccess(c, gin.H{
+		"active_subscriptions": activeSubs,
+		"all_subscriptions":    allSubs,
+		"user_group":           user.Group,
+		"user_quota":           user.Quota,
+		"quota_per_unit":       common.QuotaPerUnit,
 	})
 }

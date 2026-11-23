@@ -83,6 +83,10 @@ var accessTokenExemptRoutes = []string{
 	"DELETE /api/subscription/admin/needtoken-console/users/:id/tokens/:token_id",
 	"GET /api/subscription/admin/needtoken-console/users/:id/logs",
 	"GET /api/subscription/admin/needtoken-console/users/:id/usage",
+	"GET /api/subscription/admin/needtoken-console/users/:id/models",
+	"GET /api/subscription/admin/needtoken-console/users/:id/tasks",
+	"GET /api/subscription/admin/needtoken-console/users/:id/drawings",
+	"GET /api/subscription/admin/needtoken-console/users/:id/subscriptions",
 
 	// API key authentication (TokenAuthReadOnly).
 	"GET /api/usage/token/",
