@@ -30,7 +30,7 @@ func TestMemberConsoleLifecycleAndSecurity(t *testing.T) {
 	common.RedisEnabled = false
 	db, err := gorm.Open(sqlite.Open("file:member_console_test?mode=memory&cache=shared"), &gorm.Config{})
 	require.NoError(t, err)
-	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.Log{}, &model.QuotaData{}, &model.UserSubscription{}, &model.SubscriptionPlan{}))
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.Log{}, &model.QuotaData{}, &model.UserSubscription{}, &model.SubscriptionPlan{}, &model.Task{}, &model.Midjourney{}))
 	model.DB = db
 	model.LOG_DB = db
 	fixedNow := time.Now().UTC().Truncate(time.Second)
@@ -57,6 +57,10 @@ func TestMemberConsoleLifecycleAndSecurity(t *testing.T) {
 	grp.DELETE("/users/:id/tokens/:token_id", MemberConsoleDeleteToken)
 	grp.GET("/users/:id/logs", MemberConsoleListLogs)
 	grp.GET("/users/:id/usage", MemberConsoleUsage)
+	grp.GET("/users/:id/models", MemberConsoleModels)
+	grp.GET("/users/:id/tasks", MemberConsoleListTasks)
+	grp.GET("/users/:id/drawings", MemberConsoleListDrawings)
+	grp.GET("/users/:id/subscriptions", MemberConsoleSubscriptions)
 
 	doSigned := func(method, target string, body string, ts int64, overrideSig string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(method, target, bytes.NewBufferString(body))
@@ -209,7 +213,48 @@ func TestMemberConsoleLifecycleAndSecurity(t *testing.T) {
 	require.Len(t, usageResp.Data.Models, 1)
 	assert.Equal(t, "claude-sonnet-4-6", usageResp.Data.Models[0].ModelName)
 
-	// 7. Delete token.
+	// 7. Models, tasks, drawings, and subscriptions endpoints.
+	require.NoError(t, db.Create(&model.Task{
+		TaskID:    "task_vid_001",
+		UserId:    member.Id,
+		ChannelId: 99,
+		Platform:  "kling",
+		Action:    "text2video",
+		Status:    model.TaskStatusSuccess,
+		Progress:  "100%",
+		Quota:     50000,
+		CreatedAt: fixedNow.Unix() - 120,
+	}).Error)
+	require.NoError(t, db.Create(&model.Midjourney{
+		MjId:       "mj_draw_001",
+		UserId:     member.Id,
+		ChannelId:  99,
+		Action:     "IMAGINE",
+		Status:     "SUCCESS",
+		Progress:   "100%",
+		Prompt:     "emerald skyline",
+		Quota:      25000,
+		SubmitTime: fixedNow.Unix() - 180,
+	}).Error)
+
+	modelsRec := doSigned(http.MethodGet, "/api/subscription/admin/needtoken-console/users/"+strconv.Itoa(member.Id)+"/models", "", fixedNow.Unix(), "")
+	require.Equal(t, http.StatusOK, modelsRec.Code)
+	assert.Contains(t, modelsRec.Body.String(), `"usable_groups"`)
+
+	tasksRec := doSigned(http.MethodGet, "/api/subscription/admin/needtoken-console/users/"+strconv.Itoa(member.Id)+"/tasks?p=1&page_size=20", "", fixedNow.Unix(), "")
+	require.Equal(t, http.StatusOK, tasksRec.Code)
+	assert.Contains(t, tasksRec.Body.String(), `"task_vid_001"`)
+
+	drawingsRec := doSigned(http.MethodGet, "/api/subscription/admin/needtoken-console/users/"+strconv.Itoa(member.Id)+"/drawings?p=1&page_size=20", "", fixedNow.Unix(), "")
+	require.Equal(t, http.StatusOK, drawingsRec.Code)
+	assert.Contains(t, drawingsRec.Body.String(), `"mj_draw_001"`)
+	assert.NotContains(t, drawingsRec.Body.String(), `"channel_id"`)
+
+	subsRec := doSigned(http.MethodGet, "/api/subscription/admin/needtoken-console/users/"+strconv.Itoa(member.Id)+"/subscriptions", "", fixedNow.Unix(), "")
+	require.Equal(t, http.StatusOK, subsRec.Code)
+	assert.Contains(t, subsRec.Body.String(), `"all_subscriptions"`)
+
+	// 8. Delete token.
 	delRec := doSigned(http.MethodDelete, "/api/subscription/admin/needtoken-console/users/"+strconv.Itoa(member.Id)+"/tokens/"+strconv.Itoa(tokenID), "", fixedNow.Unix(), "")
 	require.Equal(t, http.StatusOK, delRec.Code)
 }

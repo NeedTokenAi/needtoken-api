@@ -236,6 +236,10 @@ func SetApiRouter(router *gin.Engine) {
 		apiRouter.DELETE("/subscription/admin/needtoken-console/users/:id/tokens/:token_id", middleware.CriticalRateLimit(), middleware.DisableCache(), controller.MemberConsoleDeleteToken)
 		apiRouter.GET("/subscription/admin/needtoken-console/users/:id/logs", middleware.DisableCache(), controller.MemberConsoleListLogs)
 		apiRouter.GET("/subscription/admin/needtoken-console/users/:id/usage", middleware.DisableCache(), controller.MemberConsoleUsage)
+		apiRouter.GET("/subscription/admin/needtoken-console/users/:id/models", middleware.DisableCache(), controller.MemberConsoleModels)
+		apiRouter.GET("/subscription/admin/needtoken-console/users/:id/tasks", middleware.DisableCache(), controller.MemberConsoleListTasks)
+		apiRouter.GET("/subscription/admin/needtoken-console/users/:id/drawings", middleware.DisableCache(), controller.MemberConsoleListDrawings)
+		apiRouter.GET("/subscription/admin/needtoken-console/users/:id/subscriptions", middleware.DisableCache(), controller.MemberConsoleSubscriptions)
 
 		// Subscription payment callbacks (no auth)
 		apiRouter.POST("/subscription/epay/notify", anonymousRequestBodyLimit, controller.SubscriptionEpayNotify)
