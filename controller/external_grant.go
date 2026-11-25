@@ -8,6 +8,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
@@ -80,6 +81,8 @@ func AdminGetFulfillmentCapabilities(c *gin.Context) {
 		"managed_api_key_issuance": true, "delivery_mode": "native_console",
 		"payment_compliance_confirmed":  operation_setting.IsPaymentComplianceConfirmed(),
 		"subscription_write_authorized": service.AccessTokenScopeGranted(c.GetStringSlice("access_token_scopes"), "billing:write"),
+		"auto_groups":                   setting.GetAutoGroups(),
+		"routable_auto_groups":          service.GetRoutableGlobalAutoGroups(),
 		"collected_at":                  common.GetTimestamp(),
 	})
 }
@@ -158,6 +161,17 @@ func AdminGetCustomerQuotaSummary(c *gin.Context) {
 	if err != nil {
 		externalGrantError(c, err)
 		return
+	}
+	effectiveAutoGroups := service.GetUserEffectiveAutoGroup(userId, summary.UserGroup)
+	summary.EffectiveAutoGroups = effectiveAutoGroups
+	for i := range summary.TokenCaps {
+		if summary.TokenCaps[i].Group == "auto" {
+			if len(summary.TokenCaps[i].AutoGroups) == 0 {
+				summary.TokenCaps[i].EffectiveAutoGroups = effectiveAutoGroups
+			} else {
+				summary.TokenCaps[i].EffectiveAutoGroups = service.FilterUserTokenAutoGroupsForUser(userId, summary.UserGroup, summary.TokenCaps[i].AutoGroups)
+			}
+		}
 	}
 	common.ApiSuccess(c, summary)
 }

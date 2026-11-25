@@ -283,6 +283,7 @@ type CustomerWalletSummary struct {
 type CustomerSubscriptionSummary struct {
 	Id                  int    `json:"id"`
 	PlanId              int    `json:"plan_id"`
+	AllowedGroups       string `json:"allowed_groups,omitempty"`
 	AmountTotal         int64  `json:"amount_total"`
 	AmountUsed          int64  `json:"amount_used"`
 	StartTime           int64  `json:"start_time"`
@@ -294,13 +295,17 @@ type CustomerSubscriptionSummary struct {
 }
 
 type CustomerTokenCapSummary struct {
-	Id             int    `json:"id"`
-	Name           string `json:"name"`
-	Status         int    `json:"status"`
-	RemainQuota    int    `json:"remain_quota"`
-	UsedQuota      int    `json:"used_quota"`
-	UnlimitedQuota bool   `json:"unlimited_quota"`
-	ExpiredTime    int64  `json:"expired_time"`
+	Id                  int      `json:"id"`
+	Name                string   `json:"name"`
+	Group               string   `json:"group,omitempty"`
+	AutoGroups          []string `json:"auto_groups,omitempty" gorm:"-"`
+	EffectiveAutoGroups []string `json:"effective_auto_groups,omitempty" gorm:"-"`
+	AutoGroupsRaw       string   `json:"-" gorm:"column:auto_groups"`
+	Status              int      `json:"status"`
+	RemainQuota         int      `json:"remain_quota"`
+	UsedQuota           int      `json:"used_quota"`
+	UnlimitedQuota      bool     `json:"unlimited_quota"`
+	ExpiredTime         int64    `json:"expired_time"`
 }
 
 type CustomerManagedAPIKeyCapacity struct {
@@ -316,6 +321,8 @@ type CustomerQuotaSummary struct {
 	CollectedAt            int64                         `json:"collected_at"`
 	UserId                 int                           `json:"user_id"`
 	Status                 int                           `json:"status"`
+	UserGroup              string                        `json:"user_group,omitempty"`
+	EffectiveAutoGroups    []string                      `json:"effective_auto_groups,omitempty"`
 	Wallet                 CustomerWalletSummary         `json:"wallet"`
 	Subscriptions          []CustomerSubscriptionSummary `json:"subscriptions"`
 	TokenCaps              []CustomerTokenCapSummary     `json:"token_caps"`
@@ -355,12 +362,17 @@ func GetCustomerQuotaSummary(ctx context.Context, userId int) (*CustomerQuotaSum
 	}
 	result := CustomerQuotaSummary{Source: "new-api", UserId: userId, Subscriptions: []CustomerSubscriptionSummary{}, TokenCaps: []CustomerTokenCapSummary{}, SubscriptionTimeZone: CalculationTimeZone()}
 	result.ManagedAPIKeyCapacity.Limit = operation_setting.GetMaxUserTokens()
+	groupCol := commonGroupCol
+	if groupCol == "" {
+		groupCol = "`group`"
+	}
 	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var user User
-		if err := tx.Select("id", "status", "quota", "used_quota").First(&user, userId).Error; err != nil {
+		if err := tx.Select("id", "status", "quota", "used_quota", groupCol).First(&user, userId).Error; err != nil {
 			return err
 		}
 		result.Status = user.Status
+		result.UserGroup = user.Group
 		result.Wallet = CustomerWalletSummary{Quota: user.Quota, UsedQuota: user.UsedQuota}
 		// Count all native keys, independently of the capped display list or
 		// monetary caps. Expired/disabled keys still occupy native token slots.
@@ -369,14 +381,22 @@ func GetCustomerQuotaSummary(ctx context.Context, userId int) (*CustomerQuotaSum
 		}
 		result.ManagedAPIKeyCapacity.Available = result.ManagedAPIKeyCapacity.Used < int64(result.ManagedAPIKeyCapacity.Limit)
 		if err := tx.Model(&UserSubscription{}).
-			Select("id", "plan_id", "amount_total", "amount_used", "start_time", "end_time", "status", "last_reset_time", "next_reset_time", "allow_wallet_overflow").
+			Select("id", "plan_id", "allowed_groups", "amount_total", "amount_used", "start_time", "end_time", "status", "last_reset_time", "next_reset_time", "allow_wallet_overflow").
 			Where("user_id = ?", userId).Order("id desc").Limit(1001).Scan(&result.Subscriptions).Error; err != nil {
 			return err
 		}
 		if err := tx.Model(&Token{}).
-			Select("id", "name", "status", "remain_quota", "used_quota", "unlimited_quota", "expired_time").
+			Select("id", "name", groupCol, "auto_groups", "status", "remain_quota", "used_quota", "unlimited_quota", "expired_time").
 			Where("user_id = ?", userId).Order("id desc").Limit(1001).Scan(&result.TokenCaps).Error; err != nil {
 			return err
+		}
+		for i := range result.TokenCaps {
+			if raw := strings.TrimSpace(result.TokenCaps[i].AutoGroupsRaw); raw != "" {
+				var parsed []string
+				if unmarshalErr := common.UnmarshalJsonStr(raw, &parsed); unmarshalErr == nil && len(parsed) > 0 {
+					result.TokenCaps[i].AutoGroups = parsed
+				}
+			}
 		}
 		return nil
 	})

@@ -153,5 +153,130 @@ func TestPostConsumeUserSubscriptionDeltaWithOverflow(t *testing.T) {
 	require.NoError(t, db.Create(&subNoOverflow).Error)
 	_, err = PostConsumeUserSubscriptionDeltaWithOverflow(subNoOverflow.Id, user.Id, "openai", 50)
 	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrSubscriptionWalletOverflowDisabled)
 	assert.Contains(t, err.Error(), "wallet_overflow_disabled")
+	// Primary remaining 10 must still be consumed while wallet balance stays untouched.
+	var refreshedNoOv UserSubscription
+	require.NoError(t, db.First(&refreshedNoOv, subNoOverflow.Id).Error)
+	assert.Equal(t, int64(100), refreshedNoOv.AmountUsed)
+	require.NoError(t, db.First(&refreshedUser, user.Id).Error)
+	assert.Equal(t, 430, refreshedUser.Quota)
+
+	// subscription_only MUST forbid wallet overflow even when subscription AllowWalletOverflow=true.
+	subPref := UserSubscription{
+		UserId: user.Id, PlanId: plan.Id, Status: "active",
+		AllowedGroups: "gemini", AllowWalletOverflow: true,
+		AmountTotal: 100, AmountUsed: 90, StartTime: now - 100, EndTime: now + 3600,
+	}
+	require.NoError(t, db.Create(&subPref).Error)
+	prefRes, err := PostConsumeUserSubscriptionDeltaWithOptions(SubscriptionPostConsumeOptions{
+		UserSubscriptionId: subPref.Id,
+		UserId:             user.Id,
+		UsingGroup:         "gemini",
+		Delta:              50,
+		BillingPreference:  "subscription_only",
+	})
+	require.ErrorIs(t, err, ErrSubscriptionWalletOverflowDisabled)
+	assert.Equal(t, int64(10), prefRes.PrimaryDelta)
+	assert.Equal(t, int64(0), prefRes.WalletOverflowDelta)
+	assert.Equal(t, int64(40), prefRes.UnbilledOverflow)
+	require.NoError(t, db.First(&refreshedUser, user.Id).Error)
+	assert.Equal(t, 430, refreshedUser.Quota, "subscription_only must never deduct wallet")
+
+	// Wallet overflow must clamp at zero and never drive User.Quota negative.
+	require.NoError(t, db.Model(&User{}).Where("id = ?", user.Id).Update("quota", 15).Error)
+	subClamp := UserSubscription{
+		UserId: user.Id, PlanId: plan.Id, Status: "active",
+		AllowedGroups: "deepseek", AllowWalletOverflow: true,
+		AmountTotal: 100, AmountUsed: 95, StartTime: now - 100, EndTime: now + 3600,
+	}
+	require.NoError(t, db.Create(&subClamp).Error)
+	clampRes, err := PostConsumeUserSubscriptionDeltaWithOptions(SubscriptionPostConsumeOptions{
+		UserSubscriptionId: subClamp.Id,
+		UserId:             user.Id,
+		UsingGroup:         "deepseek",
+		Delta:              50,
+		BillingPreference:  "subscription_first",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, int64(5), clampRes.PrimaryDelta)
+	assert.Equal(t, int64(15), clampRes.WalletOverflowDelta)
+	assert.Equal(t, int64(30), clampRes.UnbilledOverflow)
+	require.NoError(t, db.First(&refreshedUser, user.Id).Error)
+	assert.Equal(t, 0, refreshedUser.Quota, "wallet quota must never go negative")
+}
+
+func TestPreConsumeUserSubscriptionMultiCardSplitAndRefund(t *testing.T) {
+	db := setupUnifiedWalletTestDB(t)
+	require.NoError(t, db.AutoMigrate(&SubscriptionPreConsumeRecord{}))
+	now := time.Now().Unix()
+
+	user := User{Username: "split-sub-user", Password: "x", Status: common.UserStatusEnabled, Group: "default", Quota: 1000, AffCode: "sp1"}
+	require.NoError(t, db.Create(&user).Error)
+
+	plan := SubscriptionPlan{Title: "Claude Split Pack", Enabled: true, DurationUnit: SubscriptionDurationMonth, DurationValue: 1, TotalAmount: 100}
+	require.NoError(t, db.Create(&plan).Error)
+
+	sub1 := UserSubscription{
+		UserId: user.Id, PlanId: plan.Id, Status: "active",
+		AllowedGroups: "claude-vip", AllowWalletOverflow: true,
+		AmountTotal: 100, AmountUsed: 60, StartTime: now - 100, EndTime: now + 3600,
+	}
+	sub2 := UserSubscription{
+		UserId: user.Id, PlanId: plan.Id, Status: "active",
+		AllowedGroups: "claude-vip", AllowWalletOverflow: true,
+		AmountTotal: 100, AmountUsed: 60, StartTime: now - 100, EndTime: now + 7200,
+	}
+	require.NoError(t, db.Create(&sub1).Error)
+	require.NoError(t, db.Create(&sub2).Error)
+
+	// Each card has 40 remaining; pre-consuming 60 must split across sub1 (40) + sub2 (20).
+	res, err := PreConsumeUserSubscriptionForGroup("req-split-1", user.Id, "claude-opus-4-6", "claude-vip", 0, 60)
+	require.NoError(t, err)
+	assert.Equal(t, sub1.Id, res.UserSubscriptionId)
+	assert.Equal(t, int64(60), res.PreConsumed)
+	assert.Equal(t, int64(40), res.PrimaryPreConsumed)
+	require.Len(t, res.Allocations, 2)
+	assert.Equal(t, sub1.Id, res.Allocations[0].UserSubscriptionId)
+	assert.Equal(t, int64(40), res.Allocations[0].PreConsumed)
+	assert.Equal(t, sub2.Id, res.Allocations[1].UserSubscriptionId)
+	assert.Equal(t, int64(20), res.Allocations[1].PreConsumed)
+
+	// Idempotent replay with same requestId must return identical total without double debit.
+	replay, err := PreConsumeUserSubscriptionForGroup("req-split-1", user.Id, "claude-opus-4-6", "claude-vip", 0, 60)
+	require.NoError(t, err)
+	assert.Equal(t, int64(60), replay.PreConsumed)
+	require.Len(t, replay.Allocations, 2)
+
+	var s1, s2 UserSubscription
+	require.NoError(t, db.First(&s1, sub1.Id).Error)
+	require.NoError(t, db.First(&s2, sub2.Id).Error)
+	assert.Equal(t, int64(100), s1.AmountUsed)
+	assert.Equal(t, int64(80), s2.AmountUsed)
+
+	// Full refund must restore both split cards cleanly and remain idempotent.
+	require.NoError(t, RefundSubscriptionPreConsume("req-split-1"))
+	require.NoError(t, RefundSubscriptionPreConsume("req-split-1"))
+	require.NoError(t, db.First(&s1, sub1.Id).Error)
+	require.NoError(t, db.First(&s2, sub2.Id).Error)
+	assert.Equal(t, int64(60), s1.AmountUsed)
+	assert.Equal(t, int64(60), s2.AmountUsed)
+
+	// Split pre-consume 60 again, then settle actual usage 10 (delta=-50): must LIFO-refund sub2 (-20) then sub1 (-30).
+	res2, err := PreConsumeUserSubscriptionForGroup("req-split-2", user.Id, "claude-opus-4-6", "claude-vip", 0, 60)
+	require.NoError(t, err)
+	settleRes, err := PostConsumeUserSubscriptionDeltaWithOptions(SubscriptionPostConsumeOptions{
+		UserSubscriptionId: res2.UserSubscriptionId,
+		UserId:             user.Id,
+		UsingGroup:         "claude-vip",
+		Delta:              -50,
+		PreConsumeAllocs:   res2.Allocations,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, int64(-30), settleRes.PrimaryDelta)
+	assert.Equal(t, int64(-20), settleRes.SecondarySubDelta)
+	require.NoError(t, db.First(&s1, sub1.Id).Error)
+	require.NoError(t, db.First(&s2, sub2.Id).Error)
+	assert.Equal(t, int64(70), s1.AmountUsed, "sub1 net charge should be 10 (60 -> 70)")
+	assert.Equal(t, int64(60), s2.AmountUsed, "sub2 should be fully refunded back to 60")
 }

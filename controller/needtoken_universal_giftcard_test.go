@@ -9,9 +9,12 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/setting"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
@@ -218,4 +221,111 @@ func TestAdminGetWalletCreditFulfillment_FoundAndNotFound(t *testing.T) {
 	wMiss := httptest.NewRecorder()
 	r.ServeHTTP(wMiss, reqMiss)
 	require.Equal(t, http.StatusNotFound, wMiss.Code)
+}
+
+func TestAdminFulfillmentCapabilitiesAndQuotaSummaryExposeRoutableAutoGroups(t *testing.T) {
+	prevDB, prevLogDB := model.DB, model.LOG_DB
+	prevMain, prevLog := common.MainDatabaseType(), common.LogDatabaseType()
+	prevRedis := common.RedisEnabled
+	prevAutoGroups := setting.AutoGroups2JsonString()
+	prevUsableGroups := setting.UserUsableGroups2JSONString()
+	prevRatios := ratio_setting.GroupRatio2JSONString()
+
+	common.SetDatabaseTypes(common.DatabaseTypeSQLite, common.DatabaseTypeSQLite)
+	common.RedisEnabled = false
+	dsn := fmt.Sprintf("file:%s?mode=memory&cache=shared", strings.ReplaceAll(t.Name(), "/", "_"))
+	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
+	require.NoError(t, err)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(1)
+	model.DB, model.LOG_DB = db, db
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.SubscriptionPlan{}, &model.UserSubscription{}, &model.Token{}))
+	t.Cleanup(func() {
+		model.DB, model.LOG_DB = prevDB, prevLogDB
+		common.SetDatabaseTypes(prevMain, prevLog)
+		common.RedisEnabled = prevRedis
+		_ = setting.UpdateAutoGroupsByJsonString(prevAutoGroups)
+		_ = setting.UpdateUserUsableGroupsByJSONString(prevUsableGroups)
+		_ = ratio_setting.UpdateGroupRatioByJSONString(prevRatios)
+		_ = sqlDB.Close()
+	})
+
+	require.NoError(t, setting.UpdateUserUsableGroupsByJSONString(`{"default":"Default"}`))
+	require.NoError(t, setting.UpdateAutoGroupsByJsonString(`["default","unpriced"]`))
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"default":1,"vip-only":1}`))
+
+	now := time.Now().Unix()
+	u := &model.User{Username: "auto-route-user", Password: "x", Role: common.RoleCommonUser, Status: common.UserStatusEnabled, Group: "default", Quota: 100}
+	require.NoError(t, db.Create(u).Error)
+	plan := &model.SubscriptionPlan{Title: "VIP Plan", AllowedGroups: "vip-only", TotalAmount: 1000, Enabled: true}
+	require.NoError(t, db.Create(plan).Error)
+	sub := &model.UserSubscription{
+		UserId: u.Id, PlanId: plan.Id, AllowedGroups: "vip-only",
+		AmountTotal: 1000, StartTime: now - 60, EndTime: now + 3600, Status: "active",
+	}
+	require.NoError(t, db.Create(sub).Error)
+	tok := &model.Token{
+		UserId: u.Id, Key: "tok-auto-route-1", Name: "Managed Key", Group: "auto",
+		Status: common.TokenStatusEnabled, UnlimitedQuota: true, ExpiredTime: now + 3600,
+	}
+	require.NoError(t, db.Create(tok).Error)
+
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	withPAT := func(h gin.HandlerFunc) gin.HandlerFunc {
+		return func(c *gin.Context) {
+			c.Set("access_token_id", 1)
+			c.Set("access_token_scopes", []string{"billing:write"})
+			h(c)
+		}
+	}
+	r.GET("/api/subscription/admin/capabilities", withPAT(AdminGetFulfillmentCapabilities))
+	r.GET("/api/subscription/admin/users/:id/summary", withPAT(AdminGetCustomerQuotaSummary))
+
+	// 1. Capabilities only lists global auto groups that have configured ratios.
+	wCap := httptest.NewRecorder()
+	r.ServeHTTP(wCap, httptest.NewRequest(http.MethodGet, "/api/subscription/admin/capabilities", nil))
+	require.Equal(t, http.StatusOK, wCap.Code)
+	var capResp struct {
+		Success bool `json:"success"`
+		Data    struct {
+			AutoGroups         []string `json:"auto_groups"`
+			RoutableAutoGroups []string `json:"routable_auto_groups"`
+		} `json:"data"`
+	}
+	require.NoError(t, common.Unmarshal(wCap.Body.Bytes(), &capResp))
+	assert.True(t, capResp.Success)
+	assert.Equal(t, []string{"default", "unpriced"}, capResp.Data.AutoGroups)
+	assert.Equal(t, []string{"default"}, capResp.Data.RoutableAutoGroups)
+
+	// 2. When vip-only is missing from global AutoGroups, auto key cannot route to it.
+	wSum1 := httptest.NewRecorder()
+	r.ServeHTTP(wSum1, httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/subscription/admin/users/%d/summary", u.Id), nil))
+	require.Equal(t, http.StatusOK, wSum1.Code)
+	var sumResp struct {
+		Success bool                       `json:"success"`
+		Data    model.CustomerQuotaSummary `json:"data"`
+	}
+	require.NoError(t, common.Unmarshal(wSum1.Body.Bytes(), &sumResp))
+	assert.Equal(t, []string{"default"}, sumResp.Data.EffectiveAutoGroups)
+	require.Len(t, sumResp.Data.TokenCaps, 1)
+	assert.Equal(t, "auto", sumResp.Data.TokenCaps[0].Group)
+	assert.Equal(t, []string{"default"}, sumResp.Data.TokenCaps[0].EffectiveAutoGroups)
+	require.Len(t, sumResp.Data.Subscriptions, 1)
+	assert.Equal(t, "vip-only", sumResp.Data.Subscriptions[0].AllowedGroups)
+
+	// 3. Adding vip-only to global AutoGroups makes it routable on the auto key.
+	require.NoError(t, setting.UpdateAutoGroupsByJsonString(`["vip-only","default"]`))
+	wSum2 := httptest.NewRecorder()
+	r.ServeHTTP(wSum2, httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/subscription/admin/users/%d/summary", u.Id), nil))
+	require.Equal(t, http.StatusOK, wSum2.Code)
+	sumResp = struct {
+		Success bool                       `json:"success"`
+		Data    model.CustomerQuotaSummary `json:"data"`
+	}{}
+	require.NoError(t, common.Unmarshal(wSum2.Body.Bytes(), &sumResp))
+	assert.Equal(t, []string{"vip-only", "default"}, sumResp.Data.EffectiveAutoGroups)
+	require.Len(t, sumResp.Data.TokenCaps, 1)
+	assert.Equal(t, []string{"vip-only", "default"}, sumResp.Data.TokenCaps[0].EffectiveAutoGroups)
 }

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"time"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 )
 
@@ -79,22 +80,25 @@ func (w *WalletFunding) Refund() error {
 // ---------------------------------------------------------------------------
 
 type SubscriptionFunding struct {
-	requestId      string
-	userId         int
-	modelName      string
-	usingGroup     string
-	amount         int64 // 预扣的订阅额度（subConsume）
-	subscriptionId int
-	preConsumed    int64
+	requestId         string
+	userId            int
+	modelName         string
+	usingGroup        string
+	billingPreference string
+	amount            int64 // 预扣的订阅额度（subConsume）
+	subscriptionId    int
+	preConsumed       int64
+	allocations       []model.SubscriptionPreConsumeAllocation
 	// 以下字段在 PreConsume 成功后填充，供 RelayInfo 同步使用
 	AmountTotal     int64
 	AmountUsedAfter int64
 	PlanId          int
 	PlanTitle       string
 	// 后结算拆分记录，供 BillingSession 精确同步日志
-	lastPrimaryDelta int64
-	lastWalletDelta  int64
-	lastSecondarySub int64
+	lastPrimaryDelta  int64
+	lastWalletDelta   int64
+	lastSecondarySub  int64
+	lastUnbilledDelta int64
 }
 
 func (s *SubscriptionFunding) Source() string { return BillingSourceSubscription }
@@ -107,6 +111,7 @@ func (s *SubscriptionFunding) PreConsume(_ int) error {
 	}
 	s.subscriptionId = res.UserSubscriptionId
 	s.preConsumed = res.PreConsumed
+	s.allocations = res.Allocations
 	s.AmountTotal = res.AmountTotal
 	s.AmountUsedAfter = res.AmountUsedAfter
 	// 获取订阅计划信息
@@ -121,13 +126,31 @@ func (s *SubscriptionFunding) Settle(delta int) error {
 	if delta == 0 {
 		return nil
 	}
-	res, err := model.PostConsumeUserSubscriptionDeltaWithOverflow(s.subscriptionId, s.userId, s.usingGroup, int64(delta))
-	if err != nil {
-		return err
-	}
+	res, err := model.PostConsumeUserSubscriptionDeltaWithOptions(model.SubscriptionPostConsumeOptions{
+		UserSubscriptionId: s.subscriptionId,
+		UserId:             s.userId,
+		UsingGroup:         s.usingGroup,
+		Delta:              int64(delta),
+		BillingPreference:  s.billingPreference,
+		PreConsumeAllocs:   s.allocations,
+	})
 	s.lastPrimaryDelta = res.PrimaryDelta
 	s.lastSecondarySub = res.SecondarySubDelta
 	s.lastWalletDelta = res.WalletOverflowDelta
+	s.lastUnbilledDelta = res.UnbilledOverflow
+	if err != nil {
+		if errors.Is(err, model.ErrSubscriptionWalletOverflowDisabled) {
+			// 订阅剩余额度已原子扣满且严禁扣钱包；记录告警并视为结算完成，避免把已交付内容的请求误退费。
+			common.SysLog(common.LogText("subscription post-consume overflow capped without wallet charge (userId=%d, subId=%d, pref=%s, unbilled=%d)",
+				s.userId, s.subscriptionId, s.billingPreference, res.UnbilledOverflow))
+			return nil
+		}
+		return err
+	}
+	if res.UnbilledOverflow > 0 {
+		common.SysLog(common.LogText("subscription wallet overflow clamped at non-negative balance (userId=%d, subId=%d, wallet=%d, unbilled=%d)",
+			s.userId, s.subscriptionId, res.WalletOverflowDelta, res.UnbilledOverflow))
+	}
 	return nil
 }
 

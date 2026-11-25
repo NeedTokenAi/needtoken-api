@@ -303,22 +303,49 @@ func ApplyExternalWalletDebit(ctx context.Context, userId, maxQuota int, allowPa
 	}, nil
 }
 
-// SubscriptionDeltaOverflowResult records how a positive subscription post-consume
+// ErrSubscriptionWalletOverflowDisabled indicates positive subscription delta exceeded
+// all eligible active subscriptions and wallet spillover was disallowed by either
+// the user's subscription_only preference or a subscription's allow_wallet_overflow=false.
+var ErrSubscriptionWalletOverflowDisabled = errors.New("subscription wallet_overflow_disabled")
+
+// SubscriptionDeltaOverflowResult records how a subscription post-consume
 // delta was absorbed across the primary subscription, stacked sibling subscriptions,
 // and (when allowed) the user's unified wallet balance.
 type SubscriptionDeltaOverflowResult struct {
 	PrimaryDelta        int64
 	SecondarySubDelta   int64
 	WalletOverflowDelta int64
+	UnbilledOverflow    int64
+}
+
+type SubscriptionPostConsumeOptions struct {
+	UserSubscriptionId int
+	UserId             int
+	UsingGroup         string
+	Delta              int64
+	BillingPreference  string
+	PreConsumeAllocs   []SubscriptionPreConsumeAllocation
 }
 
 // PostConsumeUserSubscriptionDeltaWithOverflow settles a subscription delta cleanly.
-// Negative deltas refund the primary subscription directly. Positive deltas that
-// exceed the primary subscription's remaining quota cap the primary subscription
-// at its total and spill the remainder into other eligible active subscriptions
-// (scoped first, earliest expiry first) and finally into User.Quota when wallet
-// overflow is permitted for the group.
+// Retained for backward compatibility; delegates to PostConsumeUserSubscriptionDeltaWithOptions.
 func PostConsumeUserSubscriptionDeltaWithOverflow(userSubscriptionId, userId int, usingGroup string, delta int64) (SubscriptionDeltaOverflowResult, error) {
+	return PostConsumeUserSubscriptionDeltaWithOptions(SubscriptionPostConsumeOptions{
+		UserSubscriptionId: userSubscriptionId,
+		UserId:             userId,
+		UsingGroup:         usingGroup,
+		Delta:              delta,
+	})
+}
+
+// PostConsumeUserSubscriptionDeltaWithOptions settles a subscription delta while
+// honoring multi-card split pre-consume refunds, user billing preferences
+// (subscription_only never spills to wallet), and non-negative wallet bounds.
+func PostConsumeUserSubscriptionDeltaWithOptions(opts SubscriptionPostConsumeOptions) (SubscriptionDeltaOverflowResult, error) {
+	userSubscriptionId := opts.UserSubscriptionId
+	userId := opts.UserId
+	usingGroup := opts.UsingGroup
+	delta := opts.Delta
 	if userSubscriptionId <= 0 {
 		return SubscriptionDeltaOverflowResult{}, errors.New("invalid userSubscriptionId")
 	}
@@ -326,13 +353,64 @@ func PostConsumeUserSubscriptionDeltaWithOverflow(userSubscriptionId, userId int
 		return SubscriptionDeltaOverflowResult{}, nil
 	}
 	if delta < 0 {
-		if err := PostConsumeUserSubscriptionDelta(userSubscriptionId, delta); err != nil {
+		if len(opts.PreConsumeAllocs) <= 1 {
+			if err := PostConsumeUserSubscriptionDelta(userSubscriptionId, delta); err != nil {
+				return SubscriptionDeltaOverflowResult{}, err
+			}
+			return SubscriptionDeltaOverflowResult{PrimaryDelta: delta}, nil
+		}
+		var result SubscriptionDeltaOverflowResult
+		refundRemain := -delta
+		err := DB.Transaction(func(tx *gorm.DB) error {
+			// Refund in reverse allocation order (LIFO) so secondary split cards recover first.
+			for i := len(opts.PreConsumeAllocs) - 1; i >= 0 && refundRemain > 0; i-- {
+				alloc := opts.PreConsumeAllocs[i]
+				if alloc.UserSubscriptionId <= 0 || alloc.PreConsumed <= 0 {
+					continue
+				}
+				var sub UserSubscription
+				if err := lockForUpdate(tx).Where("id = ?", alloc.UserSubscriptionId).First(&sub).Error; err != nil {
+					return err
+				}
+				refundable := min(refundRemain, min(alloc.PreConsumed, sub.AmountUsed))
+				if refundable <= 0 {
+					continue
+				}
+				sub.AmountUsed = max(sub.AmountUsed-refundable, int64(0))
+				if err := tx.Save(&sub).Error; err != nil {
+					return err
+				}
+				if sub.Id == userSubscriptionId {
+					result.PrimaryDelta -= refundable
+				} else {
+					result.SecondarySubDelta -= refundable
+				}
+				refundRemain -= refundable
+			}
+			if refundRemain > 0 {
+				var primary UserSubscription
+				if err := lockForUpdate(tx).Where("id = ?", userSubscriptionId).First(&primary).Error; err != nil {
+					return err
+				}
+				extraRefund := min(refundRemain, primary.AmountUsed)
+				if extraRefund > 0 {
+					primary.AmountUsed = max(primary.AmountUsed-extraRefund, int64(0))
+					if err := tx.Save(&primary).Error; err != nil {
+						return err
+					}
+					result.PrimaryDelta -= extraRefund
+				}
+			}
+			return nil
+		})
+		if err != nil {
 			return SubscriptionDeltaOverflowResult{}, err
 		}
-		return SubscriptionDeltaOverflowResult{PrimaryDelta: delta}, nil
+		return result, nil
 	}
 
 	var result SubscriptionDeltaOverflowResult
+	var overflowRejected bool
 	now := GetDBTimestamp()
 	err := DB.Transaction(func(tx *gorm.DB) error {
 		var primary UserSubscription
@@ -410,8 +488,11 @@ func PostConsumeUserSubscriptionDeltaWithOverflow(userSubscriptionId, userId int
 			return nil
 		}
 
-		// Check whether wallet overflow is permitted across matching active subscriptions.
+		// Check whether wallet overflow is permitted by user preference and active subscriptions.
 		allowOverflow := primary.AllowWalletOverflow
+		if common.NormalizeBillingPreference(opts.BillingPreference) == "subscription_only" {
+			allowOverflow = false
+		}
 		if allowOverflow {
 			for _, candidate := range append(scoped, general...) {
 				if !candidate.AllowWalletOverflow {
@@ -421,17 +502,35 @@ func PostConsumeUserSubscriptionDeltaWithOverflow(userSubscriptionId, userId int
 			}
 		}
 		if !allowOverflow {
-			return fmt.Errorf("subscription used exceeds total, overflow=%d wallet_overflow_disabled", overflow)
+			// Commit absorbed subscription quota and refuse any wallet charge.
+			result.UnbilledOverflow = overflow
+			overflowRejected = true
+			return nil
 		}
 		if overflow > int64(common.MaxWalletQuota) {
 			return fmt.Errorf("subscription overflow exceeds wallet quota bound: %d", overflow)
 		}
-		walletDelta := int(overflow)
-		if err := tx.Model(&User{}).Where("id = ?", effectiveUserId).
-			Update("quota", gorm.Expr("quota - ?", walletDelta)).Error; err != nil {
+		var user User
+		if err := lockForUpdate(tx).Select("id", "quota").First(&user, effectiveUserId).Error; err != nil {
 			return err
 		}
-		result.WalletOverflowDelta = overflow
+		if user.Quota <= 0 {
+			result.UnbilledOverflow = overflow
+			return nil
+		}
+		walletCharge := min(overflow, int64(user.Quota))
+		walletDelta := int(walletCharge)
+		res := tx.Model(&User{}).Where("id = ? AND quota >= ?", effectiveUserId, walletDelta).
+			Update("quota", gorm.Expr("quota - ?", walletDelta))
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected > 0 {
+			result.WalletOverflowDelta = walletCharge
+		}
+		if result.WalletOverflowDelta < overflow {
+			result.UnbilledOverflow = overflow - result.WalletOverflowDelta
+		}
 		return nil
 	})
 	if err != nil {
@@ -444,6 +543,9 @@ func PostConsumeUserSubscriptionDeltaWithOverflow(userSubscriptionId, userId int
 				_ = invalidateUserCache(effectiveUserId)
 			}
 		}
+	}
+	if overflowRejected {
+		return result, fmt.Errorf("%w: overflow=%d", ErrSubscriptionWalletOverflowDisabled, result.UnbilledOverflow)
 	}
 	return result, nil
 }

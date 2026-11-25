@@ -1,6 +1,8 @@
 package model
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strconv"
@@ -1297,12 +1299,19 @@ func AdminResetPlanSubscriptions(planId int, advanceResetTime bool) (*Subscripti
 	return result, nil
 }
 
+type SubscriptionPreConsumeAllocation struct {
+	UserSubscriptionId int
+	PreConsumed        int64
+}
+
 type SubscriptionPreConsumeResult struct {
 	UserSubscriptionId int
 	PreConsumed        int64
+	PrimaryPreConsumed int64
 	AmountTotal        int64
 	AmountUsedBefore   int64
 	AmountUsedAfter    int64
+	Allocations        []SubscriptionPreConsumeAllocation
 }
 
 // ExpireDueSubscriptions marks expired subscriptions and handles group downgrade.
@@ -1468,42 +1477,71 @@ func PreConsumeUserSubscription(requestId string, userId int, modelName string, 
 	return PreConsumeUserSubscriptionForGroup(requestId, userId, modelName, "", quotaType, amount)
 }
 
-// PreConsumeUserSubscriptionForGroup pre-consumes from an active subscription
+func subscriptionSplitRequestPrefix(requestId string) string {
+	sum := sha256.Sum256([]byte(requestId))
+	return "sp:" + hex.EncodeToString(sum[:])[:48] + ":"
+}
+
+func subscriptionSplitRequestId(requestId string, idx int) string {
+	return subscriptionSplitRequestPrefix(requestId) + strconv.Itoa(idx)
+}
+
+// PreConsumeUserSubscriptionForGroup pre-consumes from active subscriptions
 // eligible for usingGroup, prioritizing group-scoped (dedicated) subscriptions
-// ahead of general all-group subscriptions.
+// ahead of general all-group subscriptions. When no single eligible subscription
+// can cover amount alone, it atomically splits the pre-consume across multiple
+// eligible subscriptions within the same transaction.
 func PreConsumeUserSubscriptionForGroup(requestId string, userId int, modelName string, usingGroup string, quotaType int, amount int64) (*SubscriptionPreConsumeResult, error) {
 	if userId <= 0 {
 		return nil, errors.New("invalid userId")
 	}
-	if strings.TrimSpace(requestId) == "" {
+	requestId = strings.TrimSpace(requestId)
+	if requestId == "" {
 		return nil, errors.New("requestId is empty")
 	}
 	if amount <= 0 {
 		return nil, errors.New("amount must be > 0")
 	}
 	now := GetDBTimestamp()
+	splitPrefix := subscriptionSplitRequestPrefix(requestId)
 
 	returnValue := &SubscriptionPreConsumeResult{}
 
 	err := DB.Transaction(func(tx *gorm.DB) error {
-		var existing SubscriptionPreConsumeRecord
-		query := tx.Where("request_id = ?", requestId).Limit(1).Find(&existing)
-		if query.Error != nil {
-			return query.Error
+		var existingRecords []SubscriptionPreConsumeRecord
+		if err := tx.Where("request_id = ? OR request_id LIKE ?", requestId, splitPrefix+"%").
+			Order("id asc").
+			Find(&existingRecords).Error; err != nil {
+			return err
 		}
-		if query.RowsAffected > 0 {
-			if existing.Status == "refunded" {
-				return errors.New("subscription pre-consume already refunded")
+		if len(existingRecords) > 0 {
+			var primaryRecord SubscriptionPreConsumeRecord
+			var totalPre int64
+			allocs := make([]SubscriptionPreConsumeAllocation, 0, len(existingRecords))
+			for _, rec := range existingRecords {
+				if rec.Status == "refunded" {
+					return errors.New("subscription pre-consume already refunded")
+				}
+				if rec.RequestId == requestId || primaryRecord.Id == 0 {
+					primaryRecord = rec
+				}
+				totalPre += rec.PreConsumed
+				allocs = append(allocs, SubscriptionPreConsumeAllocation{
+					UserSubscriptionId: rec.UserSubscriptionId,
+					PreConsumed:        rec.PreConsumed,
+				})
 			}
 			var sub UserSubscription
-			if err := tx.Where("id = ?", existing.UserSubscriptionId).First(&sub).Error; err != nil {
+			if err := tx.Where("id = ?", primaryRecord.UserSubscriptionId).First(&sub).Error; err != nil {
 				return err
 			}
 			returnValue.UserSubscriptionId = sub.Id
-			returnValue.PreConsumed = existing.PreConsumed
+			returnValue.PreConsumed = totalPre
+			returnValue.PrimaryPreConsumed = primaryRecord.PreConsumed
 			returnValue.AmountTotal = sub.AmountTotal
 			returnValue.AmountUsedBefore = sub.AmountUsed
 			returnValue.AmountUsedAfter = sub.AmountUsed
+			returnValue.Allocations = allocs
 			return nil
 		}
 
@@ -1533,19 +1571,24 @@ func PreConsumeUserSubscriptionForGroup(requestId string, userId int, modelName 
 		if len(eligible) == 0 {
 			return errors.New("no active subscription")
 		}
-		for _, candidate := range eligible {
-			sub := candidate
-			plan, err := getSubscriptionPlanByIdTx(tx, sub.PlanId)
+
+		// Reset any due subscriptions before evaluating remaining quota.
+		for i := range eligible {
+			plan, err := getSubscriptionPlanByIdTx(tx, eligible[i].PlanId)
 			if err != nil {
 				return err
 			}
-			if err := maybeResetUserSubscriptionWithPlanTx(tx, &sub, plan, now); err != nil {
+			if err := maybeResetUserSubscriptionWithPlanTx(tx, &eligible[i], plan, now); err != nil {
 				return err
 			}
+		}
+
+		// Fast path: single eligible subscription covers the entire amount.
+		for i := range eligible {
+			sub := &eligible[i]
 			usedBefore := sub.AmountUsed
 			if sub.AmountTotal > 0 {
-				remain := sub.AmountTotal - usedBefore
-				if remain < amount {
+				if sub.AmountTotal-usedBefore < amount {
 					continue
 				}
 			}
@@ -1564,25 +1607,106 @@ func PreConsumeUserSubscriptionForGroup(requestId string, userId int, modelName 
 					}
 					returnValue.UserSubscriptionId = sub.Id
 					returnValue.PreConsumed = dup.PreConsumed
+					returnValue.PrimaryPreConsumed = dup.PreConsumed
 					returnValue.AmountTotal = sub.AmountTotal
 					returnValue.AmountUsedBefore = sub.AmountUsed
 					returnValue.AmountUsedAfter = sub.AmountUsed
+					returnValue.Allocations = []SubscriptionPreConsumeAllocation{{UserSubscriptionId: dup.UserSubscriptionId, PreConsumed: dup.PreConsumed}}
 					return nil
 				}
 				return err
 			}
 			sub.AmountUsed += amount
-			if err := tx.Save(&sub).Error; err != nil {
+			if err := tx.Save(sub).Error; err != nil {
 				return err
 			}
 			returnValue.UserSubscriptionId = sub.Id
 			returnValue.PreConsumed = amount
+			returnValue.PrimaryPreConsumed = amount
 			returnValue.AmountTotal = sub.AmountTotal
 			returnValue.AmountUsedBefore = usedBefore
 			returnValue.AmountUsedAfter = sub.AmountUsed
+			returnValue.Allocations = []SubscriptionPreConsumeAllocation{{UserSubscriptionId: sub.Id, PreConsumed: amount}}
 			return nil
 		}
-		return fmt.Errorf("subscription quota insufficient, need=%d", amount)
+
+		// Multi-subscription split path: check combined remaining quota across eligible cards.
+		var totalRemain int64
+		for i := range eligible {
+			if eligible[i].AmountTotal <= 0 {
+				totalRemain = amount
+				break
+			}
+			if rem := eligible[i].AmountTotal - eligible[i].AmountUsed; rem > 0 {
+				totalRemain += rem
+				if totalRemain >= amount {
+					break
+				}
+			}
+		}
+		if totalRemain < amount {
+			return fmt.Errorf("subscription quota insufficient, need=%d", amount)
+		}
+
+		remaining := amount
+		allocs := make([]SubscriptionPreConsumeAllocation, 0, len(eligible))
+		var primarySub *UserSubscription
+		var primaryUsedBefore int64
+		var primaryTake int64
+		for i := range eligible {
+			if remaining <= 0 {
+				break
+			}
+			sub := &eligible[i]
+			var take int64
+			if sub.AmountTotal <= 0 {
+				take = remaining
+			} else {
+				rem := sub.AmountTotal - sub.AmountUsed
+				if rem <= 0 {
+					continue
+				}
+				take = min(rem, remaining)
+			}
+			recReqID := requestId
+			if len(allocs) > 0 {
+				recReqID = subscriptionSplitRequestId(requestId, len(allocs))
+			} else {
+				primarySub = sub
+				primaryUsedBefore = sub.AmountUsed
+				primaryTake = take
+			}
+			record := &SubscriptionPreConsumeRecord{
+				RequestId:          recReqID,
+				UserId:             userId,
+				UserSubscriptionId: sub.Id,
+				PreConsumed:        take,
+				Status:             "consumed",
+			}
+			if err := tx.Create(record).Error; err != nil {
+				return err
+			}
+			sub.AmountUsed += take
+			if err := tx.Save(sub).Error; err != nil {
+				return err
+			}
+			allocs = append(allocs, SubscriptionPreConsumeAllocation{
+				UserSubscriptionId: sub.Id,
+				PreConsumed:        take,
+			})
+			remaining -= take
+		}
+		if remaining > 0 || primarySub == nil {
+			return fmt.Errorf("subscription quota insufficient, need=%d", amount)
+		}
+		returnValue.UserSubscriptionId = primarySub.Id
+		returnValue.PreConsumed = amount
+		returnValue.PrimaryPreConsumed = primaryTake
+		returnValue.AmountTotal = primarySub.AmountTotal
+		returnValue.AmountUsedBefore = primaryUsedBefore
+		returnValue.AmountUsedAfter = primarySub.AmountUsed
+		returnValue.Allocations = allocs
+		return nil
 	})
 	if err != nil {
 		return nil, err
@@ -1590,29 +1714,46 @@ func PreConsumeUserSubscriptionForGroup(requestId string, userId int, modelName 
 	return returnValue, nil
 }
 
-// RefundSubscriptionPreConsume is idempotent and refunds pre-consumed subscription quota by requestId.
+// RefundSubscriptionPreConsume is idempotent and refunds pre-consumed subscription quota
+// across single or multi-subscription split allocations by requestId.
 func RefundSubscriptionPreConsume(requestId string) error {
-	if strings.TrimSpace(requestId) == "" {
+	requestId = strings.TrimSpace(requestId)
+	if requestId == "" {
 		return errors.New("requestId is empty")
 	}
+	splitPrefix := subscriptionSplitRequestPrefix(requestId)
 	return DB.Transaction(func(tx *gorm.DB) error {
-		var record SubscriptionPreConsumeRecord
+		var records []SubscriptionPreConsumeRecord
 		if err := lockForUpdate(tx).
-			Where("request_id = ?", requestId).First(&record).Error; err != nil {
+			Where("request_id = ? OR request_id LIKE ?", requestId, splitPrefix+"%").
+			Order("id asc").
+			Find(&records).Error; err != nil {
 			return err
 		}
-		if record.Status == "refunded" {
-			return nil
+		if len(records) == 0 {
+			return gorm.ErrRecordNotFound
 		}
-		if record.PreConsumed <= 0 {
-			record.Status = "refunded"
-			return tx.Save(&record).Error
+		for i := range records {
+			rec := &records[i]
+			if rec.Status == "refunded" {
+				continue
+			}
+			if rec.PreConsumed > 0 {
+				var sub UserSubscription
+				if err := lockForUpdate(tx).Where("id = ?", rec.UserSubscriptionId).First(&sub).Error; err != nil {
+					return err
+				}
+				sub.AmountUsed = max(sub.AmountUsed-rec.PreConsumed, int64(0))
+				if err := tx.Save(&sub).Error; err != nil {
+					return err
+				}
+			}
+			rec.Status = "refunded"
+			if err := tx.Save(rec).Error; err != nil {
+				return err
+			}
 		}
-		if err := PostConsumeUserSubscriptionDelta(record.UserSubscriptionId, -record.PreConsumed); err != nil {
-			return err
-		}
-		record.Status = "refunded"
-		return tx.Save(&record).Error
+		return nil
 	})
 }
 

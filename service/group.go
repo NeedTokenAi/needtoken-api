@@ -164,6 +164,31 @@ func FilterUserTokenAutoGroups(userGroup string, groups []string) []string {
 	return filterUserTokenAutoGroupsWithUser(0, userGroup, groups)
 }
 
+// FilterUserTokenAutoGroupsForUser applies user group and active subscription
+// unlock permissions to an explicit token auto_groups snapshot.
+func FilterUserTokenAutoGroupsForUser(userId int, userGroup string, groups []string) []string {
+	return filterUserTokenAutoGroupsWithUser(userId, userGroup, groups)
+}
+
+// GetRoutableGlobalAutoGroups returns global Auto groups that also have a
+// configured group ratio, matching the exact routing gate in resolveEffectiveAutoGroups.
+func GetRoutableGlobalAutoGroups() []string {
+	raw := setting.GetAutoGroups()
+	out := make([]string, 0, len(raw))
+	seen := make(map[string]struct{}, len(raw))
+	for _, group := range raw {
+		if group == "" || group == "auto" || !ratio_setting.ContainsGroupRatio(group) {
+			continue
+		}
+		if _, ok := seen[group]; ok {
+			continue
+		}
+		seen[group] = struct{}{}
+		out = append(out, group)
+	}
+	return out
+}
+
 func filterUserTokenAutoGroupsWithUser(userId int, userGroup string, groups []string) []string {
 	maxCount := setting.GetMaxTokenAutoGroups()
 	filtered := make([]string, 0, min(len(groups), maxCount))

@@ -79,7 +79,9 @@ func (s *BillingSession) Settle(actualQuota int) error {
 	// 3) 更新 relayInfo 上的订阅 PostDelta（用于日志；若超额溢入二卡或钱包余额则精准记录）
 	if sub, ok := s.funding.(*SubscriptionFunding); ok {
 		s.relayInfo.SubscriptionPostDelta += sub.lastPrimaryDelta
-		if sub.lastSecondarySub > 0 || sub.lastWalletDelta > 0 {
+		s.relayInfo.SubscriptionSecondaryDelta += sub.lastSecondarySub
+		s.relayInfo.SubscriptionWalletOverflow += sub.lastWalletDelta
+		if sub.lastSecondarySub != 0 || sub.lastWalletDelta > 0 {
 			common.SysLog(common.LogText("subscription post-consume overflow settled (userId=%d, subId=%d, primary=%d, secondarySub=%d, wallet=%d)",
 				s.relayInfo.UserId, sub.subscriptionId, sub.lastPrimaryDelta, sub.lastSecondarySub, sub.lastWalletDelta))
 		}
@@ -375,6 +377,8 @@ func (s *BillingSession) syncRelayInfo() {
 		info.SubscriptionId = sub.subscriptionId
 		info.SubscriptionPreConsumed = sub.preConsumed + int64(s.extraReserved)
 		info.SubscriptionPostDelta = 0
+		info.SubscriptionSecondaryDelta = 0
+		info.SubscriptionWalletOverflow = 0
 		info.SubscriptionAmountTotal = sub.AmountTotal
 		info.SubscriptionAmountUsedAfterPreConsume = sub.AmountUsedAfter + int64(s.extraReserved)
 		info.SubscriptionPlanId = sub.PlanId
@@ -442,11 +446,12 @@ func NewBillingSession(c *gin.Context, relayInfo *relaycommon.RelayInfo, preCons
 			relayInfo: relayInfo,
 			lang:      i18n.StatedLang(c),
 			funding: &SubscriptionFunding{
-				requestId:  relayInfo.RequestId,
-				userId:     relayInfo.UserId,
-				modelName:  relayInfo.GetBillingModelName(),
-				usingGroup: usingGroup,
-				amount:     subConsume,
+				requestId:         relayInfo.RequestId,
+				userId:            relayInfo.UserId,
+				modelName:         relayInfo.GetBillingModelName(),
+				usingGroup:        usingGroup,
+				billingPreference: pref,
+				amount:            subConsume,
 			},
 		}
 		// 必须传 subConsume 而非 preConsumedQuota，保证 SubscriptionFunding.amount、
