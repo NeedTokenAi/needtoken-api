@@ -117,6 +117,8 @@ func MemberConsoleWalletRedeem(c *gin.Context) {
 
 func writeUnifiedWalletError(c *gin.Context, err error) {
 	switch {
+	case errors.Is(err, model.ErrExternalGrantRolledBack):
+		common.ApiErrorStatus(c, http.StatusConflict, common.NewMessage("Operation was already rolled back"), gin.H{"code": "operation_rolled_back"})
 	case errors.Is(err, model.ErrExternalGrantConflict):
 		common.ApiErrorStatus(c, http.StatusConflict, common.NewMessage("Operation payload conflict"), gin.H{"code": "operation_conflict"})
 	case errors.Is(err, model.ErrWalletInsufficientBalance):

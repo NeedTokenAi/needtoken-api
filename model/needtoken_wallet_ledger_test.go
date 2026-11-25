@@ -79,6 +79,29 @@ func TestExternalWalletCreditDebitIdempotencyAndBounds(t *testing.T) {
 	assert.True(t, debitReplay.Replayed)
 	assert.Equal(t, 3500, debitReplay.AppliedQuota)
 	assert.Equal(t, 0, debitReplay.BalanceQuota)
+
+	// Once a debit operation has been compensated via :rollback, replaying the original
+	// operation_id MUST fail closed instead of returning a stale receipt.
+	rbRes, err := ApplyExternalWalletCredit(ctx, user.Id, 3500, "order:202:pay:rollback", "order rollback")
+	require.NoError(t, err)
+	assert.False(t, rbRes.Replayed)
+	assert.Equal(t, 3500, rbRes.BalanceQuota)
+
+	_, err = ApplyExternalWalletDebit(ctx, user.Id, 4000, true, "order:202:pay", "order partial")
+	assert.ErrorIs(t, err, ErrExternalGrantRolledBack)
+	balAfter, err := GetUserQuota(user.Id, false)
+	require.NoError(t, err)
+	assert.Equal(t, 3500, balAfter)
+
+	// Universal gift card claim credits are durably indexed by ugc_claim:<claim_id>.
+	gcRes, err := ApplyExternalWalletCredit(ctx, user.Id, 500, "ugc_claim:na_test123", "Universal gift card (NTGC-TEST)")
+	require.NoError(t, err)
+	assert.False(t, gcRes.Replayed)
+	grant, err := GetExternalGrant(ctx, "ugc_claim:na_test123", ExternalGrantWalletCredit)
+	require.NoError(t, err)
+	assert.Equal(t, user.Id, grant.UserId)
+	assert.Equal(t, 500, grant.Quota)
+	assert.Equal(t, "succeeded", grant.State)
 }
 
 func TestPostConsumeUserSubscriptionDeltaWithOverflow(t *testing.T) {

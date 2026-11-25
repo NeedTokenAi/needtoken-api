@@ -96,6 +96,18 @@ func AdminGetSubscriptionFulfillment(c *gin.Context) {
 	common.ApiSuccess(c, grant)
 }
 
+func AdminGetWalletCreditFulfillment(c *gin.Context) {
+	if !requireExternalGrantPAT(c) {
+		return
+	}
+	grant, err := model.GetExternalGrant(c.Request.Context(), c.Param("operation_id"), model.ExternalGrantWalletCredit)
+	if err != nil {
+		externalGrantError(c, err)
+		return
+	}
+	common.ApiSuccess(c, grant)
+}
+
 func AdminCreateRedemptionFulfillment(c *gin.Context) {
 	if !requireExternalGrantPAT(c) || !requirePaymentCompliance(c) {
 		return

@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -10,9 +11,12 @@ import (
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
 	"github.com/gin-gonic/gin"
+	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
 
 func TestTryRedeemUniversalGiftCard_SuccessAndRollbackRelease(t *testing.T) {
@@ -91,10 +95,11 @@ func TestTryRedeemUniversalGiftCard_SuccessAndRollbackRelease(t *testing.T) {
 	t.Setenv("NEEDTOKEN_GLUE_URL", srv.URL)
 	t.Setenv("NEEDTOKEN_LINKING_SECRET", testSecret)
 	var creditedUID, creditedQuota int
-	var creditedCode string
-	universalGiftCardCreditFn = func(userId int, quota int, cardCode string) error {
+	var creditedClaimID, creditedCode string
+	universalGiftCardCreditFn = func(_ context.Context, userId int, quota int, claimID, cardCode string) error {
 		creditedUID = userId
 		creditedQuota = quota
+		creditedClaimID = claimID
 		creditedCode = cardCode
 		return nil
 	}
@@ -105,6 +110,7 @@ func TestTryRedeemUniversalGiftCard_SuccessAndRollbackRelease(t *testing.T) {
 	assert.Equal(t, 5000000, q)
 	assert.Equal(t, 7, creditedUID)
 	assert.Equal(t, 5000000, creditedQuota)
+	assert.True(t, strings.HasPrefix(creditedClaimID, "na_"), "claim_id must be threaded into idempotent credit ledger")
 	assert.Equal(t, "NTGC-ABCD-1234", creditedCode)
 	assert.Equal(t, []string{needTokenUniversalGiftCardClaimPath, needTokenUniversalGiftCardConfirmPath}, calls)
 	assert.NotEmpty(t, claimBody)
@@ -114,7 +120,7 @@ func TestTryRedeemUniversalGiftCard_SuccessAndRollbackRelease(t *testing.T) {
 	// 3. Local credit error MUST trigger Release so card is never stranded.
 	calls = nil
 	lastReleaseReason = ""
-	universalGiftCardCreditFn = func(userId int, quota int, cardCode string) error {
+	universalGiftCardCreditFn = func(_ context.Context, userId int, quota int, claimID, cardCode string) error {
 		return errors.New("wallet limit exceeded")
 	}
 	handled, q, err = tryRedeemUniversalGiftCard(context.Background(), "NTGC-ABCD-1234", 7)
@@ -147,4 +153,69 @@ func TestAddRedemptionDisabledReturns410Gone(t *testing.T) {
 
 	require.Equal(t, http.StatusGone, w.Code)
 	assert.Contains(t, w.Body.String(), "single_side_redemption_generation_disabled")
+}
+
+func TestAdminGetWalletCreditFulfillment_FoundAndNotFound(t *testing.T) {
+	prevDB, prevLogDB := model.DB, model.LOG_DB
+	prevMain, prevLog := common.MainDatabaseType(), common.LogDatabaseType()
+	prevRedis := common.RedisEnabled
+	common.SetDatabaseTypes(common.DatabaseTypeSQLite, common.DatabaseTypeSQLite)
+	common.RedisEnabled = false
+	dsn := fmt.Sprintf("file:%s?mode=memory&cache=shared", strings.ReplaceAll(t.Name(), "/", "_"))
+	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
+	require.NoError(t, err)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(1)
+	model.DB, model.LOG_DB = db, db
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.ExternalGrant{}, &model.Log{}))
+	t.Cleanup(func() {
+		model.DB, model.LOG_DB = prevDB, prevLogDB
+		common.SetDatabaseTypes(prevMain, prevLog)
+		common.RedisEnabled = prevRedis
+		_ = sqlDB.Close()
+	})
+
+	u := &model.User{Username: "ugc-audit", Password: "x", Role: common.RoleCommonUser, Status: common.UserStatusEnabled, Group: "default", Quota: 0}
+	require.NoError(t, db.Create(u).Error)
+	_, err = model.ApplyExternalWalletCredit(context.Background(), u.Id, 5000000, "ugc_claim:na_claim_audit_1", "Universal gift card")
+	require.NoError(t, err)
+
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.GET("/api/subscription/admin/wallet-credits/:operation_id", func(c *gin.Context) {
+		if c.GetHeader("X-Test-PAT") == "1" {
+			c.Set("access_token_id", 1)
+		}
+		AdminGetWalletCreditFulfillment(c)
+	})
+
+	// 1. Without PAT auth -> rejected 403.
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/subscription/admin/wallet-credits/ugc_claim:na_claim_audit_1", nil))
+	require.Equal(t, http.StatusForbidden, w.Code)
+
+	// 2. Existing wallet credit op -> 200 with exact user_id & quota.
+	req := httptest.NewRequest(http.MethodGet, "/api/subscription/admin/wallet-credits/ugc_claim:na_claim_audit_1", nil)
+	req.Header.Set("X-Test-PAT", "1")
+	w = httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+	var resp struct {
+		Success bool                `json:"success"`
+		Data    model.ExternalGrant `json:"data"`
+	}
+	require.NoError(t, common.Unmarshal(w.Body.Bytes(), &resp))
+	assert.True(t, resp.Success)
+	assert.Equal(t, "ugc_claim:na_claim_audit_1", resp.Data.OperationId)
+	assert.Equal(t, u.Id, resp.Data.UserId)
+	assert.Equal(t, 5000000, resp.Data.Quota)
+	assert.Equal(t, "succeeded", resp.Data.State)
+
+	// 3. Missing op -> 404.
+	reqMiss := httptest.NewRequest(http.MethodGet, "/api/subscription/admin/wallet-credits/ugc_claim:not_found", nil)
+	reqMiss.Header.Set("X-Test-PAT", "1")
+	wMiss := httptest.NewRecorder()
+	r.ServeHTTP(wMiss, reqMiss)
+	require.Equal(t, http.StatusNotFound, wMiss.Code)
 }

@@ -68,7 +68,15 @@ var (
 			return http.ErrUseLastResponse
 		},
 	}
-	universalGiftCardCreditFn = model.CreditUniversalGiftCardTopUp
+	universalGiftCardCreditFn = func(ctx context.Context, userId int, quota int, claimID, cardCode string) error {
+		opID := "ugc_claim:" + strings.TrimSpace(claimID)
+		remark := "Universal gift card"
+		if trimmedCode := strings.TrimSpace(cardCode); trimmedCode != "" {
+			remark = fmt.Sprintf("Universal gift card (%s)", trimmedCode)
+		}
+		_, err := model.ApplyExternalWalletCredit(ctx, userId, quota, opID, remark)
+		return err
+	}
 )
 
 func universalGiftCardConfig() (baseURL string, secret []byte, ok bool) {
@@ -204,7 +212,7 @@ func tryRedeemUniversalGiftCard(ctx context.Context, rawKey string, userID int) 
 		return true, 0, convErr
 	}
 
-	if creditErr := universalGiftCardCreditFn(userID, creditedQuota, resolvedCode); creditErr != nil {
+	if creditErr := universalGiftCardCreditFn(ctx, userID, creditedQuota, resolvedClaimID, resolvedCode); creditErr != nil {
 		_, _ = postUniversalGiftCardGlue(context.Background(), baseURL, secret, needTokenUniversalGiftCardReleasePath, universalGiftCardReleaseReq{
 			Code:    resolvedCode,
 			ClaimID: resolvedClaimID,
