@@ -18,7 +18,24 @@ const (
 
 var (
 	ErrWalletInsufficientBalance = errors.New("insufficient unified wallet balance")
+	ErrExternalGrantRolledBack   = errors.New("external wallet debit operation was already rolled back")
 )
+
+func hasRolledBackDebitGrant(ctx context.Context, operationId string) (bool, error) {
+	rollbackOpID := operationId + ":rollback"
+	if !validExternalGrantOperationID(rollbackOpID) {
+		return false, nil
+	}
+	var count int64
+	err := DB.WithContext(ctx).
+		Model(&ExternalGrant{}).
+		Where("operation_key = ? AND kind = ?", externalGrantDigest([]byte(rollbackOpID)), ExternalGrantWalletCredit).
+		Count(&count).Error
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
 
 type ExternalWalletMutationResult struct {
 	OperationId  string `json:"operation_id"`
@@ -167,6 +184,13 @@ func ApplyExternalWalletDebit(ctx context.Context, userId, maxQuota int, allowPa
 		if existing.Kind != ExternalGrantWalletDebit || existing.PayloadHash != payloadHash {
 			return nil, ErrExternalGrantConflict
 		}
+		rolledBack, rbErr := hasRolledBackDebitGrant(ctx, operationId)
+		if rbErr != nil {
+			return nil, rbErr
+		}
+		if rolledBack {
+			return nil, ErrExternalGrantRolledBack
+		}
 		balance, balErr := GetUserQuota(userId, false)
 		if balErr != nil {
 			balance = 0
@@ -235,6 +259,13 @@ func ApplyExternalWalletDebit(ctx context.Context, userId, maxQuota int, allowPa
 			if lookupErr := DB.WithContext(ctx).Where("operation_key = ?", opKey).First(&recovered).Error; lookupErr == nil {
 				if recovered.Kind != ExternalGrantWalletDebit || recovered.PayloadHash != payloadHash {
 					return nil, ErrExternalGrantConflict
+				}
+				rolledBack, rbErr := hasRolledBackDebitGrant(ctx, operationId)
+				if rbErr != nil {
+					return nil, rbErr
+				}
+				if rolledBack {
+					return nil, ErrExternalGrantRolledBack
 				}
 				balance, _ := GetUserQuota(userId, false)
 				return &ExternalWalletMutationResult{
