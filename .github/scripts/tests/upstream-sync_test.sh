@@ -197,5 +197,7 @@ is_high_risk_path "web/src/components/profile-dropdown.tsx" || fail "profile-dro
 is_high_risk_path "service/billing_session.go" || fail "service/billing_session.go must be high-risk"
 is_high_risk_path "service/group.go" || fail "service/group.go must be high-risk"
 is_high_risk_path "controller/needtoken_slo.go" || fail "controller/needtoken_slo.go must be high-risk"
+is_high_risk_path "controller/needtoken_unified_wallet.go" || fail "controller/needtoken_unified_wallet.go must be high-risk"
+is_high_risk_path "model/needtoken_wallet_ledger.go" || fail "model/needtoken_wallet_ledger.go must be high-risk"
 
 echo "needtoken-api upstream-sync ok"

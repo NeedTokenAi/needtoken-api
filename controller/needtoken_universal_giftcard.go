@@ -213,11 +213,26 @@ func tryRedeemUniversalGiftCard(ctx context.Context, rawKey string, userID int) 
 		return true, 0, creditErr
 	}
 
-	_, _ = postUniversalGiftCardGlue(context.Background(), baseURL, secret, needTokenUniversalGiftCardConfirmPath, universalGiftCardConfirmReq{
+	confirmPayload := universalGiftCardConfirmReq{
 		Code:          resolvedCode,
 		ClaimID:       resolvedClaimID,
 		TxnRef:        fmt.Sprintf("newapi:topup:user:%d:%s", userID, resolvedClaimID),
 		CreditDisplay: fmt.Sprintf("$%s USD", usd.StringFixed(2)),
-	}, nil)
+	}
+	var confirmErr error
+	for attempt := range 3 {
+		if _, err := postUniversalGiftCardGlue(context.Background(), baseURL, secret, needTokenUniversalGiftCardConfirmPath, confirmPayload, nil); err == nil {
+			confirmErr = nil
+			break
+		} else {
+			confirmErr = err
+			if attempt < 2 {
+				time.Sleep(time.Duration(attempt+1) * 150 * time.Millisecond)
+			}
+		}
+	}
+	if confirmErr != nil {
+		common.SysError(common.LogText("universal gift card confirm failed after credit (code=%s claim_id=%s user_id=%d): %s", resolvedCode, resolvedClaimID, userID, confirmErr.Error()))
+	}
 	return true, creditedQuota, nil
 }
