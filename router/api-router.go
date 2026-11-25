@@ -240,6 +240,9 @@ func SetApiRouter(router *gin.Engine) {
 		apiRouter.GET("/subscription/admin/needtoken-console/users/:id/tasks", middleware.DisableCache(), controller.MemberConsoleListTasks)
 		apiRouter.GET("/subscription/admin/needtoken-console/users/:id/drawings", middleware.DisableCache(), controller.MemberConsoleListDrawings)
 		apiRouter.GET("/subscription/admin/needtoken-console/users/:id/subscriptions", middleware.DisableCache(), controller.MemberConsoleSubscriptions)
+		apiRouter.POST("/subscription/admin/needtoken-console/users/:id/wallet/credit", middleware.CriticalRateLimit(), middleware.DisableCache(), controller.MemberConsoleWalletCredit)
+		apiRouter.POST("/subscription/admin/needtoken-console/users/:id/wallet/debit", middleware.CriticalRateLimit(), middleware.DisableCache(), controller.MemberConsoleWalletDebit)
+		apiRouter.POST("/subscription/admin/needtoken-console/users/:id/wallet/redeem", middleware.CriticalRateLimit(), middleware.DisableCache(), controller.MemberConsoleWalletRedeem)
 
 		// Subscription payment callbacks (no auth)
 		apiRouter.POST("/subscription/epay/notify", anonymousRequestBodyLimit, controller.SubscriptionEpayNotify)
