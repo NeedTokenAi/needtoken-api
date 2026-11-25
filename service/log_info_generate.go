@@ -211,7 +211,7 @@ func appendBillingInfo(relayInfo *relaycommon.RelayInfo, other *model.LogOther) 
 			other.SetPublic("subscription_plan_title", relayInfo.SubscriptionPlanTitle)
 		}
 		// Compute "this request" subscription consumed + remaining
-		consumed := relayInfo.SubscriptionPreConsumed + relayInfo.SubscriptionPostDelta
+		consumed := relayInfo.SubscriptionPreConsumed + relayInfo.SubscriptionPostDelta + relayInfo.SubscriptionSecondaryDelta
 		usedFinal := relayInfo.SubscriptionAmountUsedAfterPreConsume + relayInfo.SubscriptionPostDelta
 		if consumed < 0 {
 			consumed = 0
@@ -228,8 +228,10 @@ func appendBillingInfo(relayInfo *relaycommon.RelayInfo, other *model.LogOther) 
 		if consumed > 0 {
 			other.SetPublic("subscription_consumed", consumed)
 		}
-		// Wallet quota is not deducted when billed from subscription.
-		other.SetPublic("wallet_quota_deducted", 0)
+		if relayInfo.SubscriptionSecondaryDelta != 0 {
+			other.SetPublic("subscription_secondary_delta", relayInfo.SubscriptionSecondaryDelta)
+		}
+		other.SetPublic("wallet_quota_deducted", relayInfo.SubscriptionWalletOverflow)
 	}
 }
 
