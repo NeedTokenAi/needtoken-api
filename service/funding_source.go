@@ -91,6 +91,10 @@ type SubscriptionFunding struct {
 	AmountUsedAfter int64
 	PlanId          int
 	PlanTitle       string
+	// 后结算拆分记录，供 BillingSession 精确同步日志
+	lastPrimaryDelta int64
+	lastWalletDelta  int64
+	lastSecondarySub int64
 }
 
 func (s *SubscriptionFunding) Source() string { return BillingSourceSubscription }
@@ -117,7 +121,14 @@ func (s *SubscriptionFunding) Settle(delta int) error {
 	if delta == 0 {
 		return nil
 	}
-	return model.PostConsumeUserSubscriptionDelta(s.subscriptionId, int64(delta))
+	res, err := model.PostConsumeUserSubscriptionDeltaWithOverflow(s.subscriptionId, s.userId, s.usingGroup, int64(delta))
+	if err != nil {
+		return err
+	}
+	s.lastPrimaryDelta = res.PrimaryDelta
+	s.lastSecondarySub = res.SecondarySubDelta
+	s.lastWalletDelta = res.WalletOverflowDelta
+	return nil
 }
 
 func (s *SubscriptionFunding) Refund() error {

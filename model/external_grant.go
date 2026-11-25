@@ -217,9 +217,10 @@ func CreateExternalGrant(ctx context.Context, creatorUserId int, request Externa
 				}
 				// This removes only the additional per-token cap. Native wallet and
 				// subscription limits, resets and billing preferences still govern
-				// every request. An empty group follows the recipient's native group.
+				// every request. Group "auto" routes across active dedicated
+				// subscriptions and usable groups for multi-model mixed calling.
 				token := Token{
-					UserId: request.UserId, Key: key, Name: "API subscription",
+					UserId: request.UserId, Key: key, Name: "API subscription", Group: "auto",
 					Status: common.TokenStatusEnabled, CreatedTime: common.GetTimestamp(), AccessedTime: common.GetTimestamp(),
 					ExpiredTime: subscription.EndTime, UnlimitedQuota: true, AllowUserQuotaQuery: true,
 				}

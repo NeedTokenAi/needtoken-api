@@ -76,9 +76,13 @@ func (s *BillingSession) Settle(actualQuota int) error {
 				s.relayInfo.UserId, s.relayInfo.TokenId, delta, tokenErr.Error()))
 		}
 	}
-	// 3) 更新 relayInfo 上的订阅 PostDelta（用于日志）
-	if s.funding.Source() == BillingSourceSubscription {
-		s.relayInfo.SubscriptionPostDelta += int64(delta)
+	// 3) 更新 relayInfo 上的订阅 PostDelta（用于日志；若超额溢入二卡或钱包余额则精准记录）
+	if sub, ok := s.funding.(*SubscriptionFunding); ok {
+		s.relayInfo.SubscriptionPostDelta += sub.lastPrimaryDelta
+		if sub.lastSecondarySub > 0 || sub.lastWalletDelta > 0 {
+			common.SysLog(common.LogText("subscription post-consume overflow settled (userId=%d, subId=%d, primary=%d, secondarySub=%d, wallet=%d)",
+				s.relayInfo.UserId, sub.subscriptionId, sub.lastPrimaryDelta, sub.lastSecondarySub, sub.lastWalletDelta))
+		}
 	}
 	s.settled = true
 	return tokenErr

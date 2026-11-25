@@ -410,7 +410,7 @@ func testManagedSubscriptionGrant(t *testing.T, db *gorm.DB, user User, plan Sub
 	_, err = GetTokenByIds(token.Id, user.Id+1)
 	assert.ErrorIs(t, err, gorm.ErrRecordNotFound, "another account cannot reveal the managed key")
 	assert.Equal(t, common.TokenStatusEnabled, token.Status)
-	assert.Empty(t, token.Group, "follow the recipient's native group")
+	assert.Equal(t, "auto", token.Group, "auto-route across active subscriptions and usable groups")
 	assert.False(t, token.CrossGroupRetry)
 	assert.False(t, token.ModelLimitsEnabled)
 	assert.True(t, token.UnlimitedQuota, "no additional token cap; native billing remains authoritative")
