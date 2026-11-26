@@ -160,26 +160,53 @@ test("internal secret unlocks exact glue/ops admin APIs only and never pure admi
     new Request("https://api.example/api/user/search?keyword=test", { headers }),
     new Request("https://api.example/api/option/", { method: "GET", headers }),
     new Request("https://api.example/api/option/", { method: "PUT", headers }),
+    new Request("https://api.example/api/option/model_pricing", { method: "GET", headers }),
+    new Request("https://api.example/api/option/model_pricing", { method: "PATCH", headers }),
+    new Request("https://api.example/api/option/model_pricing/issues", { method: "GET", headers }),
+    new Request("https://api.example/api/option/model_pricing/preview", { method: "POST", headers }),
     new Request("https://api.example/api/data/users?start_timestamp=1&end_timestamp=2", { method: "GET", headers }),
+    new Request("https://api.example/api/data/?start_timestamp=1&end_timestamp=2", { method: "GET", headers }),
+    new Request("https://api.example/api/log/?p=1&page_size=20", { method: "GET", headers }),
+    new Request("https://api.example/api/log/stat?type=2", { method: "GET", headers }),
+    new Request("https://api.example/api/task?p=1&page_size=20", { method: "GET", headers }),
+    new Request("https://api.example/api/mj/?p=1&page_size=20", { method: "GET", headers }),
   ]) {
     const res = await handleEdgeAdminGate(allowedInternal, env, sql);
     assert.equal(res.allow, true, `expected internal allow for ${allowedInternal.method} ${allowedInternal.url}`);
   }
 
-  // Even with internal secret, pure root/UI endpoints and option/data sub-paths stay closed unless a break-glass cookie is issued.
+  // Even with internal secret, pure root/UI endpoints and unallowed option/data/log sub-paths or methods stay closed unless a break-glass cookie is issued.
   for (const stillBlocked of [
     new Request("https://api.example/system-settings", { headers }),
     new Request("https://api.example/api/option/", { method: "POST", headers }),
     new Request("https://api.example/api/option/", { method: "DELETE", headers }),
     new Request("https://api.example/api/option/payment_compliance", { method: "POST", headers }),
-    new Request("https://api.example/api/option/model_pricing", { method: "GET", headers }),
-    new Request("https://api.example/api/data/", { method: "GET", headers }),
+    new Request("https://api.example/api/option/model_pricing", { method: "DELETE", headers }),
+    new Request("https://api.example/api/option/model_pricing/preview", { method: "GET", headers }),
+    new Request("https://api.example/api/data/", { method: "POST", headers }),
     new Request("https://api.example/api/data/users", { method: "POST", headers }),
     new Request("https://api.example/api/data/flow", { method: "GET", headers }),
+    new Request("https://api.example/api/log/", { method: "POST", headers }),
+    new Request("https://api.example/api/task", { method: "POST", headers }),
+    new Request("https://api.example/api/mj/", { method: "POST", headers }),
     new Request("https://api.example/api/performance/stats", { headers }),
   ]) {
     const res = await handleEdgeAdminGate(stillBlocked, env, sql);
     assert.equal(res.response?.status, 404, `expected 404 for ${stillBlocked.method} ${stillBlocked.url}`);
+  }
+
+  // Without secret, strict internal pricing/log routes MUST return 404 publicly.
+  for (const publicBlocked of [
+    "https://api.example/api/option/model_pricing",
+    "https://api.example/api/option/model_pricing/issues",
+    "https://api.example/api/data/",
+    "https://api.example/api/log/",
+    "https://api.example/api/log/stat",
+    "https://api.example/api/task",
+    "https://api.example/api/mj/",
+  ]) {
+    const res = await handleEdgeAdminGate(new Request(publicBlocked), env, sql);
+    assert.equal(res.response?.status, 404, `expected public 404 for ${publicBlocked}`);
   }
 
   // Break-glass ticket unlocks admin UI and root APIs for that browser only, and revokes cleanly.
