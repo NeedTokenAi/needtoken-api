@@ -395,3 +395,161 @@ func TestMemberConsoleGroupIsolationAndSubscriptionUnlock(t *testing.T) {
 	require.NoError(t, db.Model(exclSub).Update("end_time", fixedNow.Unix()-10).Error)
 	assert.False(t, service.UserCanUseGroup(member.Id, member.Group, "openai-exclusive-1"))
 }
+
+func TestMemberConsoleGroupMetaAndMultiGroupTokenGuard(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	const secret = "11223344556677889900aabbccddeeff1122334455667788"
+	t.Setenv("NEEDTOKEN_LINKING_SECRET", secret)
+
+	origDB := model.DB
+	origNow := accountLinkNow
+	origRedis := common.RedisEnabled
+	origUsable := setting.UserUsableGroups2JSONString()
+	origRatios := ratio_setting.GroupRatio2JSONString()
+	origDefaultAuto := setting.DefaultUseAutoGroup
+	common.RedisEnabled = false
+
+	db, err := gorm.Open(sqlite.Open("file:member_group_meta_test?mode=memory&cache=shared"), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.UserSubscription{}, &model.Channel{}))
+	model.DB = db
+	fixedNow := time.Now().UTC().Truncate(time.Second)
+	accountLinkNow = func() time.Time { return fixedNow }
+
+	require.NoError(t, setting.UpdateUserUsableGroupsByJSONString(`{"default":"Default group"}`))
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"default":1,"ssvip":0.5,"vip":0.8}`))
+	setting.DefaultUseAutoGroup = false
+
+	t.Cleanup(func() {
+		model.DB = origDB
+		accountLinkNow = origNow
+		common.RedisEnabled = origRedis
+		_ = setting.UpdateUserUsableGroupsByJSONString(origUsable)
+		_ = ratio_setting.UpdateGroupRatioByJSONString(origRatios)
+		setting.DefaultUseAutoGroup = origDefaultAuto
+	})
+
+	member := &model.User{Username: "meta_member", DisplayName: "Meta", Role: common.RoleCommonUser, Status: common.UserStatusEnabled, Group: "default", AffCode: "aff_meta"}
+	require.NoError(t, db.Create(member).Error)
+	require.NoError(t, db.Create(&model.UserSubscription{
+		UserId:        member.Id,
+		PlanId:        10,
+		Status:        "active",
+		StartTime:     fixedNow.Unix() - 60,
+		EndTime:       fixedNow.Unix() + 3600,
+		AmountTotal:   5000000,
+		AllowedGroups: "ssvip",
+	}).Error)
+
+	prioHigh := int64(10)
+	require.NoError(t, db.Create(&model.Channel{
+		Name:     "S2-OpenAI 组池",
+		Type:     59,
+		Key:      "sk-secret-pool",
+		Status:   common.ChannelStatusEnabled,
+		Group:    "ssvip",
+		Models:   "gpt-6.2-sol,gpt-5.4",
+		Priority: &prioHigh,
+	}).Error)
+	// Disabled channel in default must not count as enabled supply.
+	require.NoError(t, db.Create(&model.Channel{
+		Name:   "Disabled Default",
+		Type:   1,
+		Key:    "sk-disabled",
+		Status: common.ChannelStatusManuallyDisabled,
+		Group:  "default",
+		Models: "gpt-4o",
+	}).Error)
+	// Unauthorized vip channel must never leak into member's group_meta.
+	require.NoError(t, db.Create(&model.Channel{
+		Name:   "Hidden VIP Pool",
+		Type:   59,
+		Key:    "sk-vip",
+		Status: common.ChannelStatusEnabled,
+		Group:  "vip",
+		Models: "claude-opus-4-6",
+	}).Error)
+
+	r := gin.New()
+	grp := r.Group("/api/subscription/admin/needtoken-console")
+	grp.GET("/users/:id/tokens", MemberConsoleListTokens)
+	grp.POST("/users/:id/tokens", MemberConsoleCreateToken)
+	grp.PUT("/users/:id/tokens/:token_id", MemberConsoleUpdateToken)
+	grp.GET("/users/:id/models", MemberConsoleModels)
+
+	doSigned := func(method, target, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, target, bytes.NewBufferString(body))
+		if body != "" {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		tsStr := strconv.FormatInt(fixedNow.Unix(), 10)
+		sig := computeMemberConsoleSignature([]byte(secret), method, req.URL.Path, req.URL.RawQuery, tsStr, []byte(body))
+		req.Header.Set("X-NeedToken-Timestamp", tsStr)
+		req.Header.Set("X-NeedToken-Signature", sig)
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// 1. List tokens includes group_meta with channel name, ratio, active count, and models; hides vip and secrets.
+	listRec := doSigned(http.MethodGet, "/api/subscription/admin/needtoken-console/users/"+strconv.Itoa(member.Id)+"/tokens", "")
+	require.Equal(t, http.StatusOK, listRec.Code)
+	assert.NotContains(t, listRec.Body.String(), "sk-secret-pool")
+	assert.NotContains(t, listRec.Body.String(), "Hidden VIP Pool")
+	var listResp struct {
+		Success bool `json:"success"`
+		Data    struct {
+			GroupMeta  map[string]memberConsoleGroupMetaDTO `json:"group_meta"`
+			GroupRatio map[string]float64                   `json:"group_ratio"`
+		} `json:"data"`
+	}
+	require.NoError(t, common.Unmarshal(listRec.Body.Bytes(), &listResp))
+	require.Contains(t, listResp.Data.GroupMeta, "ssvip")
+	require.Contains(t, listResp.Data.GroupMeta, "default")
+	assert.NotContains(t, listResp.Data.GroupMeta, "vip")
+	assert.Equal(t, "S2-OpenAI 组池", listResp.Data.GroupMeta["ssvip"].DisplayName)
+	assert.Equal(t, 0.5, listResp.Data.GroupMeta["ssvip"].Ratio)
+	assert.Equal(t, 1, listResp.Data.GroupMeta["ssvip"].EnabledChannelCount)
+	assert.Equal(t, []string{"gpt-5.4", "gpt-6.2-sol"}, listResp.Data.GroupMeta["ssvip"].Models)
+	assert.Equal(t, 0, listResp.Data.GroupMeta["default"].EnabledChannelCount)
+
+	// 2. Explicit multi-group token works even when DefaultUseAutoGroup=false.
+	multiRec := doSigned(http.MethodPost, "/api/subscription/admin/needtoken-console/users/"+strconv.Itoa(member.Id)+"/tokens",
+		`{"name":"Multi Group Key","group":"auto","auto_groups":["ssvip","default"],"model_limits_enabled":false}`)
+	require.Equal(t, http.StatusOK, multiRec.Code)
+	var multiResp struct {
+		Success bool `json:"success"`
+		Data    struct {
+			Token memberConsoleTokenDTO `json:"token"`
+		} `json:"data"`
+	}
+	require.NoError(t, common.Unmarshal(multiRec.Body.Bytes(), &multiResp))
+	require.True(t, multiResp.Success)
+	assert.Equal(t, "auto", multiResp.Data.Token.Group)
+	assert.Equal(t, []string{"ssvip", "default"}, multiResp.Data.Token.AutoGroups)
+	assert.True(t, multiResp.Data.Token.CrossGroupRetry)
+
+	// 3. Smuggling unauthorized group in auto_groups is strictly rejected.
+	smuggleRec := doSigned(http.MethodPost, "/api/subscription/admin/needtoken-console/users/"+strconv.Itoa(member.Id)+"/tokens",
+		`{"name":"Bad Multi","group":"auto","auto_groups":["ssvip","vip"]}`)
+	var smuggleResp struct {
+		Success bool `json:"success"`
+	}
+	require.NoError(t, common.Unmarshal(smuggleRec.Body.Bytes(), &smuggleResp))
+	assert.False(t, smuggleResp.Success)
+
+	// 4. Single-item auto_groups normalizes cleanly to a direct group token.
+	updRec := doSigned(http.MethodPut, "/api/subscription/admin/needtoken-console/users/"+strconv.Itoa(member.Id)+"/tokens/"+strconv.Itoa(multiResp.Data.Token.Id),
+		`{"group":"auto","auto_groups":["ssvip"]}`)
+	require.Equal(t, http.StatusOK, updRec.Code)
+	var updResp struct {
+		Success bool                  `json:"success"`
+		Data    memberConsoleTokenDTO `json:"data"`
+	}
+	require.NoError(t, common.Unmarshal(updRec.Body.Bytes(), &updResp))
+	require.True(t, updResp.Success)
+	assert.Equal(t, "ssvip", updResp.Data.Group)
+	assert.Empty(t, updResp.Data.AutoGroups)
+	assert.False(t, updResp.Data.CrossGroupRetry)
+}

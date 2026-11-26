@@ -179,6 +179,140 @@ func buildMemberConsoleTokenDTO(tok *model.Token) memberConsoleTokenDTO {
 	}
 }
 
+type memberConsoleGroupMetaDTO struct {
+	Code                string   `json:"code"`
+	Description         string   `json:"description"`
+	ChannelNames        []string `json:"channel_names"`
+	DisplayName         string   `json:"display_name"`
+	Ratio               float64  `json:"ratio"`
+	EnabledChannelCount int      `json:"enabled_channel_count"`
+	Models              []string `json:"models"`
+}
+
+func isGenericGroupDescription(code, desc string) bool {
+	trimmed := strings.TrimSpace(desc)
+	if trimmed == "" || strings.EqualFold(trimmed, strings.TrimSpace(code)) {
+		return true
+	}
+	switch strings.ToLower(trimmed) {
+	case "default group", "vip group", "user group", "auto group":
+		return true
+	default:
+		return false
+	}
+}
+
+func buildMemberConsoleGroupMeta(user *model.User, usableGroups map[string]string) (map[string]memberConsoleGroupMetaDTO, map[string]float64) {
+	userGroup := "default"
+	if user != nil {
+		if trimmed := strings.TrimSpace(user.Group); trimmed != "" {
+			userGroup = trimmed
+		}
+	}
+	allRatios := ratio_setting.GetGroupRatioCopy()
+	groupRatio := make(map[string]float64, len(usableGroups))
+	groupMeta := make(map[string]memberConsoleGroupMetaDTO, len(usableGroups))
+
+	type groupChannelAgg struct {
+		channelNames []string
+		channelSeen  map[string]struct{}
+		modelSet     map[string]struct{}
+		enabledCount int
+	}
+	aggs := make(map[string]*groupChannelAgg, len(usableGroups))
+
+	for g, desc := range usableGroups {
+		if g == "" || g == "auto" {
+			continue
+		}
+		ratio := 1.0
+		if override, exists := ratio_setting.GetGroupGroupRatio(userGroup, g); exists {
+			ratio = override
+		} else if baseRatio, exists := allRatios[g]; exists {
+			ratio = baseRatio
+		}
+		groupRatio[g] = ratio
+		aggs[g] = &groupChannelAgg{
+			channelSeen: make(map[string]struct{}),
+			modelSet:    make(map[string]struct{}),
+		}
+		groupMeta[g] = memberConsoleGroupMetaDTO{
+			Code:         g,
+			Description:  strings.TrimSpace(desc),
+			ChannelNames: []string{},
+			DisplayName:  strings.TrimSpace(desc),
+			Ratio:        ratio,
+			Models:       []string{},
+		}
+	}
+
+	if model.DB != nil && len(aggs) > 0 {
+		var channels []*model.Channel
+		if err := model.DB.Where("status = ?", common.ChannelStatusEnabled).Order("priority desc, id asc").Find(&channels).Error; err == nil {
+			for _, ch := range channels {
+				if ch == nil {
+					continue
+				}
+				chName := strings.TrimSpace(ch.Name)
+				chModels := ch.GetModels()
+				for _, rawG := range ch.GetGroups() {
+					g := strings.TrimSpace(rawG)
+					agg, ok := aggs[g]
+					if !ok {
+						continue
+					}
+					agg.enabledCount++
+					if chName != "" {
+						if _, seen := agg.channelSeen[chName]; !seen {
+							agg.channelSeen[chName] = struct{}{}
+							agg.channelNames = append(agg.channelNames, chName)
+						}
+					}
+					for _, rawM := range chModels {
+						m := strings.TrimSpace(rawM)
+						if m != "" {
+							agg.modelSet[m] = struct{}{}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	for g, meta := range groupMeta {
+		agg := aggs[g]
+		if agg != nil {
+			meta.EnabledChannelCount = agg.enabledCount
+			if len(agg.channelNames) > 0 {
+				meta.ChannelNames = agg.channelNames
+			}
+			if len(agg.modelSet) > 0 {
+				models := make([]string, 0, len(agg.modelSet))
+				for m := range agg.modelSet {
+					models = append(models, m)
+				}
+				slices.Sort(models)
+				meta.Models = models
+			}
+		}
+		switch {
+		case len(meta.ChannelNames) == 1:
+			meta.DisplayName = meta.ChannelNames[0]
+		case !isGenericGroupDescription(meta.Code, meta.Description):
+			meta.DisplayName = meta.Description
+		case len(meta.ChannelNames) > 0:
+			meta.DisplayName = meta.ChannelNames[0]
+		case meta.Description != "":
+			meta.DisplayName = meta.Description
+		default:
+			meta.DisplayName = meta.Code
+		}
+		groupMeta[g] = meta
+	}
+
+	return groupMeta, groupRatio
+}
+
 func memberConsoleUsableGroups(user *model.User) map[string]string {
 	userId := 0
 	userGroup := "default"
@@ -208,6 +342,43 @@ func validateMemberTokenGroup(user *model.User, group string) bool {
 	return ok
 }
 
+func sanitizeMemberAutoGroups(user *model.User, rawGroups []string) ([]string, bool) {
+	usable := memberConsoleUsableGroups(user)
+	userGroup := ""
+	if user != nil {
+		userGroup = strings.TrimSpace(user.Group)
+	}
+	maxCount := setting.GetMaxTokenAutoGroups()
+	cleaned := make([]string, 0, len(rawGroups))
+	seen := make(map[string]struct{}, len(rawGroups))
+	for _, raw := range rawGroups {
+		g := strings.TrimSpace(raw)
+		if g == "" {
+			continue
+		}
+		if g == "auto" {
+			return nil, false
+		}
+		if _, dup := seen[g]; dup {
+			continue
+		}
+		if g != userGroup {
+			if _, ok := usable[g]; !ok {
+				return nil, false
+			}
+		}
+		if !ratio_setting.ContainsGroupRatio(g) {
+			return nil, false
+		}
+		seen[g] = struct{}{}
+		cleaned = append(cleaned, g)
+		if maxCount > 0 && len(cleaned) > maxCount {
+			return nil, false
+		}
+	}
+	return cleaned, len(cleaned) > 0
+}
+
 func MemberConsoleListTokens(c *gin.Context) {
 	user, _, ok := verifyMemberConsoleRequest(c)
 	if !ok {
@@ -232,12 +403,18 @@ func MemberConsoleListTokens(c *gin.Context) {
 		activeSubs = []model.SubscriptionSummary{}
 	}
 
+	usableGroups := memberConsoleUsableGroups(user)
+	groupMeta, groupRatio := buildMemberConsoleGroupMeta(user, usableGroups)
+
 	common.ApiSuccess(c, gin.H{
 		"items":                items,
 		"total":                len(items),
-		"usable_groups":        memberConsoleUsableGroups(user),
+		"usable_groups":        usableGroups,
+		"group_ratio":          groupRatio,
+		"group_meta":           groupMeta,
 		"default_group":        user.Group,
 		"default_auto_group":   setting.DefaultUseAutoGroup,
+		"auto_groups":          service.GetUserEffectiveAutoGroup(user.Id, user.Group),
 		"quota_per_unit":       common.QuotaPerUnit,
 		"active_subscriptions": activeSubs,
 	})
@@ -311,7 +488,19 @@ func MemberConsoleCreateToken(c *gin.Context) {
 	if group == "" && setting.DefaultUseAutoGroup {
 		group = "auto"
 	}
-	if !validateMemberTokenGroup(user, group) {
+	var explicitAutoGroups []string
+	if group == "auto" && len(req.AutoGroups.Groups) > 0 {
+		cleaned, okGroups := sanitizeMemberAutoGroups(user, req.AutoGroups.Groups)
+		if !okGroups {
+			common.ApiErrorT(c, "Invalid group")
+			return
+		}
+		if len(cleaned) == 1 {
+			group = cleaned[0]
+		} else {
+			explicitAutoGroups = cleaned
+		}
+	} else if !validateMemberTokenGroup(user, group) {
 		common.ApiErrorT(c, "Invalid group")
 		return
 	}
@@ -325,8 +514,12 @@ func MemberConsoleCreateToken(c *gin.Context) {
 		modelLimits = strings.TrimSpace(*req.ModelLimits)
 	}
 	crossGroupRetry := false
-	if req.CrossGroupRetry != nil && group == "auto" {
-		crossGroupRetry = *req.CrossGroupRetry
+	if group == "auto" {
+		if req.CrossGroupRetry != nil {
+			crossGroupRetry = *req.CrossGroupRetry
+		} else if len(explicitAutoGroups) > 1 {
+			crossGroupRetry = true
+		}
 	}
 
 	now := common.GetTimestamp()
@@ -346,8 +539,8 @@ func MemberConsoleCreateToken(c *gin.Context) {
 		CrossGroupRetry:     crossGroupRetry,
 		AllowUserQuotaQuery: true,
 	}
-	if cleanToken.Group == "auto" && len(req.AutoGroups.Groups) > 0 {
-		_ = cleanToken.SetAutoGroups(req.AutoGroups.Groups)
+	if cleanToken.Group == "auto" && len(explicitAutoGroups) > 0 {
+		_ = cleanToken.SetAutoGroups(explicitAutoGroups)
 	}
 
 	rawKey, err := common.GenerateKey()
@@ -431,13 +624,50 @@ func MemberConsoleUpdateToken(c *gin.Context) {
 	if req.AllowIps != nil {
 		cleanToken.AllowIps = req.AllowIps
 	}
+	var explicitAutoGroups []string
+	explicitAutoSet := false
 	if req.Group != nil {
 		group := strings.TrimSpace(*req.Group)
-		if !validateMemberTokenGroup(user, group) {
-			common.ApiErrorT(c, "Invalid group")
-			return
+		if group == "auto" && req.AutoGroups.Set && len(req.AutoGroups.Groups) > 0 {
+			cleaned, okGroups := sanitizeMemberAutoGroups(user, req.AutoGroups.Groups)
+			if !okGroups {
+				common.ApiErrorT(c, "Invalid group")
+				return
+			}
+			if len(cleaned) == 1 {
+				cleanToken.Group = cleaned[0]
+			} else {
+				cleanToken.Group = "auto"
+				explicitAutoGroups = cleaned
+				explicitAutoSet = true
+			}
+		} else {
+			if !validateMemberTokenGroup(user, group) {
+				common.ApiErrorT(c, "Invalid group")
+				return
+			}
+			cleanToken.Group = group
 		}
-		cleanToken.Group = group
+	} else if cleanToken.Group == "auto" && req.AutoGroups.Set {
+		if len(req.AutoGroups.Groups) == 0 {
+			if !validateMemberTokenGroup(user, "auto") {
+				common.ApiErrorT(c, "Invalid group")
+				return
+			}
+			explicitAutoSet = true
+		} else {
+			cleaned, okGroups := sanitizeMemberAutoGroups(user, req.AutoGroups.Groups)
+			if !okGroups {
+				common.ApiErrorT(c, "Invalid group")
+				return
+			}
+			if len(cleaned) == 1 {
+				cleanToken.Group = cleaned[0]
+			} else {
+				explicitAutoGroups = cleaned
+				explicitAutoSet = true
+			}
+		}
 	}
 	if cleanToken.Group != "auto" {
 		cleanToken.CrossGroupRetry = false
@@ -445,9 +675,13 @@ func MemberConsoleUpdateToken(c *gin.Context) {
 	} else {
 		if req.CrossGroupRetry != nil {
 			cleanToken.CrossGroupRetry = *req.CrossGroupRetry
+		} else if explicitAutoSet && len(explicitAutoGroups) > 1 {
+			cleanToken.CrossGroupRetry = true
 		}
-		if req.AutoGroups.Set {
-			_ = cleanToken.SetAutoGroups(req.AutoGroups.Groups)
+		if explicitAutoSet {
+			_ = cleanToken.SetAutoGroups(explicitAutoGroups)
+		} else if req.AutoGroups.Set {
+			_ = cleanToken.SetAutoGroups(nil)
 		}
 	}
 	if req.Status != nil {
@@ -687,18 +921,7 @@ func MemberConsoleModels(c *gin.Context) {
 	group := strings.TrimSpace(user.Group)
 	usableGroup := memberConsoleUsableGroups(user)
 	delete(usableGroup, "auto")
-	groupRatio := make(map[string]float64)
-	allRatios := ratio_setting.GetGroupRatioCopy()
-	for g, baseRatio := range allRatios {
-		if _, allowed := usableGroup[g]; !allowed {
-			continue
-		}
-		if override, exists := ratio_setting.GetGroupGroupRatio(group, g); exists {
-			groupRatio[g] = override
-		} else {
-			groupRatio[g] = baseRatio
-		}
-	}
+	groupMeta, groupRatio := buildMemberConsoleGroupMeta(user, usableGroup)
 
 	pricing := filterPricingByUsableGroups(model.GetPricing(), usableGroup)
 	common.ApiSuccess(c, gin.H{
@@ -706,6 +929,7 @@ func MemberConsoleModels(c *gin.Context) {
 		"vendors":            model.GetVendors(),
 		"usable_groups":      usableGroup,
 		"group_ratio":        groupRatio,
+		"group_meta":         groupMeta,
 		"default_group":      group,
 		"supported_endpoint": model.GetSupportedEndpointMap(),
 		"auto_groups":        service.GetUserEffectiveAutoGroup(user.Id, group),
@@ -820,11 +1044,17 @@ func MemberConsoleSubscriptions(c *gin.Context) {
 		allSubs = []model.SubscriptionSummary{}
 	}
 
+	usableGroups := memberConsoleUsableGroups(user)
+	groupMeta, groupRatio := buildMemberConsoleGroupMeta(user, usableGroups)
+
 	common.ApiSuccess(c, gin.H{
 		"active_subscriptions": activeSubs,
 		"all_subscriptions":    allSubs,
 		"user_group":           user.Group,
 		"user_quota":           user.Quota,
+		"usable_groups":        usableGroups,
+		"group_ratio":          groupRatio,
+		"group_meta":           groupMeta,
 		"quota_per_unit":       common.QuotaPerUnit,
 	})
 }
