@@ -622,9 +622,16 @@ func TokenAuth() func(c *gin.Context) {
 		userGroup := userCache.Group
 		tokenGroup := token.Group
 		if tokenGroup != "" {
-			// Allow static usable groups, admin-enabled auto group, or groups explicitly
-			// unlocked by the user's currently active subscriptions.
-			if !service.UserCanUseGroup(token.UserId, userGroup, tokenGroup) {
+			// Allow static usable groups, admin-enabled auto group, groups explicitly
+			// unlocked by active subscriptions, or explicit per-token auto_groups
+			// when at least one selected group remains authorized for this user.
+			authorized := service.UserCanUseGroup(token.UserId, userGroup, tokenGroup)
+			if !authorized && tokenGroup == "auto" {
+				if explicitAuto, err := token.GetAutoGroups(); err == nil && len(explicitAuto) > 0 {
+					authorized = len(service.FilterUserTokenAutoGroupsForUser(token.UserId, userGroup, explicitAuto)) > 0
+				}
+			}
+			if !authorized {
 				abortWithOpenAiMessage(c, http.StatusForbidden, i18n.T(c, i18n.MsgAuthTokenGroupForbidden, map[string]any{"Group": tokenGroup}))
 				return
 			}
