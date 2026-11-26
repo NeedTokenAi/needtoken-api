@@ -310,11 +310,18 @@ export function classifyNewApiRequest(method, normalized) {
     return "internal_admin_api";
   }
 
-  // 1b. Strict internal Admin APIs used by needtoken ops (brand/groups options & user rankings).
+  // 1b. Strict internal Admin APIs used by needtoken ops (brand/groups options, pricing audit, logs, & user rankings).
   // Never fall back to open access when EDGE_ADMIN_SECRET is unset; sub-paths remain admin_only.
   if (
     (path === "/api/option" && (upperMethod === "GET" || upperMethod === "PUT")) ||
-    (path === "/api/data/users" && upperMethod === "GET")
+    (path === "/api/option/model_pricing" && (upperMethod === "GET" || upperMethod === "PATCH")) ||
+    (path === "/api/option/model_pricing/issues" && upperMethod === "GET") ||
+    (path === "/api/option/model_pricing/preview" && upperMethod === "POST") ||
+    (path === "/api/data/users" && upperMethod === "GET") ||
+    (path === "/api/data" && upperMethod === "GET") ||
+    ((path === "/api/log" || path === "/api/log/stat") && upperMethod === "GET") ||
+    (path === "/api/task" && upperMethod === "GET") ||
+    (path === "/api/mj" && upperMethod === "GET")
   ) {
     return "strict_internal_admin_api";
   }
