@@ -38,8 +38,9 @@ is_high_risk_path() {
       return 0
       ;;
     # NeedToken 二开保护区
-    VERSION | controller/needtoken_* | controller/external_grant* | \
+    VERSION | main.go | controller/needtoken_* | controller/external_grant* | \
       service/billing_session.go | service/funding_source.go | service/group.go | \
+      service/needtoken_* | \
       web/index.html | web/public/* | \
       web/src/routes/_authenticated/account-link.tsx | \
       "web/src/routes/(auth)/oauth.tsx" | \

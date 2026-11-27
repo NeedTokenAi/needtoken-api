@@ -1,22 +1,27 @@
 package service
 
 import (
+	"context"
+	"errors"
 	"math"
 	"math/rand"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	rktypes "github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
 	"github.com/shopspring/decimal"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
 
 // Claude Sonnet-style tiered expression: standard vs long-context
@@ -1175,4 +1180,342 @@ func TestSamePriceCacheReadsRemainInInput(t *testing.T) {
 			assert.Equal(t, separateParams.Len, params.Len, "tier conditions keep the full context length")
 		})
 	}
+}
+
+func TestBillingSessionRefundFailureRecoveryAndPartialIdempotency(t *testing.T) {
+	truncate(t)
+
+	// 1. 精确复现 R06：钱包 100，预扣 50，首次 Refund 遇瞬时数据库错误 ->
+	//    NeedsRefund 保持 true，恢复后再次 Refund 余额恢复为 100 且 NeedsRefund=false；第三次 Refund 不多退。
+	const walletUID = 801
+	seedUser(t, walletUID, 50) // 100 - 50 pre-consumed
+	tokWallet := &model.Token{
+		Id: 801, UserId: walletUID, Key: "sk-r06-wallet-token", Name: "r06-w",
+		RemainQuota: 50, UsedQuota: 50, Status: common.TokenStatusEnabled,
+	}
+	require.NoError(t, model.DB.Create(tokWallet).Error)
+
+	session := &BillingSession{
+		relayInfo: &relaycommon.RelayInfo{
+			RequestId: "req-r06-wallet-1",
+			UserId:    walletUID,
+			TokenId:   tokWallet.Id,
+			TokenKey:  tokWallet.Key,
+		},
+		funding:          &WalletFunding{userId: walletUID, consumed: 50},
+		preConsumedQuota: 50,
+		tokenConsumed:    50,
+	}
+
+	const failWalletCallback = "r06_inject_wallet_refund_fail"
+	failWallet := true
+	require.NoError(t, model.DB.Callback().Update().Before("gorm:update").Register(failWalletCallback, func(tx *gorm.DB) {
+		if failWallet && tx.Statement.Table == "users" {
+			_ = tx.AddError(errors.New("transient database failure on user quota refund"))
+		}
+	}))
+	t.Cleanup(func() { _ = model.DB.Callback().Update().Remove(failWalletCallback) })
+
+	session.Refund(nil)
+	assert.True(t, session.NeedsRefund(), "failed refund must keep NeedsRefund=true for retry")
+	q1, err := model.GetUserQuota(walletUID, true)
+	require.NoError(t, err)
+	assert.Equal(t, 50, q1, "balance stays 50 during transient failure")
+
+	failWallet = false
+	session.Refund(nil)
+	assert.False(t, session.NeedsRefund(), "recovered refund marks session completed")
+	q2, err := model.GetUserQuota(walletUID, true)
+	require.NoError(t, err)
+	assert.Equal(t, 100, q2, "balance must recover to 100 after second Refund call")
+
+	var reloadedTok model.Token
+	require.NoError(t, model.DB.First(&reloadedTok, tokWallet.Id).Error)
+	assert.Equal(t, 100, reloadedTok.RemainQuota)
+
+	// 第三次调用幂等不重复退额
+	session.Refund(nil)
+	q3, err := model.GetUserQuota(walletUID, true)
+	require.NoError(t, err)
+	assert.Equal(t, 100, q3)
+
+	// 2. 部分成功恢复：钱包退款已成功，令牌退款遇瞬时 DB 故障 -> 恢复后钱包绝不二次增额，仅补退令牌额度。
+	const partialUID = 802
+	require.NoError(t, model.DB.Create(&model.User{Id: partialUID, Username: "r06_partial", AffCode: "aff_r06_p", Quota: 50, Status: common.UserStatusEnabled}).Error)
+	tokPartial := &model.Token{
+		Id: 802, UserId: partialUID, Key: "sk-r06-partial-token", Name: "r06-p",
+		RemainQuota: 50, UsedQuota: 50, Status: common.TokenStatusEnabled,
+	}
+	require.NoError(t, model.DB.Create(tokPartial).Error)
+
+	partialSession := &BillingSession{
+		relayInfo: &relaycommon.RelayInfo{
+			RequestId: "req-r06-partial-1",
+			UserId:    partialUID,
+			TokenId:   tokPartial.Id,
+			TokenKey:  tokPartial.Key,
+		},
+		funding:          &WalletFunding{userId: partialUID, consumed: 50},
+		preConsumedQuota: 50,
+		tokenConsumed:    50,
+	}
+	failToken := true
+	const failTokenCallback = "r06_inject_token_refund_fail"
+	require.NoError(t, model.DB.Callback().Update().Before("gorm:update").Register(failTokenCallback, func(tx *gorm.DB) {
+		if failToken && tx.Statement.Table == "tokens" {
+			_ = tx.AddError(errors.New("transient database failure on token refund"))
+		}
+	}))
+	t.Cleanup(func() { _ = model.DB.Callback().Update().Remove(failTokenCallback) })
+
+	partialSession.Refund(nil)
+	assert.True(t, partialSession.NeedsRefund())
+	qp1, err := model.GetUserQuota(partialUID, true)
+	require.NoError(t, err)
+	assert.Equal(t, 100, qp1, "wallet step committed once")
+
+	// Simulate process restart and background recovery via RecoverPendingBillingRefunds
+	failToken = false
+	require.NoError(t, model.DB.Model(&model.NeedTokenBillingRefund{}).
+		Where("operation_id = ?", partialSession.operationId).
+		Update("next_retry_at", time.Now().Unix()-1).Error)
+
+	recovered, err := RecoverPendingBillingRefunds(context.Background(), 20)
+	require.NoError(t, err)
+	assert.Equal(t, 1, recovered)
+	qp2, err := model.GetUserQuota(partialUID, true)
+	require.NoError(t, err)
+	assert.Equal(t, 100, qp2, "wallet must NEVER be credited twice on partial recovery")
+	var reloadedTokPartial model.Token
+	require.NoError(t, model.DB.First(&reloadedTokPartial, tokPartial.Id).Error)
+	assert.Equal(t, 100, reloadedTokPartial.RemainQuota)
+
+	// 3. 订阅资金 + 补预扣(ExtraReserved) + 令牌，同时开启 BatchUpdateEnabled=true 验证退额直接落 DB 不丢。
+	prevBatch := common.BatchUpdateEnabled
+	common.BatchUpdateEnabled = true
+	t.Cleanup(func() { common.BatchUpdateEnabled = prevBatch })
+
+	const subUID = 803
+	require.NoError(t, model.DB.Create(&model.User{Id: subUID, Username: "r06_sub", AffCode: "aff_r06_s", Quota: 10, Status: common.UserStatusEnabled}).Error)
+	tokSub := &model.Token{
+		Id: 803, UserId: subUID, Key: "sk-r06-sub-token", Name: "r06-s",
+		RemainQuota: 100, UsedQuota: 0, Status: common.TokenStatusEnabled,
+	}
+	require.NoError(t, model.DB.Create(tokSub).Error)
+	now := time.Now().Unix()
+	sub := &model.UserSubscription{
+		Id: 803, UserId: subUID, PlanId: 1, Status: "active", AllowedGroups: "default",
+		AmountTotal: 1000, AmountUsed: 100, StartTime: now - 100, EndTime: now + 3600,
+	}
+	require.NoError(t, model.DB.Create(sub).Error)
+	require.NoError(t, model.DB.Create(&model.SubscriptionPreConsumeRecord{
+		RequestId: "req-r06-sub-1", UserId: subUID, UserSubscriptionId: sub.Id,
+		PreConsumed: 40, Status: "consumed",
+	}).Error)
+	// Also pre-deduct 20 extra reserved + 60 token consumed (total 100 on sub, 60 on token)
+	require.NoError(t, model.DB.Model(tokSub).Updates(map[string]any{"remain_quota": 40, "used_quota": 60}).Error)
+
+	subSession := &BillingSession{
+		relayInfo: &relaycommon.RelayInfo{
+			RequestId:      "req-r06-sub-1",
+			UserId:         subUID,
+			TokenId:        tokSub.Id,
+			TokenKey:       tokSub.Key,
+			SubscriptionId: sub.Id,
+		},
+		funding: &SubscriptionFunding{
+			requestId:      "req-r06-sub-1",
+			userId:         subUID,
+			subscriptionId: sub.Id,
+			preConsumed:    40,
+		},
+		preConsumedQuota: 60,
+		tokenConsumed:    60,
+		extraReserved:    20,
+	}
+
+	subSession.Refund(nil)
+	assert.False(t, subSession.NeedsRefund())
+	var reloadedSub model.UserSubscription
+	require.NoError(t, model.DB.First(&reloadedSub, sub.Id).Error)
+	assert.Equal(t, int64(40), reloadedSub.AmountUsed, "both initial 40 + extra 20 refunded from 100 -> 40")
+	var reloadedTokSub model.Token
+	require.NoError(t, model.DB.First(&reloadedTokSub, tokSub.Id).Error)
+	assert.Equal(t, 100, reloadedTokSub.RemainQuota, "token quota refunded directly to DB even with BatchUpdateEnabled=true")
+}
+
+func TestHybridSubscriptionWalletPreConsumeSettleAndRefund(t *testing.T) {
+	truncate(t)
+	now := time.Now().Unix()
+	newTestGinCtx := func() *gin.Context {
+		c, _ := gin.CreateTestContext(httptest.NewRecorder())
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+		return c
+	}
+
+	// 1. 60 套餐 + 40 现金可以承担 100 预扣，并正确退款还原。
+	plan := &model.SubscriptionPlan{
+		Title:   "Hybrid Test Plan",
+		Enabled: true,
+	}
+	require.NoError(t, model.DB.Create(plan).Error)
+	const u1 = 811
+	seedUser(t, u1, 40)
+	require.NoError(t, model.DB.Create(&model.Token{Id: 811, UserId: u1, Key: "sk-r08-1", Name: "r08-1", RemainQuota: 1000, Status: common.TokenStatusEnabled}).Error)
+	sub1 := &model.UserSubscription{
+		Id: 811, UserId: u1, PlanId: plan.Id, Status: "active", AllowedGroups: "default", AllowWalletOverflow: true,
+		AmountTotal: 100, AmountUsed: 40, StartTime: now - 100, EndTime: now + 3600,
+	}
+	require.NoError(t, model.DB.Create(sub1).Error)
+
+	info1 := &relaycommon.RelayInfo{
+		RequestId: "req-r08-1", UserId: u1, TokenId: 811, TokenKey: "sk-r08-1", UsingGroup: "default",
+		ForcePreConsume: true,
+		UserSetting:     dto.UserSetting{BillingPreference: "subscription_first"},
+	}
+	sess1, apiErr := NewBillingSession(newTestGinCtx(), info1, 100)
+	require.Nil(t, apiErr, "60 sub + 40 wallet must cover 100 pre-consume")
+	assert.Equal(t, BillingSourceSubscription, info1.BillingSource)
+	assert.Equal(t, int64(60), info1.SubscriptionPreConsumed)
+	assert.Equal(t, int64(40), info1.SubscriptionWalletOverflow)
+
+	var afterUser1 model.User
+	require.NoError(t, model.DB.First(&afterUser1, u1).Error)
+	assert.Equal(t, 0, afterUser1.Quota)
+	var afterSub1 model.UserSubscription
+	require.NoError(t, model.DB.First(&afterSub1, sub1.Id).Error)
+	assert.Equal(t, int64(100), afterSub1.AmountUsed)
+
+	// 失败退款必须同时恢复 60 套餐与 40 钱包。
+	sess1.Refund(nil)
+	assert.False(t, sess1.NeedsRefund())
+	require.NoError(t, model.DB.First(&afterUser1, u1).Error)
+	assert.Equal(t, 40, afterUser1.Quota)
+	require.NoError(t, model.DB.First(&afterSub1, sub1.Id).Error)
+	assert.Equal(t, int64(40), afterSub1.AmountUsed)
+
+	// 2. 钱包本身足够 100 时，也必须优先用完 60 套餐 + 40 钱包，实际 70 结算时先退 30 现金。
+	const u2 = 812
+	require.NoError(t, model.DB.Create(&model.User{Id: u2, Username: "r08_u2", AffCode: "aff_r08_2", Quota: 100, Status: common.UserStatusEnabled}).Error)
+	require.NoError(t, model.DB.Create(&model.Token{Id: 812, UserId: u2, Key: "sk-r08-2", Name: "r08-2", RemainQuota: 1000, Status: common.TokenStatusEnabled}).Error)
+	sub2 := &model.UserSubscription{
+		Id: 812, UserId: u2, PlanId: plan.Id, Status: "active", AllowedGroups: "default", AllowWalletOverflow: true,
+		AmountTotal: 100, AmountUsed: 40, StartTime: now - 100, EndTime: now + 3600,
+	}
+	require.NoError(t, model.DB.Create(sub2).Error)
+
+	info2 := &relaycommon.RelayInfo{
+		RequestId: "req-r08-2", UserId: u2, TokenId: 812, TokenKey: "sk-r08-2", UsingGroup: "default",
+		ForcePreConsume: true,
+		UserSetting:     dto.UserSetting{BillingPreference: "subscription_first"},
+	}
+	sess2, apiErr2 := NewBillingSession(newTestGinCtx(), info2, 100)
+	require.Nil(t, apiErr2)
+	assert.Equal(t, BillingSourceSubscription, info2.BillingSource)
+	assert.Equal(t, int64(60), info2.SubscriptionPreConsumed)
+	require.NoError(t, sess2.Settle(70))
+	var afterUser2 model.User
+	require.NoError(t, model.DB.First(&afterUser2, u2).Error)
+	assert.Equal(t, 90, afterUser2.Quota, "net wallet charge=10 (60 sub + 10 wallet = 70), leaving 90 in wallet")
+	var afterSub2 model.UserSubscription
+	require.NoError(t, model.DB.First(&afterSub2, sub2.Id).Error)
+	assert.Equal(t, int64(100), afterSub2.AmountUsed)
+	assert.Equal(t, int64(10), info2.SubscriptionWalletOverflow)
+
+	// 3. 合计不足（60 套餐 + 30 钱包 请求 100）必须整体失败，零残留。
+	const u3 = 813
+	require.NoError(t, model.DB.Create(&model.User{Id: u3, Username: "r08_u3", AffCode: "aff_r08_3", Quota: 30, Status: common.UserStatusEnabled}).Error)
+	require.NoError(t, model.DB.Create(&model.Token{Id: 813, UserId: u3, Key: "sk-r08-3", Name: "r08-3", RemainQuota: 1000, Status: common.TokenStatusEnabled}).Error)
+	sub3 := &model.UserSubscription{
+		Id: 813, UserId: u3, PlanId: plan.Id, Status: "active", AllowedGroups: "default", AllowWalletOverflow: true,
+		AmountTotal: 100, AmountUsed: 40, StartTime: now - 100, EndTime: now + 3600,
+	}
+	require.NoError(t, model.DB.Create(sub3).Error)
+	info3 := &relaycommon.RelayInfo{
+		RequestId: "req-r08-3", UserId: u3, TokenId: 813, TokenKey: "sk-r08-3", UsingGroup: "default",
+		ForcePreConsume: true,
+		UserSetting:     dto.UserSetting{BillingPreference: "subscription_first"},
+	}
+	_, apiErr3 := NewBillingSession(newTestGinCtx(), info3, 100)
+	require.NotNil(t, apiErr3)
+	assert.Equal(t, rktypes.ErrorCodeInsufficientUserQuota, apiErr3.GetErrorCode())
+	var afterUser3 model.User
+	require.NoError(t, model.DB.First(&afterUser3, u3).Error)
+	assert.Equal(t, 30, afterUser3.Quota)
+	var afterSub3 model.UserSubscription
+	require.NoError(t, model.DB.First(&afterSub3, sub3.Id).Error)
+	assert.Equal(t, int64(40), afterSub3.AmountUsed)
+
+	// 4. subscription_only 即使钱包有 100 也不得擅自扣现金。
+	info4 := &relaycommon.RelayInfo{
+		RequestId: "req-r08-4", UserId: u2, TokenId: 812, TokenKey: "sk-r08-2", UsingGroup: "default",
+		ForcePreConsume: true,
+		UserSetting:     dto.UserSetting{BillingPreference: "subscription_only"},
+	}
+	require.NoError(t, model.DB.Model(&model.UserSubscription{}).Where("id = ?", sub2.Id).Update("amount_used", 40).Error)
+	_, apiErr4 := NewBillingSession(newTestGinCtx(), info4, 100)
+	require.NotNil(t, apiErr4)
+	assert.Equal(t, rktypes.ErrorCodeInsufficientUserQuota, apiErr4.GetErrorCode())
+	require.NoError(t, model.DB.First(&afterUser2, u2).Error)
+	assert.Equal(t, 90, afterUser2.Quota, "subscription_only must never deduct wallet")
+}
+
+func TestBillingShortfallPersistenceAndLogAccounting(t *testing.T) {
+	truncate(t)
+	now := time.Now().Unix()
+
+	// R09 精确复现场景：套餐剩 15、钱包剩 15、预扣 10、实际费用 60 -> 实收 30、未收 30 持久落库可查且钱包不为负。
+	plan := &model.SubscriptionPlan{
+		Title:   "Shortfall Test Plan",
+		Enabled: true,
+	}
+	require.NoError(t, model.DB.Create(plan).Error)
+	const uid = 821
+	require.NoError(t, model.DB.Create(&model.User{Id: uid, Username: "r09_user", AffCode: "aff_r09_1", Quota: 15, Status: common.UserStatusEnabled}).Error)
+	require.NoError(t, model.DB.Create(&model.Token{Id: 821, UserId: uid, Key: "sk-r09-1", Name: "r09-1", RemainQuota: 1000, Status: common.TokenStatusEnabled}).Error)
+	sub := &model.UserSubscription{
+		Id: 821, UserId: uid, PlanId: plan.Id, Status: "active", AllowedGroups: "default", AllowWalletOverflow: true,
+		AmountTotal: 100, AmountUsed: 85, StartTime: now - 100, EndTime: now + 3600,
+	}
+	require.NoError(t, model.DB.Create(sub).Error)
+
+	info := &relaycommon.RelayInfo{
+		RequestId: "req-r09-1", UserId: uid, TokenId: 821, TokenKey: "sk-r09-1",
+		ChannelMeta:     &relaycommon.ChannelMeta{ChannelId: 9},
+		OriginModelName: "gpt-5.4", UsingGroup: "default", ForcePreConsume: true,
+		UserSetting: dto.UserSetting{BillingPreference: "subscription_first"},
+	}
+	ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ginCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	sess, apiErr := NewBillingSession(ginCtx, info, 10)
+	require.Nil(t, apiErr)
+	require.NoError(t, sess.Settle(60))
+
+	var uAfter model.User
+	require.NoError(t, model.DB.First(&uAfter, uid).Error)
+	assert.Equal(t, 0, uAfter.Quota, "wallet clamped at 0 and must not go negative")
+	var subAfter model.UserSubscription
+	require.NoError(t, model.DB.First(&subAfter, sub.Id).Error)
+	assert.Equal(t, int64(100), subAfter.AmountUsed)
+
+	// 持久化差异可查询
+	res, err := model.QueryBillingShortfalls(context.Background(), model.BillingShortfallFilter{UserId: uid})
+	require.NoError(t, err)
+	require.Equal(t, int64(1), res.Total)
+	require.Len(t, res.Items, 1)
+	assert.Equal(t, int64(60), res.Items[0].ActualQuota)
+	assert.Equal(t, int64(15), res.Items[0].SubscriptionCharged)
+	assert.Equal(t, int64(15), res.Items[0].WalletCharged)
+	assert.Equal(t, int64(30), res.Items[0].CollectedQuota)
+	assert.Equal(t, int64(30), res.Items[0].UnbilledQuota)
+	assert.Equal(t, "wallet_exhausted", res.Items[0].Reason)
+	assert.Equal(t, int64(30), res.TotalUnbilledQuota)
+
+	// 消费日志 other 字段同步口径可解释
+	other := model.NewLogOther()
+	appendBillingInfo(info, other)
+	otherJSON := other.JSONString()
+	assert.Contains(t, otherJSON, `"collected_quota":30`)
+	assert.Contains(t, otherJSON, `"unbilled_quota":30`)
+	assert.Contains(t, otherJSON, `"actual_quota_expected":60`)
 }

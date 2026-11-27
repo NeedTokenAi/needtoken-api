@@ -115,6 +115,22 @@ func MemberConsoleWalletRedeem(c *gin.Context) {
 	})
 }
 
+// MemberConsoleWalletLookupOp queries authoritative ledger status for an external wallet operation.
+func MemberConsoleWalletLookupOp(c *gin.Context) {
+	user, _, ok := verifyMemberConsoleRequest(c)
+	if !ok {
+		return
+	}
+	opID := strings.TrimSpace(c.Query("operation_id"))
+	kind := strings.TrimSpace(c.Query("kind"))
+	res, err := model.LookupExternalWalletOp(c.Request.Context(), user.Id, opID, kind)
+	if err != nil {
+		writeUnifiedWalletError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "message": "", "data": res})
+}
+
 func writeUnifiedWalletError(c *gin.Context, err error) {
 	switch {
 	case errors.Is(err, model.ErrExternalGrantRolledBack):

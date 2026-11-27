@@ -152,6 +152,9 @@ type RelayInfo struct {
 	SubscriptionSecondaryDelta int64
 	// SubscriptionWalletOverflow tracks post-consume quota spilled into wallet balance.
 	SubscriptionWalletOverflow int64
+	// SubscriptionUnbilledOverflow tracks uncollected quota when settlement exceeds available subscription+wallet funds.
+	SubscriptionUnbilledOverflow int64
+	SubscriptionUnbilledReason   string
 	// SubscriptionPlanId / SubscriptionPlanTitle are used for logging/UI display.
 	SubscriptionPlanId    int
 	SubscriptionPlanTitle string

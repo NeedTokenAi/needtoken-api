@@ -232,6 +232,18 @@ func appendBillingInfo(relayInfo *relaycommon.RelayInfo, other *model.LogOther) 
 			other.SetPublic("subscription_secondary_delta", relayInfo.SubscriptionSecondaryDelta)
 		}
 		other.SetPublic("wallet_quota_deducted", relayInfo.SubscriptionWalletOverflow)
+		if relayInfo.SubscriptionUnbilledOverflow > 0 {
+			collected := relayInfo.SubscriptionPreConsumed + relayInfo.SubscriptionPostDelta + relayInfo.SubscriptionSecondaryDelta + relayInfo.SubscriptionWalletOverflow
+			if collected < 0 {
+				collected = 0
+			}
+			other.SetPublic("collected_quota", collected)
+			other.SetPublic("unbilled_quota", relayInfo.SubscriptionUnbilledOverflow)
+			other.SetPublic("actual_quota_expected", collected+relayInfo.SubscriptionUnbilledOverflow)
+			if relayInfo.SubscriptionUnbilledReason != "" {
+				other.SetAdmin("unbilled_reason", relayInfo.SubscriptionUnbilledReason)
+			}
+		}
 	}
 }
 

@@ -590,3 +590,127 @@ func TestMemberConsoleGroupMetaAndMultiGroupTokenGuard(t *testing.T) {
 	assert.Empty(t, updResp.Data.AutoGroups)
 	assert.False(t, updResp.Data.CrossGroupRetry)
 }
+
+func TestMemberConsoleWalletLookupOp(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	const secret = "0123456789abcdef0123456789abcdef0123456789abcdef"
+	t.Setenv("NEEDTOKEN_LINKING_SECRET", secret)
+
+	origDB := model.DB
+	origLogDB := model.LOG_DB
+	origNow := accountLinkNow
+	origRedis := common.RedisEnabled
+	common.RedisEnabled = false
+	db, err := gorm.Open(sqlite.Open("file:member_console_wallet_op_test?mode=memory&cache=shared"), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.ExternalGrant{}, &model.Log{}))
+	model.DB = db
+	model.LOG_DB = db
+	fixedNow := time.Now().UTC().Truncate(time.Second)
+	accountLinkNow = func() time.Time { return fixedNow }
+	t.Cleanup(func() {
+		model.DB = origDB
+		model.LOG_DB = origLogDB
+		accountLinkNow = origNow
+		common.RedisEnabled = origRedis
+	})
+
+	member := &model.User{
+		Username:    "wallet-op-member",
+		Password:    "hashed-password",
+		DisplayName: "Wallet Op Member",
+		Role:        common.RoleCommonUser,
+		Status:      common.UserStatusEnabled,
+		AffCode:     "aff_wallet_op",
+		Quota:       8000,
+	}
+	require.NoError(t, model.DB.Create(member).Error)
+
+	_, err = model.ApplyExternalWalletDebit(t.Context(), member.Id, 2000, true, "order:55:debit:op1", "checkout")
+	require.NoError(t, err)
+
+	r := gin.New()
+	r.GET("/api/subscription/admin/needtoken-console/users/:id/wallet/ops", MemberConsoleWalletLookupOp)
+
+	doSignedGet := func(rawQuery string) *httptest.ResponseRecorder {
+		reqPath := "/api/subscription/admin/needtoken-console/users/" + strconv.Itoa(member.Id) + "/wallet/ops"
+		ts := strconv.FormatInt(fixedNow.Unix(), 10)
+		sig := computeMemberConsoleSignature([]byte(secret), http.MethodGet, reqPath, rawQuery, ts, nil)
+		target := reqPath
+		if rawQuery != "" {
+			target += "?" + rawQuery
+		}
+		req := httptest.NewRequest(http.MethodGet, target, nil)
+		req.Header.Set("X-NeedToken-Timestamp", ts)
+		req.Header.Set("X-NeedToken-Signature", sig)
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+		return rec
+	}
+
+	foundRec := doSignedGet("operation_id=order:55:debit:op1&kind=wallet_debit")
+	require.Equal(t, http.StatusOK, foundRec.Code)
+	var foundResp struct {
+		Success bool                         `json:"success"`
+		Data    model.ExternalWalletOpStatus `json:"data"`
+	}
+	require.NoError(t, common.Unmarshal(foundRec.Body.Bytes(), &foundResp))
+	assert.True(t, foundResp.Success)
+	assert.True(t, foundResp.Data.Found)
+	assert.Equal(t, "debited", foundResp.Data.Status)
+	assert.Equal(t, 2000, foundResp.Data.AppliedQuota)
+	assert.Equal(t, 6000, foundResp.Data.BalanceQuota)
+
+	missingRec := doSignedGet("operation_id=order:55:debit:never_committed&kind=wallet_debit")
+	require.Equal(t, http.StatusOK, missingRec.Code)
+	var missingResp struct {
+		Success bool                         `json:"success"`
+		Data    model.ExternalWalletOpStatus `json:"data"`
+	}
+	require.NoError(t, common.Unmarshal(missingRec.Body.Bytes(), &missingResp))
+	assert.True(t, missingResp.Success)
+	assert.False(t, missingResp.Data.Found)
+	assert.Equal(t, "not_found", missingResp.Data.Status)
+	assert.Equal(t, 6000, missingResp.Data.BalanceQuota)
+}
+
+func TestAdminListBillingShortfalls(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	origDB := model.DB
+	db, err := gorm.Open(sqlite.Open("file:admin_billing_shortfalls_test?mode=memory&cache=shared"), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(&model.NeedTokenBillingShortfall{}))
+	model.DB = db
+	t.Cleanup(func() { model.DB = origDB })
+
+	require.NoError(t, model.RecordBillingShortfall(t.Context(), model.NeedTokenBillingShortfall{
+		OperationId:         "shortfall:ctrl-1",
+		RequestId:           "req-ctrl-1",
+		UserId:              42,
+		ActualQuota:         60,
+		SubscriptionCharged: 15,
+		WalletCharged:       15,
+		CollectedQuota:      30,
+		UnbilledQuota:       30,
+		Reason:              "wallet_exhausted",
+	}))
+
+	r := gin.New()
+	r.GET("/api/subscription/admin/billing-shortfalls", AdminListBillingShortfalls)
+	req := httptest.NewRequest(http.MethodGet, "/api/subscription/admin/billing-shortfalls?user_id=42", nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	var resp struct {
+		Success bool                              `json:"success"`
+		Data    model.BillingShortfallQueryResult `json:"data"`
+	}
+	require.NoError(t, common.Unmarshal(rec.Body.Bytes(), &resp))
+	assert.True(t, resp.Success)
+	assert.Equal(t, int64(1), resp.Data.Total)
+	assert.Equal(t, int64(30), resp.Data.TotalUnbilledQuota)
+	require.Len(t, resp.Data.Items, 1)
+	assert.Equal(t, int64(60), resp.Data.Items[0].ActualQuota)
+}

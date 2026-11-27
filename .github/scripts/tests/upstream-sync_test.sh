@@ -37,8 +37,12 @@ for p in \
   "controller/auth.go" \
   "controller/needtoken_account_link.go" \
   "controller/needtoken_admin_tokens.go" \
+  "controller/needtoken_billing_shortfall.go" \
   "controller/needtoken_sso.go" \
   "controller/needtoken_sso_test.go" \
+  "model/needtoken_billing_shortfall.go" \
+  "main.go" \
+  "service/needtoken_billing_recovery.go" \
   "VERSION" \
   "web/index.html" \
   "web/public/favicon.ico" \
