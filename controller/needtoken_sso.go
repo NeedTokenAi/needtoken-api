@@ -52,6 +52,7 @@ type needTokenProvisionMemberRequest struct {
 	MerchantCustomerID string `json:"merchant_customer_id"`
 	Email              string `json:"email"`
 	EmailVerified      bool   `json:"email_verified"`
+	AllowWithoutEmail  bool   `json:"allow_without_email,omitempty"`
 	DisplayName        string `json:"display_name"`
 }
 
@@ -196,19 +197,29 @@ func ProvisionNeedTokenMember(c *gin.Context) {
 
 	customerToken, validMerchant := extractMerchantCustomerIDToken(req.MerchantCustomerID)
 	email := model.NormalizeEmail(req.Email)
-	if req.Source != needTokenSourceStorefront || !validMerchant || !req.EmailVerified || !isValidProvisionEmail(email) {
+	if req.Source != needTokenSourceStorefront || !validMerchant {
 		common.ApiErrorStatus(c, http.StatusBadRequest, common.NewMessage("Invalid parameters"))
 		return
 	}
-
-	existingCount, err := model.CountUsersByEmail(email)
-	if err != nil {
-		common.ApiErrorStatus(c, http.StatusInternalServerError, common.NewMessage("Operation failed"))
-		return
-	}
-	if existingCount > 0 {
-		common.ApiSuccess(c, gin.H{"status": "existing_requires_link"})
-		return
+	if req.AllowWithoutEmail {
+		if email != "" || req.EmailVerified {
+			common.ApiErrorStatus(c, http.StatusBadRequest, common.NewMessage("Invalid parameters"))
+			return
+		}
+	} else {
+		if !req.EmailVerified || !isValidProvisionEmail(email) {
+			common.ApiErrorStatus(c, http.StatusBadRequest, common.NewMessage("Invalid parameters"))
+			return
+		}
+		existingCount, err := model.CountUsersByEmail(email)
+		if err != nil {
+			common.ApiErrorStatus(c, http.StatusInternalServerError, common.NewMessage("Operation failed"))
+			return
+		}
+		if existingCount > 0 {
+			common.ApiSuccess(c, gin.H{"status": "existing_requires_link"})
+			return
+		}
 	}
 
 	randomPassword, err := generateProvisionAccountPassword()
@@ -216,7 +227,11 @@ func ProvisionNeedTokenMember(c *gin.Context) {
 		common.ApiErrorStatus(c, http.StatusInternalServerError, common.NewMessage("Operation failed"))
 		return
 	}
-	displayName := sanitizeProvisionDisplayName(req.DisplayName, email)
+	fallbackDisplay := email
+	if fallbackDisplay == "" {
+		fallbackDisplay = "nt_" + customerToken
+	}
+	displayName := sanitizeProvisionDisplayName(req.DisplayName, fallbackDisplay)
 
 	var created *model.User
 	for range 3 {
@@ -239,7 +254,7 @@ func ProvisionNeedTokenMember(c *gin.Context) {
 			created = candidate
 			break
 		}
-		if errors.Is(insertErr, model.ErrEmailAlreadyTaken) || model.IsEmailAlreadyTaken(email) {
+		if !req.AllowWithoutEmail && (errors.Is(insertErr, model.ErrEmailAlreadyTaken) || model.IsEmailAlreadyTaken(email)) {
 			common.ApiSuccess(c, gin.H{"status": "existing_requires_link"})
 			return
 		}
