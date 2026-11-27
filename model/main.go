@@ -351,6 +351,8 @@ func migrateDB() error {
 		&LoginEncryptionKey{},
 		&Redemption{},
 		&ExternalGrant{},
+		&NeedTokenBillingRefund{},
+		&NeedTokenBillingShortfall{},
 		&Ability{},
 		&Log{},
 		&Midjourney{},

@@ -87,6 +87,7 @@ var accessTokenExemptRoutes = []string{
 	"GET /api/subscription/admin/needtoken-console/users/:id/tasks",
 	"GET /api/subscription/admin/needtoken-console/users/:id/drawings",
 	"GET /api/subscription/admin/needtoken-console/users/:id/subscriptions",
+	"GET /api/subscription/admin/needtoken-console/users/:id/wallet/ops",
 	"POST /api/subscription/admin/needtoken-console/users/:id/wallet/credit",
 	"POST /api/subscription/admin/needtoken-console/users/:id/wallet/debit",
 	"POST /api/subscription/admin/needtoken-console/users/:id/wallet/redeem",

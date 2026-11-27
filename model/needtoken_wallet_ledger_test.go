@@ -3,6 +3,7 @@ package model
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -11,6 +12,7 @@ import (
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 )
 
@@ -279,4 +281,159 @@ func TestPreConsumeUserSubscriptionMultiCardSplitAndRefund(t *testing.T) {
 	require.NoError(t, db.First(&s2, sub2.Id).Error)
 	assert.Equal(t, int64(70), s1.AmountUsed, "sub1 net charge should be 10 (60 -> 70)")
 	assert.Equal(t, int64(60), s2.AmountUsed, "sub2 should be fully refunded back to 60")
+}
+
+func TestLookupExternalWalletOp(t *testing.T) {
+	db := setupUnifiedWalletTestDB(t)
+
+	user := User{Username: "op-lookup-user", Password: "hashed-password", DisplayName: "Op Lookup", AffCode: "AFFOP1", Status: common.UserStatusEnabled, Quota: 10000}
+	other := User{Username: "op-lookup-other", Password: "hashed-password", DisplayName: "Op Other", AffCode: "AFFOP2", Status: common.UserStatusEnabled, Quota: 5000}
+	require.NoError(t, db.Create(&user).Error)
+	require.NoError(t, db.Create(&other).Error)
+
+	ctx := context.Background()
+
+	// 1. Not found op returns Found=false and authoritative User.Quota.
+	missing, err := LookupExternalWalletOp(ctx, user.Id, "order:101:debit:missing", ExternalGrantWalletDebit)
+	require.NoError(t, err)
+	assert.False(t, missing.Found)
+	assert.Equal(t, "not_found", missing.Status)
+	assert.Equal(t, 10000, missing.BalanceQuota)
+
+	// 2. Committed debit returns Status=debited and AppliedQuota.
+	_, err = ApplyExternalWalletDebit(ctx, user.Id, 2500, true, "order:101:debit:ok", "pay order")
+	require.NoError(t, err)
+	debited, err := LookupExternalWalletOp(ctx, user.Id, "order:101:debit:ok", ExternalGrantWalletDebit)
+	require.NoError(t, err)
+	assert.True(t, debited.Found)
+	assert.Equal(t, "debited", debited.Status)
+	assert.Equal(t, 2500, debited.AppliedQuota)
+	assert.Equal(t, 7500, debited.BalanceQuota)
+
+	// 3. Cross-user lookup is rejected.
+	_, err = LookupExternalWalletOp(ctx, other.Id, "order:101:debit:ok", ExternalGrantWalletDebit)
+	assert.ErrorIs(t, err, ErrExternalGrantConflict)
+
+	// 4. Rolled-back debit transitions lookup status to rolled_back.
+	_, err = ApplyExternalWalletCredit(ctx, user.Id, 2500, "order:101:debit:ok:rollback", "rollback")
+	require.NoError(t, err)
+	rolled, err := LookupExternalWalletOp(ctx, user.Id, "order:101:debit:ok", ExternalGrantWalletDebit)
+	require.NoError(t, err)
+	assert.True(t, rolled.Found)
+	assert.Equal(t, "rolled_back", rolled.Status)
+	assert.Equal(t, 2500, rolled.AppliedQuota)
+	assert.Equal(t, 10000, rolled.BalanceQuota)
+
+	// 5. Credit lookup returns credited.
+	creditedStatus, err := LookupExternalWalletOp(ctx, user.Id, "order:101:debit:ok:rollback", ExternalGrantWalletCredit)
+	require.NoError(t, err)
+	assert.True(t, creditedStatus.Found)
+	assert.Equal(t, "credited", creditedStatus.Status)
+	assert.Equal(t, 2500, creditedStatus.AppliedQuota)
+
+	// 6. Invalid op ID / kind fails cleanly.
+	_, err = LookupExternalWalletOp(ctx, user.Id, "bad op id!", ExternalGrantWalletDebit)
+	assert.ErrorIs(t, err, ErrExternalGrantInvalid)
+	_, err = LookupExternalWalletOp(ctx, user.Id, "order:101:debit:ok", "bad_kind")
+	assert.ErrorIs(t, err, ErrExternalGrantInvalid)
+}
+
+func TestNeedTokenBillingRefundAutoMigrateAndExecution(t *testing.T) {
+	runCase := func(t *testing.T, db *gorm.DB, dialect common.DatabaseType) {
+		t.Helper()
+		prevDB, prevLogDB := DB, LOG_DB
+		prevMain, prevLog := common.MainDatabaseType(), common.LogDatabaseType()
+		prevRedis := common.RedisEnabled
+		DB, LOG_DB = db, db
+		common.SetDatabaseTypes(dialect, dialect)
+		common.RedisEnabled = false
+		initCol()
+		t.Cleanup(func() {
+			DB, LOG_DB = prevDB, prevLogDB
+			common.SetDatabaseTypes(prevMain, prevLog)
+			common.RedisEnabled = prevRedis
+			initCol()
+		})
+
+		// Verify AutoMigrate idempotency by running twice.
+		require.NoError(t, db.AutoMigrate(&User{}, &Token{}, &NeedTokenBillingRefund{}, &NeedTokenBillingShortfall{}, &SubscriptionPlan{}, &UserSubscription{}, &SubscriptionPreConsumeRecord{}))
+		require.NoError(t, db.AutoMigrate(&User{}, &Token{}, &NeedTokenBillingRefund{}, &NeedTokenBillingShortfall{}, &SubscriptionPlan{}, &UserSubscription{}, &SubscriptionPreConsumeRecord{}))
+
+		user := User{Username: "billing-refund-u-" + string(dialect), Password: "hashed-password", AffCode: "AFFBR_" + string(dialect), Status: common.UserStatusEnabled, Quota: 500}
+		require.NoError(t, db.Create(&user).Error)
+		tok := Token{UserId: user.Id, Key: "sk-br-test-" + string(dialect), Name: "br-test", RemainQuota: 500, UsedQuota: 100, Status: common.TokenStatusEnabled}
+		require.NoError(t, db.Create(&tok).Error)
+
+		ctx := context.Background()
+		opID := "billing:test-model-op-" + string(dialect)
+		require.NoError(t, UpsertBillingRefundRecord(ctx, NeedTokenBillingRefund{
+			OperationId:   opID,
+			RequestId:     "req-br-1",
+			UserId:        user.Id,
+			TokenId:       tok.Id,
+			FundingSource: "wallet",
+			WalletAmount:  100,
+			TokenConsumed: 100,
+		}))
+		_, err := MarkBillingRefundPending(ctx, NeedTokenBillingRefund{OperationId: opID})
+		require.NoError(t, err)
+
+		completed, err := ExecuteBillingRefund(ctx, opID)
+		require.NoError(t, err)
+		assert.True(t, completed)
+
+		// Re-executing must be strictly idempotent.
+		completedAgain, err := ExecuteBillingRefund(ctx, opID)
+		require.NoError(t, err)
+		assert.True(t, completedAgain)
+
+		var reloadedUser User
+		require.NoError(t, db.First(&reloadedUser, user.Id).Error)
+		assert.Equal(t, 600, reloadedUser.Quota)
+
+		var reloadedTok Token
+		require.NoError(t, db.First(&reloadedTok, tok.Id).Error)
+		assert.Equal(t, 600, reloadedTok.RemainQuota)
+
+		sfOp := "shortfall:test-model-" + string(dialect)
+		sfRec := NeedTokenBillingShortfall{
+			OperationId:         sfOp,
+			RequestId:           "req-sf-1",
+			UserId:              user.Id,
+			ActualQuota:         60,
+			SubscriptionCharged: 15,
+			WalletCharged:       15,
+			CollectedQuota:      30,
+			UnbilledQuota:       30,
+			Reason:              "wallet_exhausted",
+		}
+		require.NoError(t, RecordBillingShortfall(ctx, sfRec))
+		require.NoError(t, RecordBillingShortfall(ctx, sfRec))
+		sfRes, err := QueryBillingShortfalls(ctx, BillingShortfallFilter{UserId: user.Id})
+		require.NoError(t, err)
+		assert.Equal(t, int64(1), sfRes.Total)
+		assert.Equal(t, int64(30), sfRes.TotalUnbilledQuota)
+	}
+
+	t.Run("sqlite", func(t *testing.T) {
+		db := setupUnifiedWalletTestDB(t)
+		runCase(t, db, common.DatabaseTypeSQLite)
+	})
+
+	t.Run("postgres", func(t *testing.T) {
+		dsn := os.Getenv("TEST_POSTGRES_DSN")
+		if dsn == "" {
+			t.Skip("TEST_POSTGRES_DSN is not configured")
+		}
+		db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{})
+		require.NoError(t, err)
+		sqlDB, err := db.DB()
+		require.NoError(t, err)
+		t.Cleanup(func() {
+			_ = db.Migrator().DropTable(&NeedTokenBillingShortfall{}, &NeedTokenBillingRefund{}, &SubscriptionPreConsumeRecord{}, &UserSubscription{}, &SubscriptionPlan{}, &Token{}, &User{})
+			_ = sqlDB.Close()
+		})
+		_ = db.Migrator().DropTable(&NeedTokenBillingShortfall{}, &NeedTokenBillingRefund{}, &SubscriptionPreConsumeRecord{}, &UserSubscription{}, &SubscriptionPlan{}, &Token{}, &User{})
+		runCase(t, db, common.DatabaseTypePostgreSQL)
+	})
 }

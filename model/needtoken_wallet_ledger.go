@@ -303,10 +303,315 @@ func ApplyExternalWalletDebit(ctx context.Context, userId, maxQuota int, allowPa
 	}, nil
 }
 
+// ExternalWalletOpStatus describes the authoritative gateway state of an external wallet operation.
+type ExternalWalletOpStatus struct {
+	OperationId  string `json:"operation_id"`
+	Kind         string `json:"kind,omitempty"`
+	Found        bool   `json:"found"`
+	Status       string `json:"status"`
+	AppliedQuota int    `json:"applied_quota"`
+	BalanceQuota int    `json:"balance_quota"`
+}
+
+// LookupExternalWalletOp queries the committed gateway ledger for an external wallet operation
+// and reads the authoritative User.Quota directly from the database.
+func LookupExternalWalletOp(ctx context.Context, userId int, operationId, kind string) (*ExternalWalletOpStatus, error) {
+	if userId <= 0 || !validExternalGrantOperationID(operationId) {
+		return nil, ErrExternalGrantInvalid
+	}
+	kind = strings.TrimSpace(kind)
+	if kind != "" && kind != ExternalGrantWalletDebit && kind != ExternalGrantWalletCredit {
+		return nil, ErrExternalGrantInvalid
+	}
+
+	var user User
+	if err := DB.WithContext(ctx).Select("id", "quota").First(&user, userId).Error; err != nil {
+		return nil, err
+	}
+
+	var existing ExternalGrant
+	query := DB.WithContext(ctx).Where("operation_key = ?", externalGrantDigest([]byte(operationId)))
+	if kind != "" {
+		query = query.Where("kind = ?", kind)
+	}
+	err := query.First(&existing).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return &ExternalWalletOpStatus{
+			OperationId:  operationId,
+			Kind:         kind,
+			Found:        false,
+			Status:       "not_found",
+			AppliedQuota: 0,
+			BalanceQuota: user.Quota,
+		}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if existing.UserId != userId {
+		return nil, ErrExternalGrantConflict
+	}
+
+	status := ""
+	switch existing.Kind {
+	case ExternalGrantWalletDebit:
+		rolledBack, rbErr := hasRolledBackDebitGrant(ctx, operationId)
+		if rbErr != nil {
+			return nil, rbErr
+		}
+		if rolledBack {
+			status = "rolled_back"
+		} else {
+			status = "debited"
+		}
+	case ExternalGrantWalletCredit:
+		status = "credited"
+	default:
+		return nil, ErrExternalGrantConflict
+	}
+
+	return &ExternalWalletOpStatus{
+		OperationId:  operationId,
+		Kind:         existing.Kind,
+		Found:        true,
+		Status:       status,
+		AppliedQuota: existing.Quota,
+		BalanceQuota: user.Quota,
+	}, nil
+}
+
 // ErrSubscriptionWalletOverflowDisabled indicates positive subscription delta exceeded
 // all eligible active subscriptions and wallet spillover was disallowed by either
 // the user's subscription_only preference or a subscription's allow_wallet_overflow=false.
 var ErrSubscriptionWalletOverflowDisabled = errors.New("subscription wallet_overflow_disabled")
+
+// ErrSubscriptionHybridQuotaInsufficient indicates that even combining remaining
+// eligible subscription quota and wallet balance cannot satisfy the requested pre-consume.
+var ErrSubscriptionHybridQuotaInsufficient = errors.New("subscription and wallet quota insufficient")
+
+// PreConsumeSubscriptionWithWalletSpillover atomically pre-consumes from eligible
+// active subscriptions and, when allowed by user preference and subscription settings,
+// absorbs any remaining shortfall from the user's wallet within the same DB transaction.
+// When combined funds are still insufficient, the entire transaction rolls back cleanly.
+func PreConsumeSubscriptionWithWalletSpillover(
+	requestId string,
+	userId int,
+	modelName string,
+	usingGroup string,
+	amount int64,
+	billingPreference string,
+) (*SubscriptionPreConsumeResult, error) {
+	if userId <= 0 {
+		return nil, errors.New("invalid userId")
+	}
+	requestId = strings.TrimSpace(requestId)
+	if requestId == "" {
+		return nil, errors.New("requestId is empty")
+	}
+	if amount <= 0 {
+		return nil, errors.New("amount must be > 0")
+	}
+	now := GetDBTimestamp()
+	splitPrefix := subscriptionSplitRequestPrefix(requestId)
+	returnValue := &SubscriptionPreConsumeResult{}
+
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		var existingRecords []SubscriptionPreConsumeRecord
+		if err := tx.Where("request_id = ? OR request_id LIKE ?", requestId, splitPrefix+"%").
+			Order("id asc").
+			Find(&existingRecords).Error; err != nil {
+			return err
+		}
+		if len(existingRecords) > 0 {
+			var primaryRecord SubscriptionPreConsumeRecord
+			var totalPre int64
+			allocs := make([]SubscriptionPreConsumeAllocation, 0, len(existingRecords))
+			for _, rec := range existingRecords {
+				if rec.Status == "refunded" {
+					return errors.New("subscription pre-consume already refunded")
+				}
+				if rec.RequestId == requestId || primaryRecord.Id == 0 {
+					primaryRecord = rec
+				}
+				totalPre += rec.PreConsumed
+				allocs = append(allocs, SubscriptionPreConsumeAllocation{
+					UserSubscriptionId: rec.UserSubscriptionId,
+					PreConsumed:        rec.PreConsumed,
+				})
+			}
+			var sub UserSubscription
+			if err := tx.Where("id = ?", primaryRecord.UserSubscriptionId).First(&sub).Error; err != nil {
+				return err
+			}
+			returnValue.UserSubscriptionId = sub.Id
+			returnValue.PreConsumed = totalPre
+			returnValue.PrimaryPreConsumed = primaryRecord.PreConsumed
+			returnValue.AmountTotal = sub.AmountTotal
+			returnValue.AmountUsedBefore = sub.AmountUsed
+			returnValue.AmountUsedAfter = sub.AmountUsed
+			returnValue.Allocations = allocs
+			return nil
+		}
+
+		var subs []UserSubscription
+		if err := lockForUpdate(tx).
+			Where("user_id = ? AND status = ? AND end_time > ?", userId, "active", now).
+			Order("end_time asc, id asc").
+			Find(&subs).Error; err != nil {
+			return errors.New("no active subscription")
+		}
+		if len(subs) == 0 {
+			return errors.New("no active subscription")
+		}
+		scoped := make([]UserSubscription, 0, len(subs))
+		general := make([]UserSubscription, 0, len(subs))
+		for _, candidate := range subs {
+			if !SubscriptionMatchesGroup(candidate.AllowedGroups, usingGroup) {
+				continue
+			}
+			if NormalizeAllowedGroups(candidate.AllowedGroups) != "" {
+				scoped = append(scoped, candidate)
+			} else {
+				general = append(general, candidate)
+			}
+		}
+		eligible := append(scoped, general...)
+		if len(eligible) == 0 {
+			return errors.New("no active subscription")
+		}
+
+		allowOverflow := common.NormalizeBillingPreference(billingPreference) != "subscription_only"
+		for i := range eligible {
+			plan, err := getSubscriptionPlanByIdTx(tx, eligible[i].PlanId)
+			if err != nil {
+				return err
+			}
+			if err := maybeResetUserSubscriptionWithPlanTx(tx, &eligible[i], plan, now); err != nil {
+				return err
+			}
+			if !eligible[i].AllowWalletOverflow {
+				allowOverflow = false
+			}
+		}
+
+		var totalRemain int64
+		hasUnlimited := false
+		for i := range eligible {
+			if eligible[i].AmountTotal <= 0 {
+				hasUnlimited = true
+				break
+			}
+			if rem := eligible[i].AmountTotal - eligible[i].AmountUsed; rem > 0 {
+				totalRemain += rem
+			}
+		}
+		if !hasUnlimited && totalRemain == 0 {
+			return fmt.Errorf("subscription quota insufficient, need=%d", amount)
+		}
+
+		subTarget := amount
+		var walletNeed int64
+		if !hasUnlimited && totalRemain < amount {
+			if !allowOverflow {
+				return fmt.Errorf("subscription quota insufficient, need=%d", amount)
+			}
+			walletNeed = amount - totalRemain
+			subTarget = totalRemain
+			if walletNeed > int64(common.MaxWalletQuota) {
+				return fmt.Errorf("%w: overflow=%d", ErrSubscriptionHybridQuotaInsufficient, walletNeed)
+			}
+			var user User
+			if err := lockForUpdate(tx).Select("id", "quota", "status").First(&user, userId).Error; err != nil {
+				return err
+			}
+			if user.Status != common.UserStatusEnabled {
+				return errors.New("user is disabled")
+			}
+			if int64(user.Quota) < walletNeed {
+				return fmt.Errorf("%w: need=%d subRemain=%d wallet=%d", ErrSubscriptionHybridQuotaInsufficient, amount, totalRemain, user.Quota)
+			}
+			res := tx.Model(&User{}).Where("id = ? AND quota >= ?", userId, int(walletNeed)).
+				Update("quota", gorm.Expr("quota - ?", int(walletNeed)))
+			if res.Error != nil {
+				return res.Error
+			}
+			if res.RowsAffected != 1 {
+				return fmt.Errorf("%w: concurrent wallet debit insufficient", ErrSubscriptionHybridQuotaInsufficient)
+			}
+		}
+
+		remaining := subTarget
+		allocs := make([]SubscriptionPreConsumeAllocation, 0, len(eligible))
+		var primarySub *UserSubscription
+		var primaryUsedBefore int64
+		var primaryTake int64
+		for i := range eligible {
+			if remaining <= 0 {
+				break
+			}
+			sub := &eligible[i]
+			var take int64
+			if sub.AmountTotal <= 0 {
+				take = remaining
+			} else {
+				rem := sub.AmountTotal - sub.AmountUsed
+				if rem <= 0 {
+					continue
+				}
+				take = min(rem, remaining)
+			}
+			recReqID := requestId
+			if len(allocs) > 0 {
+				recReqID = subscriptionSplitRequestId(requestId, len(allocs))
+			} else {
+				primarySub = sub
+				primaryUsedBefore = sub.AmountUsed
+				primaryTake = take
+			}
+			record := &SubscriptionPreConsumeRecord{
+				RequestId:          recReqID,
+				UserId:             userId,
+				UserSubscriptionId: sub.Id,
+				PreConsumed:        take,
+				Status:             "consumed",
+			}
+			if err := tx.Create(record).Error; err != nil {
+				return err
+			}
+			sub.AmountUsed += take
+			if err := tx.Save(sub).Error; err != nil {
+				return err
+			}
+			allocs = append(allocs, SubscriptionPreConsumeAllocation{
+				UserSubscriptionId: sub.Id,
+				PreConsumed:        take,
+			})
+			remaining -= take
+		}
+		if remaining > 0 || primarySub == nil {
+			return fmt.Errorf("subscription quota insufficient, need=%d", amount)
+		}
+
+		returnValue.UserSubscriptionId = primarySub.Id
+		returnValue.PreConsumed = subTarget
+		returnValue.PrimaryPreConsumed = primaryTake
+		returnValue.WalletPreConsumed = walletNeed
+		returnValue.AmountTotal = primarySub.AmountTotal
+		returnValue.AmountUsedBefore = primaryUsedBefore
+		returnValue.AmountUsedAfter = primarySub.AmountUsed
+		returnValue.Allocations = allocs
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if returnValue.WalletPreConsumed > 0 && common.RedisEnabled {
+		if status, cacheErr := cacheApplyUserQuotaDelta(userId, -returnValue.WalletPreConsumed); cacheErr != nil || status != cacheQuotaOK {
+			_ = invalidateUserCache(userId)
+		}
+	}
+	return returnValue, nil
+}
 
 // SubscriptionDeltaOverflowResult records how a subscription post-consume
 // delta was absorbed across the primary subscription, stacked sibling subscriptions,

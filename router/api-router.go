@@ -213,6 +213,7 @@ func SetApiRouter(router *gin.Engine) {
 			subscriptionAdminRoute.GET("/fulfillment/:operation_id", middleware.DisableCache(), controller.AdminGetSubscriptionFulfillment)
 			subscriptionAdminRoute.GET("/wallet-credits/:operation_id", middleware.DisableCache(), controller.AdminGetWalletCreditFulfillment)
 			subscriptionAdminRoute.GET("/users/:id/summary", middleware.DisableCache(), controller.AdminGetCustomerQuotaSummary)
+			subscriptionAdminRoute.GET("/billing-shortfalls", middleware.DisableCache(), controller.AdminListBillingShortfalls)
 			subscriptionAdminRoute.POST("/plans/:id/subscriptions/reset", controller.AdminResetPlanSubscriptions)
 
 			// User subscription management (admin)
@@ -241,6 +242,7 @@ func SetApiRouter(router *gin.Engine) {
 		apiRouter.GET("/subscription/admin/needtoken-console/users/:id/tasks", middleware.DisableCache(), controller.MemberConsoleListTasks)
 		apiRouter.GET("/subscription/admin/needtoken-console/users/:id/drawings", middleware.DisableCache(), controller.MemberConsoleListDrawings)
 		apiRouter.GET("/subscription/admin/needtoken-console/users/:id/subscriptions", middleware.DisableCache(), controller.MemberConsoleSubscriptions)
+		apiRouter.GET("/subscription/admin/needtoken-console/users/:id/wallet/ops", middleware.CriticalRateLimit(), middleware.DisableCache(), controller.MemberConsoleWalletLookupOp)
 		apiRouter.POST("/subscription/admin/needtoken-console/users/:id/wallet/credit", middleware.CriticalRateLimit(), middleware.DisableCache(), controller.MemberConsoleWalletCredit)
 		apiRouter.POST("/subscription/admin/needtoken-console/users/:id/wallet/debit", middleware.CriticalRateLimit(), middleware.DisableCache(), controller.MemberConsoleWalletDebit)
 		apiRouter.POST("/subscription/admin/needtoken-console/users/:id/wallet/redeem", middleware.CriticalRateLimit(), middleware.DisableCache(), controller.MemberConsoleWalletRedeem)
