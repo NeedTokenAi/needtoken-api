@@ -52,18 +52,20 @@ type memberConsoleTokenDTO struct {
 }
 
 type memberConsoleLogDTO struct {
-	Id               int    `json:"id"`
-	CreatedAt        int64  `json:"created_at"`
-	Type             int    `json:"type"`
-	ModelName        string `json:"model_name"`
-	TokenName        string `json:"token_name"`
-	Group            string `json:"group"`
-	PromptTokens     int    `json:"prompt_tokens"`
-	CompletionTokens int    `json:"completion_tokens"`
-	Quota            int    `json:"quota"`
-	UseTime          int    `json:"use_time"`
-	IsStream         bool   `json:"is_stream"`
-	Content          string `json:"content"`
+	Id                  int    `json:"id"`
+	CreatedAt           int64  `json:"created_at"`
+	Type                int    `json:"type"`
+	ModelName           string `json:"model_name"`
+	TokenName           string `json:"token_name"`
+	Group               string `json:"group"`
+	PromptTokens        int    `json:"prompt_tokens"`
+	CompletionTokens    int    `json:"completion_tokens"`
+	Quota               int    `json:"quota"`
+	UseTime             int    `json:"use_time"`
+	IsStream            bool   `json:"is_stream"`
+	Content             string `json:"content"`
+	BillingSource       string `json:"billing_source,omitempty"`
+	WalletQuotaDeducted int64  `json:"wallet_quota_deducted,omitempty"`
 }
 
 type memberConsoleUsageDailyDTO struct {
@@ -767,19 +769,51 @@ func MemberConsoleListLogs(c *gin.Context) {
 		if row == nil {
 			continue
 		}
+		var billingSource string
+		var walletQuotaDeducted int64
+		var subID int64
+		if strings.TrimSpace(row.Other) != "" {
+			var other map[string]any
+			if err := common.UnmarshalJsonStr(row.Other, &other); err == nil && other != nil {
+				if rawSrc, ok := other["billing_source"].(string); ok {
+					billingSource = strings.TrimSpace(rawSrc)
+				}
+				switch v := other["wallet_quota_deducted"].(type) {
+				case float64:
+					walletQuotaDeducted = int64(v)
+				case int64:
+					walletQuotaDeducted = v
+				case int:
+					walletQuotaDeducted = int64(v)
+				}
+				switch v := other["subscription_id"].(type) {
+				case float64:
+					subID = int64(v)
+				case int64:
+					subID = v
+				case int:
+					subID = int64(v)
+				}
+			}
+		}
+		if billingSource == "" && row.Type == model.LogTypeConsume && subID == 0 && row.Quota > 0 {
+			billingSource = "wallet"
+		}
 		items = append(items, memberConsoleLogDTO{
-			Id:               row.Id,
-			CreatedAt:        row.CreatedAt,
-			Type:             row.Type,
-			ModelName:        row.ModelName,
-			TokenName:        row.TokenName,
-			Group:            row.Group,
-			PromptTokens:     row.PromptTokens,
-			CompletionTokens: row.CompletionTokens,
-			Quota:            row.Quota,
-			UseTime:          row.UseTime,
-			IsStream:         row.IsStream,
-			Content:          row.Content,
+			Id:                  row.Id,
+			CreatedAt:           row.CreatedAt,
+			Type:                row.Type,
+			ModelName:           row.ModelName,
+			TokenName:           row.TokenName,
+			Group:               row.Group,
+			PromptTokens:        row.PromptTokens,
+			CompletionTokens:    row.CompletionTokens,
+			Quota:               row.Quota,
+			UseTime:             row.UseTime,
+			IsStream:            row.IsStream,
+			Content:             row.Content,
+			BillingSource:       billingSource,
+			WalletQuotaDeducted: walletQuotaDeducted,
 		})
 	}
 

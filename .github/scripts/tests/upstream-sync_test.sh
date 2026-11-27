@@ -40,6 +40,8 @@ for p in \
   "controller/needtoken_sso.go" \
   "controller/needtoken_sso_test.go" \
   "VERSION" \
+  "web/index.html" \
+  "web/public/favicon.ico" \
   "web/src/routes/_authenticated/account-link.tsx" \
   "web/src/routes/(auth)/oauth.tsx" \
   "web/src/routes/index.tsx" \

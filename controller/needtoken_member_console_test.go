@@ -173,6 +173,34 @@ func TestMemberConsoleLifecycleAndSecurity(t *testing.T) {
 		UseTime:          3,
 		ChannelId:        99,
 		ChannelName:      "secret-internal-channel",
+		Other:            `{"billing_source":"wallet"}`,
+	}).Error)
+	require.NoError(t, db.Create(&model.Log{
+		UserId:           member.Id,
+		CreatedAt:        fixedNow.Unix() - 500,
+		Type:             model.LogTypeConsume,
+		ModelName:        "claude-sonnet-4-6",
+		TokenName:        "Sub Key",
+		Group:            "default",
+		PromptTokens:     300,
+		CompletionTokens: 100,
+		Quota:            50000,
+		UseTime:          2,
+		ChannelId:        99,
+		Other:            `{"billing_source":"subscription","subscription_id":7,"wallet_quota_deducted":12000}`,
+	}).Error)
+	require.NoError(t, db.Create(&model.Log{
+		UserId:           member.Id,
+		CreatedAt:        fixedNow.Unix() - 700,
+		Type:             model.LogTypeConsume,
+		ModelName:        "claude-sonnet-4-6",
+		TokenName:        "Legacy Key",
+		Group:            "default",
+		PromptTokens:     100,
+		CompletionTokens: 50,
+		Quota:            10000,
+		UseTime:          1,
+		ChannelId:        99,
 	}).Error)
 	require.NoError(t, db.Create(&model.QuotaData{
 		UserID:    member.Id,
@@ -195,8 +223,17 @@ func TestMemberConsoleLifecycleAndSecurity(t *testing.T) {
 		} `json:"data"`
 	}
 	require.NoError(t, common.Unmarshal(logsRec.Body.Bytes(), &logsResp))
-	require.Equal(t, int64(1), logsResp.Data.Total)
+	require.Equal(t, int64(3), logsResp.Data.Total)
 	assert.Equal(t, "claude-sonnet-4-6", logsResp.Data.Items[0].ModelName)
+	byToken := map[string]memberConsoleLogDTO{}
+	for _, it := range logsResp.Data.Items {
+		byToken[it.TokenName] = it
+	}
+	assert.Equal(t, "wallet", byToken["Cursor Key"].BillingSource)
+	assert.Equal(t, int64(0), byToken["Cursor Key"].WalletQuotaDeducted)
+	assert.Equal(t, "subscription", byToken["Sub Key"].BillingSource)
+	assert.Equal(t, int64(12000), byToken["Sub Key"].WalletQuotaDeducted)
+	assert.Equal(t, "wallet", byToken["Legacy Key"].BillingSource)
 
 	usageRec := doSigned(http.MethodGet, "/api/subscription/admin/needtoken-console/users/"+strconv.Itoa(member.Id)+"/usage?days=7", "", fixedNow.Unix(), "")
 	require.Equal(t, http.StatusOK, usageRec.Code)

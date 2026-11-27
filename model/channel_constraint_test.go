@@ -216,3 +216,42 @@ func TestChannelSatisfiesFilters(t *testing.T) {
 	assert.False(t, ok)
 	assert.Equal(t, dto.FilterRequestPath, kind)
 }
+
+func TestGetRandomSatisfiedChannelCaseInsensitiveFallback(t *testing.T) {
+	origMemCache := common.MemoryCacheEnabled
+	common.MemoryCacheEnabled = true
+	channelSyncLock.Lock()
+	origChannelsIDM := channelsIDM
+	origGroupMap := group2model2channels
+
+	ch := &Channel{Id: 910001, Type: constant.ChannelTypeOpenAI, Status: common.ChannelStatusEnabled}
+	channelsIDM = map[int]*Channel{910001: ch}
+	group2model2channels = map[string]map[string][]int{
+		"ssvip": {
+			"gpt-6.1-sol": {910001},
+		},
+	}
+	channelSyncLock.Unlock()
+
+	t.Cleanup(func() {
+		channelSyncLock.Lock()
+		channelsIDM = origChannelsIDM
+		group2model2channels = origGroupMap
+		channelSyncLock.Unlock()
+		common.MemoryCacheEnabled = origMemCache
+	})
+
+	exact, err := GetRandomSatisfiedChannel("ssvip", "gpt-6.1-sol", 0, nil)
+	require.NoError(t, err)
+	require.NotNil(t, exact)
+	assert.Equal(t, 910001, exact.Id)
+
+	upper, err := GetRandomSatisfiedChannel("ssvip", "GPT-6.1-Sol", 0, nil)
+	require.NoError(t, err)
+	require.NotNil(t, upper)
+	assert.Equal(t, 910001, upper.Id)
+
+	missing, err := GetRandomSatisfiedChannel("ssvip", "nonexistent-model", 0, nil)
+	require.NoError(t, err)
+	assert.Nil(t, missing)
+}

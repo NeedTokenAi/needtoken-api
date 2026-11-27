@@ -135,6 +135,30 @@ func GetRandomSatisfiedChannel(
 	if len(channels) == 0 {
 		normalizedModel := ratio_setting.RoutingMatchModelName(model)
 		channels, _ = filterCandidateIDs(group2model2channels[group][normalizedModel], model, filters)
+		if len(channels) == 0 {
+			trimmed := strings.TrimSpace(model)
+			lower := strings.ToLower(trimmed)
+			if lower != "" && lower != model && lower != normalizedModel {
+				channels, _ = filterCandidateIDs(group2model2channels[group][lower], model, filters)
+			}
+			if len(channels) == 0 && trimmed != "" {
+				var matchedIDs []int
+				seen := make(map[int]struct{})
+				for key, ids := range group2model2channels[group] {
+					if strings.EqualFold(key, trimmed) || (normalizedModel != "" && strings.EqualFold(key, normalizedModel)) {
+						for _, id := range ids {
+							if _, ok := seen[id]; !ok {
+								seen[id] = struct{}{}
+								matchedIDs = append(matchedIDs, id)
+							}
+						}
+					}
+				}
+				if len(matchedIDs) > 0 {
+					channels, _ = filterCandidateIDs(matchedIDs, model, filters)
+				}
+			}
+		}
 	}
 
 	if len(channels) == 0 {
