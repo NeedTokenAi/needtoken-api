@@ -1,8 +1,11 @@
 package router
 
 import (
+	"bytes"
 	"embed"
+	"html"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
@@ -16,6 +19,26 @@ import (
 type WebAssets struct {
 	BuildFS   embed.FS
 	IndexPage []byte
+}
+
+func renderWebIndexPage(indexPage []byte) []byte {
+	logo := strings.TrimSpace(common.Logo)
+	if logo == "" {
+		return indexPage
+	}
+	parsed, err := url.Parse(logo)
+	if err != nil || (parsed.Scheme != "https" && parsed.Scheme != "http") || parsed.Host == "" {
+		return indexPage
+	}
+	escaped := html.EscapeString(logo)
+	const defaultIconTag = `<link rel="icon" type="image/svg+xml" href="/icon.svg" />`
+	if !bytes.Contains(indexPage, []byte(defaultIconTag)) {
+		return indexPage
+	}
+	customIconTag := `<link rel="icon" href="` + escaped + `" />`
+	replaced := bytes.Replace(indexPage, []byte(defaultIconTag), []byte(customIconTag), 1)
+	replaced = bytes.Replace(replaced, []byte(`<meta property="og:image" content="/logo.png" />`), []byte(`<meta property="og:image" content="`+escaped+`" />`), 1)
+	return replaced
 }
 
 func SetWebRouter(router *gin.Engine, assets WebAssets, pluginDispatcher gin.HandlerFunc) {
@@ -41,7 +64,7 @@ func SetWebRouter(router *gin.Engine, assets WebAssets, pluginDispatcher gin.Han
 				return
 			}
 			c.Header("Cache-Control", "no-cache")
-			c.Data(http.StatusOK, "text/html; charset=utf-8", assets.IndexPage)
+			c.Data(http.StatusOK, "text/html; charset=utf-8", renderWebIndexPage(assets.IndexPage))
 		},
 	)
 }
