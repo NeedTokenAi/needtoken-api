@@ -247,6 +247,81 @@ func TestNeedTokenProvisionMemberSecurityRejections(t *testing.T) {
 	}
 }
 
+func TestNeedTokenProvisionMemberAllowWithoutEmail(t *testing.T) {
+	_, _ = setupSecurityEnrollmentTest(t)
+	secret := "0123456789abcdef0123456789abcdef0123456789abcdef"
+	t.Setenv("NEEDTOKEN_LINKING_SECRET", secret)
+
+	now := time.Date(2026, 11, 27, 13, 0, 0, 0, time.UTC)
+	origNow := accountLinkNow
+	t.Cleanup(func() { accountLinkNow = origNow })
+	accountLinkNow = func() time.Time { return now }
+	validTS := strconv.FormatInt(now.Unix(), 10)
+
+	// 1. Valid allow_without_email request provisions a blank-email user.
+	payload, err := common.Marshal(needTokenProvisionMemberRequest{
+		Source:             "needtoken-storefront",
+		MerchantCustomerID: "needtoken-storefront:user:5",
+		Email:              "",
+		EmailVerified:      false,
+		AllowWithoutEmail:  true,
+		DisplayName:        "Yule",
+	})
+	require.NoError(t, err)
+	rec := makeSignedProvisionRequest(t, secret, validTS, payload)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+
+	var resp struct {
+		Success bool `json:"success"`
+		Data    struct {
+			Status       string `json:"status"`
+			NativeUserID int    `json:"native_user_id"`
+			Username     string `json:"username"`
+		} `json:"data"`
+	}
+	require.NoError(t, common.Unmarshal(rec.Body.Bytes(), &resp))
+	require.True(t, resp.Success)
+	assert.Equal(t, "created", resp.Data.Status)
+	assert.NotZero(t, resp.Data.NativeUserID)
+	assert.True(t, strings.HasPrefix(resp.Data.Username, "nt_5_"))
+
+	storedUser, err := model.GetUserById(resp.Data.NativeUserID, true)
+	require.NoError(t, err)
+	assert.Equal(t, "", storedUser.Email)
+	assert.Equal(t, "Yule", storedUser.DisplayName)
+	assert.Equal(t, common.UserStatusEnabled, storedUser.Status)
+
+	// 2. Reject allow_without_email when any email or email_verified=true is passed.
+	for _, bad := range []needTokenProvisionMemberRequest{
+		{
+			Source:             "needtoken-storefront",
+			MerchantCustomerID: "needtoken-storefront:user:6",
+			Email:              "unverified@example.com",
+			EmailVerified:      false,
+			AllowWithoutEmail:  true,
+		},
+		{
+			Source:             "needtoken-storefront",
+			MerchantCustomerID: "needtoken-storefront:user:6",
+			Email:              "verified@example.com",
+			EmailVerified:      true,
+			AllowWithoutEmail:  true,
+		},
+		{
+			Source:             "needtoken-storefront",
+			MerchantCustomerID: "needtoken-storefront:user:6",
+			Email:              "",
+			EmailVerified:      true,
+			AllowWithoutEmail:  true,
+		},
+	} {
+		rawBad, marshalErr := common.Marshal(bad)
+		require.NoError(t, marshalErr)
+		badRec := makeSignedProvisionRequest(t, secret, validTS, rawBad)
+		assert.Equal(t, http.StatusBadRequest, badRec.Code)
+	}
+}
+
 func TestNeedTokenConsoleSSOExchangeReplayAndMFA(t *testing.T) {
 	user, _ := setupSecurityEnrollmentTest(t)
 	resetNeedTokenSSOReplayCache(t)
