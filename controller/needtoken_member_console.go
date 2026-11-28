@@ -66,6 +66,7 @@ type memberConsoleLogDTO struct {
 	Content             string `json:"content"`
 	BillingSource       string `json:"billing_source,omitempty"`
 	WalletQuotaDeducted int64  `json:"wallet_quota_deducted,omitempty"`
+	BalanceAfterQuota   *int64 `json:"balance_after_quota,omitempty"`
 }
 
 type memberConsoleUsageDailyDTO struct {
@@ -734,6 +735,51 @@ func MemberConsoleDeleteToken(c *gin.Context) {
 	common.ApiSuccess(c, gin.H{"deleted": true, "token_id": tokenID})
 }
 
+func parseMemberLogInt64(raw any) (int64, bool) {
+	switch v := raw.(type) {
+	case float64:
+		return int64(v), true
+	case int64:
+		return v, true
+	case int:
+		return int64(v), true
+	default:
+		return 0, false
+	}
+}
+
+type memberLogOtherMeta struct {
+	BillingSource       string
+	WalletQuotaDeducted int64
+	SubscriptionID      int64
+	BalanceAfterQuota   *int64
+}
+
+func parseMemberLogOther(logType int, quota int, rawOther string) memberLogOtherMeta {
+	var meta memberLogOtherMeta
+	if strings.TrimSpace(rawOther) != "" {
+		var other map[string]any
+		if err := common.UnmarshalJsonStr(rawOther, &other); err == nil && other != nil {
+			if rawSrc, ok := other["billing_source"].(string); ok {
+				meta.BillingSource = strings.TrimSpace(rawSrc)
+			}
+			if val, ok := parseMemberLogInt64(other["wallet_quota_deducted"]); ok {
+				meta.WalletQuotaDeducted = val
+			}
+			if val, ok := parseMemberLogInt64(other["subscription_id"]); ok {
+				meta.SubscriptionID = val
+			}
+			if val, ok := parseMemberLogInt64(other["balance_after_quota"]); ok {
+				meta.BalanceAfterQuota = &val
+			}
+		}
+	}
+	if meta.BillingSource == "" && logType == model.LogTypeConsume && meta.SubscriptionID == 0 && quota > 0 {
+		meta.BillingSource = "wallet"
+	}
+	return meta
+}
+
 func MemberConsoleListLogs(c *gin.Context) {
 	user, _, ok := verifyMemberConsoleRequest(c)
 	if !ok {
@@ -751,6 +797,7 @@ func MemberConsoleListLogs(c *gin.Context) {
 	pageSize = min(pageSize, 100)
 
 	filter := logFilterFromQuery(c, false)
+	hasTimeFilter := strings.TrimSpace(c.Query("start_timestamp")) != "" || strings.TrimSpace(c.Query("end_timestamp")) != ""
 	if startTimestamp, err := limitLogTimeRange(filter.StartTimestamp, filter.EndTimestamp); err == nil {
 		filter.StartTimestamp = startTimestamp
 	} else {
@@ -764,40 +811,87 @@ func MemberConsoleListLogs(c *gin.Context) {
 		return
 	}
 
-	items := make([]memberConsoleLogDTO, 0, len(logs))
-	for _, row := range logs {
-		if row == nil {
-			continue
+	inferredAfterByIndex := make(map[int]int64)
+	canReplayBalance := page == 1 && len(logs) > 0 && model.LOG_DB != nil &&
+		(filter.Type == 0 || filter.Type == model.LogTypeConsume) &&
+		strings.TrimSpace(filter.ModelName) == "" &&
+		strings.TrimSpace(filter.TokenName) == "" &&
+		strings.TrimSpace(filter.Group) == "" &&
+		strings.TrimSpace(filter.RequestId) == "" &&
+		strings.TrimSpace(filter.UpstreamRequestId) == "" &&
+		!hasTimeFilter
+	if canReplayBalance {
+		// formatUserLogs 会用虚拟展示序号覆盖 row.Id，因此需先查回本页真实 DB 主键 ID 再按主键回放。
+		idQuery := model.LOG_DB.WithContext(c.Request.Context()).
+			Model(&model.Log{}).
+			Where("user_id = ?", user.Id)
+		if filter.Type != 0 {
+			idQuery = idQuery.Where("type = ?", filter.Type)
 		}
-		var billingSource string
-		var walletQuotaDeducted int64
-		var subID int64
-		if strings.TrimSpace(row.Other) != "" {
-			var other map[string]any
-			if err := common.UnmarshalJsonStr(row.Other, &other); err == nil && other != nil {
-				if rawSrc, ok := other["billing_source"].(string); ok {
-					billingSource = strings.TrimSpace(rawSrc)
+		var realIDs []int
+		if err := idQuery.Order("id DESC").Limit(pageSize).Pluck("id", &realIDs).Error; err == nil && len(realIDs) > 0 {
+			minRealID := realIDs[len(realIDs)-1]
+			var replayLogs []model.Log
+			if err := model.LOG_DB.WithContext(c.Request.Context()).
+				Select("id, type, quota, other").
+				Where("user_id = ? AND id >= ? AND type IN ?", user.Id, minRealID, []int{model.LogTypeTopup, model.LogTypeConsume, model.LogTypeManage}).
+				Order("id DESC").
+				Limit(500).
+				Find(&replayLogs).Error; err == nil {
+				inferredByRealID := make(map[int]int64)
+				running := int64(user.Quota)
+				for _, r := range replayLogs {
+					switch r.Type {
+					case model.LogTypeConsume:
+						meta := parseMemberLogOther(r.Type, r.Quota, r.Other)
+						var deducted int64
+						if meta.BillingSource == "subscription" {
+							deducted = meta.WalletQuotaDeducted
+						} else if meta.BillingSource == "wallet" && r.Quota > 0 {
+							deducted = int64(r.Quota)
+						}
+						if meta.BalanceAfterQuota != nil {
+							running = max(int64(0), *meta.BalanceAfterQuota)
+							inferredByRealID[r.Id] = running
+							if deducted > 0 {
+								running += deducted
+							}
+						} else if deducted > 0 {
+							after := max(int64(0), running)
+							inferredByRealID[r.Id] = after
+							running = after + deducted
+						}
+					case model.LogTypeTopup:
+						if r.Quota > 0 {
+							running = max(int64(0), running-int64(r.Quota))
+						}
+					case model.LogTypeManage:
+						if r.Quota != 0 {
+							running = max(int64(0), running-int64(r.Quota))
+						}
+					}
 				}
-				switch v := other["wallet_quota_deducted"].(type) {
-				case float64:
-					walletQuotaDeducted = int64(v)
-				case int64:
-					walletQuotaDeducted = v
-				case int:
-					walletQuotaDeducted = int64(v)
-				}
-				switch v := other["subscription_id"].(type) {
-				case float64:
-					subID = int64(v)
-				case int64:
-					subID = v
-				case int:
-					subID = int64(v)
+				limit := min(len(logs), len(realIDs))
+				for idx := range limit {
+					if after, exists := inferredByRealID[realIDs[idx]]; exists {
+						inferredAfterByIndex[idx] = after
+					}
 				}
 			}
 		}
-		if billingSource == "" && row.Type == model.LogTypeConsume && subID == 0 && row.Quota > 0 {
-			billingSource = "wallet"
+	}
+
+	items := make([]memberConsoleLogDTO, 0, len(logs))
+	for idx, row := range logs {
+		if row == nil {
+			continue
+		}
+		meta := parseMemberLogOther(row.Type, row.Quota, row.Other)
+		balanceAfter := meta.BalanceAfterQuota
+		if balanceAfter == nil {
+			if inferred, exists := inferredAfterByIndex[idx]; exists {
+				balanceAfter = &inferred
+			}
 		}
 		items = append(items, memberConsoleLogDTO{
 			Id:                  row.Id,
@@ -812,8 +906,9 @@ func MemberConsoleListLogs(c *gin.Context) {
 			UseTime:             row.UseTime,
 			IsStream:            row.IsStream,
 			Content:             row.Content,
-			BillingSource:       billingSource,
-			WalletQuotaDeducted: walletQuotaDeducted,
+			BillingSource:       meta.BillingSource,
+			WalletQuotaDeducted: meta.WalletQuotaDeducted,
+			BalanceAfterQuota:   balanceAfter,
 		})
 	}
 
@@ -823,6 +918,7 @@ func MemberConsoleListLogs(c *gin.Context) {
 		"page":           page,
 		"page_size":      pageSize,
 		"quota_per_unit": common.QuotaPerUnit,
+		"user_quota":     user.Quota,
 	})
 }
 
