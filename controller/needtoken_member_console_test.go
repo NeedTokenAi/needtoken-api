@@ -714,3 +714,99 @@ func TestAdminListBillingShortfalls(t *testing.T) {
 	require.Len(t, resp.Data.Items, 1)
 	assert.Equal(t, int64(60), resp.Data.Items[0].ActualQuota)
 }
+
+func TestMemberConsoleLogsBalanceAfterQuotaReplay(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	const secret = "0123456789abcdef0123456789abcdef0123456789abcdef"
+	t.Setenv("NEEDTOKEN_LINKING_SECRET", secret)
+
+	origDB := model.DB
+	origLogDB := model.LOG_DB
+	origNow := accountLinkNow
+	origRedis := common.RedisEnabled
+	common.RedisEnabled = false
+	db, err := gorm.Open(sqlite.Open("file:member_console_logs_replay?mode=memory&cache=shared"), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Log{}))
+	model.DB = db
+	model.LOG_DB = db
+	fixedNow := time.Now().UTC().Truncate(time.Second)
+	accountLinkNow = func() time.Time { return fixedNow }
+	t.Cleanup(func() {
+		model.DB = origDB
+		model.LOG_DB = origLogDB
+		accountLinkNow = origNow
+		common.RedisEnabled = origRedis
+	})
+
+	member := &model.User{
+		Username:    "member_replay",
+		DisplayName: "Replay",
+		Role:        common.RoleCommonUser,
+		Status:      common.UserStatusEnabled,
+		Group:       "default",
+		AffCode:     "aff_r",
+		Quota:       3000,
+	}
+	require.NoError(t, db.Create(member).Error)
+
+	// 按时间/ID 从旧到新：
+	// 1. 纯钱包消费 1000 -> after 2500
+	// 2. 充值 2000 -> after 4500
+	// 3. 纯套餐消费（不扣钱包）500 -> 不影响钱包余额
+	// 4. 套餐超额扣钱包 1500 -> after 3000 (= current user.Quota)
+	require.NoError(t, db.Create(&model.Log{
+		UserId: member.Id, CreatedAt: fixedNow.Unix() - 400, Type: model.LogTypeConsume,
+		ModelName: "gpt-4o", TokenName: "Key1", Quota: 1000, Other: `{"billing_source":"wallet"}`,
+	}).Error)
+	require.NoError(t, db.Create(&model.Log{
+		UserId: member.Id, CreatedAt: fixedNow.Unix() - 300, Type: model.LogTypeTopup,
+		Quota: 2000, Content: "topup",
+	}).Error)
+	require.NoError(t, db.Create(&model.Log{
+		UserId: member.Id, CreatedAt: fixedNow.Unix() - 200, Type: model.LogTypeConsume,
+		ModelName: "claude-sonnet-4-6", TokenName: "SubPure", Quota: 500, Other: `{"billing_source":"subscription","subscription_id":9}`,
+	}).Error)
+	require.NoError(t, db.Create(&model.Log{
+		UserId: member.Id, CreatedAt: fixedNow.Unix() - 100, Type: model.LogTypeConsume,
+		ModelName: "claude-sonnet-4-6", TokenName: "SubOverflow", Quota: 4000, Other: `{"billing_source":"subscription","subscription_id":9,"wallet_quota_deducted":1500}`,
+	}).Error)
+
+	r := gin.New()
+	r.GET("/api/subscription/admin/needtoken-console/users/:id/logs", MemberConsoleListLogs)
+
+	targetPath := "/api/subscription/admin/needtoken-console/users/" + strconv.Itoa(member.Id) + "/logs"
+	rawQuery := "p=1&page_size=20&type=2"
+	ts := strconv.FormatInt(fixedNow.Unix(), 10)
+	sig := computeMemberConsoleSignature([]byte(secret), http.MethodGet, targetPath, rawQuery, ts, nil)
+	req := httptest.NewRequest(http.MethodGet, targetPath+"?"+rawQuery, nil)
+	req.Header.Set("X-NeedToken-Timestamp", ts)
+	req.Header.Set("X-NeedToken-Signature", sig)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	var resp struct {
+		Success bool `json:"success"`
+		Data    struct {
+			Items     []memberConsoleLogDTO `json:"items"`
+			Total     int64                 `json:"total"`
+			UserQuota int                   `json:"user_quota"`
+		} `json:"data"`
+	}
+	require.NoError(t, common.Unmarshal(rec.Body.Bytes(), &resp))
+	assert.True(t, resp.Success)
+	assert.Equal(t, 3000, resp.Data.UserQuota)
+	require.Equal(t, int64(3), resp.Data.Total)
+
+	byToken := map[string]memberConsoleLogDTO{}
+	for _, it := range resp.Data.Items {
+		byToken[it.TokenName] = it
+	}
+	require.NotNil(t, byToken["SubOverflow"].BalanceAfterQuota)
+	assert.Equal(t, int64(3000), *byToken["SubOverflow"].BalanceAfterQuota)
+	assert.Nil(t, byToken["SubPure"].BalanceAfterQuota)
+	require.NotNil(t, byToken["Key1"].BalanceAfterQuota)
+	assert.Equal(t, int64(2500), *byToken["Key1"].BalanceAfterQuota)
+}
